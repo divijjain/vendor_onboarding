@@ -73,7 +73,12 @@ Results are written up as a short metrics table in this README once the harness 
 
 ## Status
 
-Build order step 1 complete: `vendor_onboarding` Ecto schema + migrations, Cloak-encrypted Tax ID column, Oban wired into the supervision tree, the repository/context layering from `PRINCIPLES.md`, and passing tests for the happy path, idempotency-key rejection, and encrypted-at-rest storage. No webhook, no agent service, no LiveView yet. See `CONTEXT.md` for the full build plan, architectural decisions, and current progress through the build order.
+Build order steps 1–2 complete:
+
+- Step 1: `vendor_onboarding` Ecto schema + migrations, Cloak-encrypted Tax ID column, Oban wired into the supervision tree, the repository/context layering from `PRINCIPLES.md`.
+- Step 2: webhook ingestion end to end — idempotency-key hashing off the raw request body, a config-swappable document storage boundary (local disk for dev/test), the `IngestWebhook` action, and a stub Oban job enqueue, all reachable via `POST /webhooks/vendor_onboarding`.
+
+29 tests passing, `mix precommit` clean. No agent service, no LiveView yet — the enqueued Oban job is still a stub (step 3 replaces it with a real call to the Python service). See `CONTEXT.md` for the full build plan and architectural decisions.
 
 ## Local development
 

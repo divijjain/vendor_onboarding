@@ -66,6 +66,8 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
+config :vendor_onboarding, :storage_upload_dir, "priv/uploads"
+
 config :vendor_onboarding, Oban,
   engine: Oban.Engines.Basic,
   notifier: Oban.Notifiers.Postgres,

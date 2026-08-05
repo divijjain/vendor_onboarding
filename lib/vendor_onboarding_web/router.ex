@@ -20,10 +20,11 @@ defmodule VendorOnboardingWeb.Router do
     get "/", PageController, :home
   end
 
-  # Other scopes may use custom stacks.
-  # scope "/api", VendorOnboardingWeb do
-  #   pipe_through :api
-  # end
+  scope "/webhooks", VendorOnboardingWeb do
+    pipe_through :api
+
+    post "/vendor_onboarding", WebhookController, :create
+  end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development
   if Application.compile_env(:vendor_onboarding, :dev_routes) do

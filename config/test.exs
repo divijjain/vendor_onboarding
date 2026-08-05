@@ -36,6 +36,14 @@ config :vendor_onboarding, VendorOnboarding.Mailer, adapter: Swoosh.Adapters.Tes
 # Disable swoosh api client as it is only required for production adapters
 config :swoosh, :api_client, false
 
+# Keep test-generated documents out of priv/uploads entirely.
+config :vendor_onboarding,
+       :storage_upload_dir,
+       Path.join(System.tmp_dir!(), "vendor_onboarding_test_uploads")
+
+# Don't actually run jobs in the test suite — assert on enqueueing instead.
+config :vendor_onboarding, Oban, testing: :manual
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 
