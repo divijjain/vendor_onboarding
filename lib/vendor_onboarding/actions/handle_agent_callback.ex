@@ -7,7 +7,7 @@ defmodule VendorOnboarding.Actions.HandleAgentCallback do
 
   alias VendorOnboarding.Repository
 
-  @result_fields ~w(status thread_id company_name tax_id payment_terms liability_clauses)
+  @result_fields ~w(status thread_id company_name tax_id payment_terms liability_clauses explanation)
 
   @spec call(map()) ::
           {:ok, VendorOnboarding.Schema.VendorOnboarding.t()}

@@ -14,12 +14,15 @@ defmodule VendorOnboarding.Actions.HandleAgentCallbackTest do
                "onboarding_id" => onboarding.id,
                "status" => "needs_review",
                "thread_id" => "thread-abc",
-               "company_name" => "Acme Corp"
+               "company_name" => "Acme Corp",
+               "explanation" =>
+                 "Contract lists \"Acme Corp\"; W-9 lists \"Acme Corporation LLC\"."
              })
 
     assert updated.status == :needs_review
     assert updated.thread_id == "thread-abc"
     assert updated.company_name == "Acme Corp"
+    assert updated.explanation =~ "Acme Corporation LLC"
 
     # Other concurrently-running async tests broadcast on this same topic, so
     # pin the id we care about rather than asserting on whatever arrives first.

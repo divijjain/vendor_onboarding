@@ -13,6 +13,7 @@ defmodule VendorOnboarding.Schema.VendorOnboarding do
     field :tax_id, VendorOnboarding.Encrypted.Binary
     field :payment_terms, :string
     field :liability_clauses, :string
+    field :explanation, :string
 
     field :document_paths, :map, default: %{}
 
@@ -36,7 +37,8 @@ defmodule VendorOnboarding.Schema.VendorOnboarding do
       :company_name,
       :tax_id,
       :payment_terms,
-      :liability_clauses
+      :liability_clauses,
+      :explanation
     ])
     |> validate_required([:status])
   end

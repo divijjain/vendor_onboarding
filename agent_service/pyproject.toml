@@ -10,6 +10,7 @@ dependencies = [
     "langchain-openai>=1.4.1",
     "langgraph>=1.2.10",
     "langgraph-checkpoint-postgres>=3.1.1",
+    "mcp>=2.0.0",
     "psycopg[binary]>=3.3.4",
     "python-dotenv>=1.2.2",
     "uvicorn[standard]>=0.52.1",
@@ -18,7 +19,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_mode = "auto"

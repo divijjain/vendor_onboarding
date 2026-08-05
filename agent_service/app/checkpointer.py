@@ -3,22 +3,29 @@
 Shares the same Postgres instance as the Elixir app but writes to a
 dedicated `langgraph` schema, so the two stacks' migrations never collide.
 See CONTEXT.md's checkpointer-schema-ownership decision.
+
+Async, because Agent 2's validation node calls the two MCP servers over
+HTTP and the sync `PostgresSaver` doesn't implement the async checkpoint
+methods LangGraph's `ainvoke` needs (`aget_tuple` raises `NotImplementedError`).
 """
 
 import os
-from contextlib import contextmanager
 
 import psycopg
-from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-from psycopg.rows import dict_row
 
 SCHEMA = "langgraph"
 
 # Checkpoint state holds our own ExtractionResult (app/schemas.py), so it must
 # be explicitly allow-listed for msgpack deserialization — otherwise this
 # warns now and will be rejected outright in a future langgraph-checkpoint version.
-ALLOWED_MSGPACK_MODULES = [("app.schemas", "ExtractionResult")]
+ALLOWED_MSGPACK_MODULES = [
+    ("app.schemas", "ContractExtraction"),
+    ("app.schemas", "W9Extraction"),
+    ("app.schemas", "ValidationResult"),
+    ("app.schemas", "EntityMatchResult"),
+]
 
 
 def database_url() -> str:
@@ -37,13 +44,8 @@ def ensure_schema() -> None:
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
 
 
-@contextmanager
 def get_checkpointer():
-    """Context manager yielding a `PostgresSaver` scoped to the `langgraph` schema."""
+    """Async context manager yielding an `AsyncPostgresSaver` scoped to the `langgraph` schema."""
     ensure_schema()
-
-    with psycopg.connect(
-        _conn_string(), autocommit=True, prepare_threshold=0, row_factory=dict_row
-    ) as conn:
-        serde = JsonPlusSerializer(allowed_msgpack_modules=ALLOWED_MSGPACK_MODULES)
-        yield PostgresSaver(conn, serde=serde)
+    serde = JsonPlusSerializer(allowed_msgpack_modules=ALLOWED_MSGPACK_MODULES)
+    return AsyncPostgresSaver.from_conn_string(_conn_string(), serde=serde)
