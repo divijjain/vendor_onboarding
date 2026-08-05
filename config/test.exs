@@ -36,6 +36,11 @@ config :vendor_onboarding, VendorOnboarding.Mailer, adapter: Swoosh.Adapters.Tes
 # Disable swoosh api client as it is only required for production adapters
 config :swoosh, :api_client, false
 
+# Stub the agent service HTTP calls with Req.Test — no real Python process in tests.
+config :vendor_onboarding, VendorOnboarding.AgentService,
+  base_url: "http://localhost:8001",
+  plug: {Req.Test, VendorOnboarding.AgentService}
+
 # Keep test-generated documents out of priv/uploads entirely.
 config :vendor_onboarding,
        :storage_upload_dir,

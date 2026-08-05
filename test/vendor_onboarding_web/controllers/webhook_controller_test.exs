@@ -1,10 +1,12 @@
 defmodule VendorOnboardingWeb.WebhookControllerTest do
   use VendorOnboardingWeb.ConnCase, async: true
 
-  defp payload(contract \\ "contract-bytes", w9 \\ "w9-bytes") do
+  defp payload do
+    unique = System.unique_integer([:positive])
+
     Jason.encode!(%{
-      "contract" => Base.encode64(contract),
-      "w9" => Base.encode64(w9)
+      "contract" => Base.encode64("contract-bytes-#{unique}"),
+      "w9" => Base.encode64("w9-bytes-#{unique}")
     })
   end
 

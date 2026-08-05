@@ -87,6 +87,15 @@ if config_env() == :prod do
         {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V1", key: Base.decode64!(cloak_key), iv_length: 12}
     ]
 
+  agent_service_url =
+    System.get_env("AGENT_SERVICE_URL") ||
+      raise """
+      environment variable AGENT_SERVICE_URL is missing.
+      For example: https://agent-service.internal
+      """
+
+  config :vendor_onboarding, VendorOnboarding.AgentService, base_url: agent_service_url
+
   config :vendor_onboarding, VendorOnboardingWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [

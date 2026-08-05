@@ -10,6 +10,8 @@ config :vendor_onboarding, VendorOnboarding.Repo,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10
 
+config :vendor_onboarding, VendorOnboarding.AgentService, base_url: "http://localhost:8001"
+
 # Dev-only Cloak key for encrypting Tax ID at rest — never reused in prod,
 # where CLOAK_KEY is required via config/runtime.exs.
 config :vendor_onboarding, VendorOnboarding.Vault,
