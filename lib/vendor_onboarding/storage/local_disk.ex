@@ -3,7 +3,9 @@ defmodule VendorOnboarding.Storage.LocalDisk do
 
   @impl true
   def store(path, content) do
-    full_path = Path.join(upload_dir(), path)
+    # Absolute, since the path is later read by the Python agent service —
+    # a different process with a different cwd on the same local machine.
+    full_path = upload_dir() |> Path.join(path) |> Path.expand()
     File.mkdir_p!(Path.dirname(full_path))
     File.write!(full_path, content)
     {:ok, full_path}

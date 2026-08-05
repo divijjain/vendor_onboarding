@@ -73,13 +73,14 @@ Results are written up as a short metrics table in this README once the harness 
 
 ## Status
 
-Build order steps 1–3 complete:
+Build order steps 1–4 complete:
 
 - Step 1: `vendor_onboarding` Ecto schema + migrations, Cloak-encrypted Tax ID column, Oban wired into the supervision tree, the repository/context layering from `PRINCIPLES.md`.
 - Step 2: webhook ingestion end to end — idempotency-key hashing off the raw request body, a config-swappable document storage boundary (local disk for dev/test), the `IngestWebhook` action, and a stub Oban job enqueue, all reachable via `POST /webhooks/vendor_onboarding`.
-- Step 3: the full async round trip — `TriggerAgentRunWorker` calls the Python service via the new `Req`-based `AgentService` client, and a minimal `agent_service/` FastAPI stub (no LangGraph yet) calls back into `POST /webhooks/agent_callback`, which writes status back and broadcasts PubSub. Verified manually end to end (`received` → `processing` → `approved`), not just in tests.
+- Step 3: the full async round trip — `TriggerAgentRunWorker` calls the Python service via the new `Req`-based `AgentService` client, and the `agent_service/` FastAPI app calls back into `POST /webhooks/agent_callback`, which writes status back and broadcasts PubSub. Verified manually end to end (`received` → `processing` → `approved`), not just in tests.
+- Step 4: a real LangGraph graph (`agent_service/app/graph.py`) with Agent 1 (extraction) — a single node running structured-output extraction into `ExtractionResult` (Pydantic). The Postgres checkpointer (`app/checkpointer.py`) is wired in now, in its own `langgraph` schema, even though nothing pauses yet — verified for real against the local Postgres instance (schema/tables created, state round-trips through a `thread_id`). Agent 1 currently defaults to GPT-4o-mini but has no `OPENAI_API_KEY` configured in this environment yet, so live extraction calls are unverified — the graph, checkpointer, and callback plumbing are all tested against an injected fake extractor instead.
 
-39 tests passing, `mix precommit` clean. No real agent logic yet — the Python side is still a stub that returns a canned "approved" result (step 4 replaces it with the actual LangGraph extraction agent). No LiveView yet either. See `CONTEXT.md` for the full build plan and architectural decisions.
+39 Elixir tests + 6 Python tests passing, `mix precommit` clean. Agent 2 (validation + MCP tools + the decision/interrupt branch) doesn't exist yet, so every run currently auto-approves. No LiveView yet either. See `CONTEXT.md` for the full build plan and architectural decisions.
 
 ## Local development
 
@@ -89,5 +90,6 @@ Build order steps 1–3 complete:
 
 The Python agent service (`agent_service/`) runs as a separate process alongside Phoenix during local development:
 
+* Copy `agent_service/.env.example` to `agent_service/.env` and set `OPENAI_API_KEY` to actually run Agent 1's extraction (not required to run `agent_service`'s own test suite)
 * `cd agent_service && uv run uvicorn app.main:app --port 8001`
-* Currently a stub (no LangGraph yet) — `/trigger` acks and calls back with a canned `"approved"` result.
+* `cd agent_service && uv run pytest`
