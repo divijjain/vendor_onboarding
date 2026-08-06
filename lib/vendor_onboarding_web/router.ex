@@ -18,6 +18,8 @@ defmodule VendorOnboardingWeb.Router do
     pipe_through :browser
 
     get "/", PageController, :home
+    live "/onboardings", DashboardLive
+    live "/onboardings/:id", ReviewLive
   end
 
   scope "/webhooks", VendorOnboardingWeb do

@@ -25,6 +25,7 @@ class TriggerRequest(BaseModel):
 
 class ResumeRequest(BaseModel):
     onboarding_id: int
+    thread_id: str
     decision: str
 
 
@@ -43,17 +44,21 @@ def thread_id_for(onboarding_id: int) -> str:
     return f"onboarding-{onboarding_id}"
 
 
-def _callback_payload(onboarding_id: int, result: dict) -> dict:
+def _extraction_fields(result: dict) -> dict:
     contract = result["contract_extraction"]
     w9 = result["w9_extraction"]
 
-    payload = {
-        "onboarding_id": onboarding_id,
+    return {
         "company_name": contract.company_name,
+        "w9_company_name": w9.company_name,
         "tax_id": w9.tax_id,
         "payment_terms": contract.payment_terms,
         "liability_clauses": contract.liability_clauses,
     }
+
+
+def _callback_payload(onboarding_id: int, result: dict) -> dict:
+    payload = {"onboarding_id": onboarding_id, **_extraction_fields(result)}
 
     if "__interrupt__" in result:
         payload["status"] = "needs_review"
@@ -80,24 +85,18 @@ async def run_agent_run(onboarding_id: int, document_paths: dict[str, str]) -> N
     send_callback(_callback_payload(onboarding_id, result))
 
 
-async def run_resume(onboarding_id: int, decision: str) -> None:
+async def run_resume(onboarding_id: int, thread_id: str, decision: str) -> None:
     async with get_checkpointer() as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": thread_id_for(onboarding_id)}}
+        config = {"configurable": {"thread_id": thread_id}}
         result = await graph.ainvoke(Command(resume=decision), config)
-
-    contract = result["contract_extraction"]
-    w9 = result["w9_extraction"]
 
     send_callback(
         {
             "onboarding_id": onboarding_id,
             "status": result["decision"],
-            "company_name": contract.company_name,
-            "tax_id": w9.tax_id,
-            "payment_terms": contract.payment_terms,
-            "liability_clauses": contract.liability_clauses,
             "explanation": result.get("explanation"),
+            **_extraction_fields(result),
         }
     )
 
@@ -112,5 +111,7 @@ def trigger(request: TriggerRequest, background_tasks: BackgroundTasks) -> dict:
 
 @app.post("/resume", status_code=202)
 def resume(request: ResumeRequest, background_tasks: BackgroundTasks) -> dict:
-    background_tasks.add_task(run_resume, request.onboarding_id, request.decision)
+    background_tasks.add_task(
+        run_resume, request.onboarding_id, request.thread_id, request.decision
+    )
     return {"accepted": True, "onboarding_id": request.onboarding_id}

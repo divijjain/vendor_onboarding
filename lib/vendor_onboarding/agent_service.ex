@@ -8,9 +8,18 @@ defmodule VendorOnboarding.AgentService do
 
   @spec trigger(map()) :: {:ok, map()} | {:error, term()}
   def trigger(%{onboarding_id: _, document_paths: _} = payload) do
+    post("/trigger", payload)
+  end
+
+  @spec resume(map()) :: {:ok, map()} | {:error, term()}
+  def resume(%{onboarding_id: _, thread_id: _, decision: _} = payload) do
+    post("/resume", payload)
+  end
+
+  defp post(path, payload) do
     req_options()
     |> Req.new()
-    |> Req.post(url: "/trigger", json: payload)
+    |> Req.post(url: path, json: payload)
     |> handle_response()
   rescue
     exception -> {:error, exception}

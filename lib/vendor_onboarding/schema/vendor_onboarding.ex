@@ -10,6 +10,7 @@ defmodule VendorOnboarding.Schema.VendorOnboarding do
     field :idempotency_key, :string
 
     field :company_name, :string
+    field :w9_company_name, :string
     field :tax_id, VendorOnboarding.Encrypted.Binary
     field :payment_terms, :string
     field :liability_clauses, :string
@@ -35,6 +36,7 @@ defmodule VendorOnboarding.Schema.VendorOnboarding do
       :status,
       :thread_id,
       :company_name,
+      :w9_company_name,
       :tax_id,
       :payment_terms,
       :liability_clauses,

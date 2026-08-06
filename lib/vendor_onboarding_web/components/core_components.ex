@@ -452,6 +452,26 @@ defmodule VendorOnboardingWeb.CoreComponents do
     """
   end
 
+  @doc """
+  Renders a vendor onboarding status as a colored badge.
+
+  ## Examples
+
+      <.status_badge status={:needs_review} />
+  """
+  attr :status, :atom, required: true
+
+  def status_badge(assigns) do
+    ~H"""
+    <span class={["badge", status_badge_class(@status)]}>{@status}</span>
+    """
+  end
+
+  defp status_badge_class(:approved), do: "badge-success"
+  defp status_badge_class(:needs_review), do: "badge-warning"
+  defp status_badge_class(:rejected), do: "badge-error"
+  defp status_badge_class(_status), do: "badge-neutral"
+
   ## JS Commands
 
   def show(js \\ %JS{}, selector) do
