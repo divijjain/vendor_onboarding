@@ -59,7 +59,7 @@ The core resume claim — "0% hallucination rate on extracted entities" — is o
 | Subtle formatting difference, not a real mismatch | 3 | false-positive rate — the detail that makes "100% accuracy" credible rather than cherry-picked |
 | Missing/malformed fields | 2 | graceful degradation |
 
-Results are written up as a short metrics table in this README once the harness runs, not just asserted.
+Results are written up as a short metrics table in this README once the harness runs for real (with both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` configured), not just asserted. See `agent_service/evals/` and the Status section below for where that stands.
 
 ## Tech stack
 
@@ -73,7 +73,7 @@ Results are written up as a short metrics table in this README once the harness 
 
 ## Status
 
-Build order steps 1–6 complete:
+Build order steps 1–7 complete:
 
 - Step 1: `vendor_onboarding` Ecto schema + migrations, Cloak-encrypted Tax ID column, Oban wired into the supervision tree, the repository/context layering from `PRINCIPLES.md`.
 - Step 2: webhook ingestion end to end — idempotency-key hashing off the raw request body, a config-swappable document storage boundary (local disk for dev/test), the `IngestWebhook` action, and a stub Oban job enqueue, all reachable via `POST /webhooks/vendor_onboarding`.
@@ -81,8 +81,9 @@ Build order steps 1–6 complete:
 - Step 4: a real LangGraph graph with Agent 1 (extraction) and the Postgres checkpointer (`app/checkpointer.py`), in its own `langgraph` schema.
 - Step 5: Agent 1 now extracts the contract and W-9 **separately** (`ContractExtraction` / `W9Extraction`) so Agent 2 has two independent company names to cross-check — not one merged extraction with nothing to compare. Agent 2 calls two real, separate MCP tool servers (`mcp_servers/tax_api/`, `mcp_servers/sanctions_db/`, each its own FastAPI + `MCPServer` process talking real MCP-over-HTTP) plus an LLM-based entity-match judgment (not string equality, so formatting differences like "Corp" vs "Corporation" don't false-positive). On a discrepancy, the graph drafts an explanation and calls `interrupt()` — checkpointed to Postgres, carrying a `thread_id` back to Phoenix via the `needs_review` callback. **Verified for real**: the interrupt/resume round trip was run across two separate Python processes (simulating a restart) against the live local Postgres instance, and it resumed correctly — the durable-pause claim this project is built around.
 - Step 6: `DashboardLive` (`/onboardings`) lists every onboarding with a live status badge, PubSub-driven — a callback landing anywhere reloads just that row, not the whole list. `ReviewLive` (`/onboardings/:id`) shows the side-by-side contract-vs-W-9 diff (the headline name-mismatch scenario) plus the agent's drafted explanation, with Approve/Reject buttons that call `VendorOnboarding.resume_review/2` → `AgentService.resume/1` → the Python `/resume` endpoint built in step 5. Resume doesn't write status locally — the Python callback stays the single writer of final status. Verified in a real running server (no headless-browser tool available in this environment, so verified via the actual HTTP responses + Phoenix logs rather than a screenshot): both pages render correctly against a live `needs_review` row with no errors in the logs.
+- Step 7: the 20 synthetic documents (`agent_service/evals/fixtures.py`) in the exact 10/5/3/2 split from the table above, and the two-tier harness (`agent_service/evals/`) — deterministic Tax-ID-verbatim checks plus a DeepEval `GEval` judge tier (Claude Sonnet) for entity-mapping correctness and explanation groundedness, called directly against the LangGraph graph, bypassing Phoenix. **Not yet run for real** — this environment has neither `OPENAI_API_KEY` nor `ANTHROPIC_API_KEY`, so the harness's own plumbing is proven with an injected fake agent (which hits the correct expected decision on all 20/20 fixtures — see `tests/evals_tests/test_run.py`) rather than an actual accuracy number. The metrics table above stays a placeholder until someone runs `cd agent_service && uv run python -m evals.run` with real keys.
 
-45 Elixir tests + 17 Python tests passing, `mix precommit` clean. Every LLM call (both extractions, entity-match, explanation-drafting) is built against GPT-4o-mini but is dependency-injected in `app/graph.py` — there's no `OPENAI_API_KEY` configured in this dev environment yet, so all of the above is verified with injected fake LLM calls plus the two *real* MCP servers and the *real* Postgres checkpointer, not a live GPT-4o-mini call. See `CONTEXT.md` for the full build plan and architectural decisions.
+45 Elixir tests + 28 Python tests passing, `mix precommit` clean. Every LLM call (both extractions, entity-match, explanation-drafting, and the DeepEval judge) is built against GPT-4o-mini / Claude Sonnet but is dependency-injected — there's no `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` configured in this dev environment yet, so all of the above is verified with injected fake LLM calls plus the two *real* MCP servers and the *real* Postgres checkpointer, not a live model call. See `CONTEXT.md` for the full build plan and architectural decisions.
 
 ## Local development
 
@@ -92,8 +93,9 @@ Build order steps 1–6 complete:
 
 The Python agent service (`agent_service/`) and its two MCP tool servers run as separate processes alongside Phoenix during local development:
 
-* Copy `agent_service/.env.example` to `agent_service/.env` and set `OPENAI_API_KEY` to actually run the real LLM calls (not required to run `agent_service`'s own test suite)
+* Copy `agent_service/.env.example` to `agent_service/.env` and set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (DeepEval judge) to actually run the real LLM calls (neither is required to run `agent_service`'s own test suite)
 * `cd agent_service && uv run uvicorn app.main:app --port 8001`
 * `cd agent_service && uv run uvicorn mcp_servers.tax_api.main:app --port 8010`
 * `cd agent_service && uv run uvicorn mcp_servers.sanctions_db.main:app --port 8011`
 * `cd agent_service && uv run pytest`
+* `cd agent_service && uv run python -m evals.run` — the eval harness; deterministic tier only needs `OPENAI_API_KEY` (+ the two MCP servers running), the GEval judge tier also needs `ANTHROPIC_API_KEY`
