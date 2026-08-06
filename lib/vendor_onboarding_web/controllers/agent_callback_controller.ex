@@ -2,11 +2,11 @@ defmodule VendorOnboardingWeb.AgentCallbackController do
   use VendorOnboardingWeb, :controller
 
   def create(conn, params) do
-    case VendorOnboarding.handle_agent_callback(params) do
-      {:ok, onboarding} ->
+    case VendorOnboarding.AgentRuns.handle_agent_callback(params) do
+      {:ok, agent_run} ->
         conn
         |> put_status(:ok)
-        |> json(%{id: onboarding.id, status: onboarding.status})
+        |> json(%{onboarding_id: agent_run.vendor_onboarding_id, status: agent_run.status})
 
       {:error, :not_found} ->
         conn

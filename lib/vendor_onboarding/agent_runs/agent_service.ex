@@ -1,4 +1,4 @@
-defmodule VendorOnboarding.AgentService do
+defmodule VendorOnboarding.AgentRuns.AgentService do
   @moduledoc """
   The only module that makes HTTP calls to the Python/FastAPI agent service.
   Built on `Req`. This is the one place rescue/timeout handling belongs —

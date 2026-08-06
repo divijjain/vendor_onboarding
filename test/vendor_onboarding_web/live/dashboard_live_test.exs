@@ -1,22 +1,31 @@
 defmodule VendorOnboardingWeb.DashboardLiveTest do
   use VendorOnboardingWeb.ConnCase, async: true
 
-  alias VendorOnboarding.Repository
+  alias VendorOnboarding.AgentRuns
+  alias VendorOnboarding.Onboardings
 
   defp insert_onboarding(key) do
-    {:ok, onboarding} = Repository.insert(%{idempotency_key: key, document_paths: %{}})
+    {:ok, onboarding} =
+      Onboardings.Repository.insert(%{idempotency_key: key, document_paths: %{}})
+
+    onboarding
+  end
+
+  defp mark_needs_review(onboarding) do
+    {:ok, run} =
+      AgentRuns.Repository.insert(%{vendor_onboarding_id: onboarding.id, status: :processing})
+
+    {:ok, _run} =
+      AgentRuns.Repository.update_result(run, %{status: :needs_review, thread_id: "t-1"})
+
+    {:ok, onboarding} = Onboardings.update_status(onboarding.id, :needs_review)
     onboarding
   end
 
   test "lists onboardings with a status badge and a review link only when needs_review",
        %{conn: conn} do
     received = insert_onboarding("dash-received")
-
-    needs_review =
-      "dash-needs-review"
-      |> insert_onboarding()
-      |> then(&Repository.update_agent_result(&1, %{status: :needs_review, thread_id: "t-1"}))
-      |> then(fn {:ok, onboarding} -> onboarding end)
+    needs_review = "dash-needs-review" |> insert_onboarding() |> mark_needs_review()
 
     {:ok, _view, html} = live(conn, ~p"/onboardings")
 
@@ -32,7 +41,7 @@ defmodule VendorOnboardingWeb.DashboardLiveTest do
     assert html =~ "received"
     refute render(view) =~ "approved"
 
-    {:ok, _updated} = Repository.update_agent_result(onboarding, %{status: :approved})
+    {:ok, _updated} = Onboardings.update_status(onboarding.id, :approved)
 
     Phoenix.PubSub.broadcast(
       VendorOnboarding.PubSub,

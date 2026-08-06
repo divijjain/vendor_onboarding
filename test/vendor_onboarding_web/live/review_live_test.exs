@@ -1,25 +1,33 @@
 defmodule VendorOnboardingWeb.ReviewLiveTest do
   use VendorOnboardingWeb.ConnCase, async: true
 
-  alias VendorOnboarding.Repository
+  alias VendorOnboarding.AgentRuns
+  alias VendorOnboarding.AgentRuns.AgentService
+  alias VendorOnboarding.Onboardings
 
   defp needs_review_onboarding do
     {:ok, onboarding} =
-      Repository.insert(%{
+      Onboardings.Repository.insert(%{
         idempotency_key: "review-#{System.unique_integer([:positive])}",
         document_paths: %{}
       })
 
-    Repository.update_agent_result(onboarding, %{
-      status: :needs_review,
-      thread_id: "onboarding-#{onboarding.id}",
-      company_name: "Acme Corp",
-      w9_company_name: "Totally Different LLC",
-      tax_id: "12-3456789",
-      payment_terms: "Net 30",
-      liability_clauses: "Standard.",
-      explanation: "Names do not match."
-    })
+    {:ok, run} =
+      AgentRuns.Repository.insert(%{vendor_onboarding_id: onboarding.id, status: :processing})
+
+    {:ok, _run} =
+      AgentRuns.Repository.update_result(run, %{
+        status: :needs_review,
+        thread_id: "onboarding-#{onboarding.id}",
+        company_name: "Acme Corp",
+        w9_company_name: "Totally Different LLC",
+        tax_id: "12-3456789",
+        payment_terms: "Net 30",
+        liability_clauses: "Standard.",
+        explanation: "Names do not match."
+      })
+
+    Onboardings.update_status(onboarding.id, :needs_review)
   end
 
   test "shows the side-by-side contract/W-9 diff and the drafted explanation", %{conn: conn} do
@@ -38,7 +46,7 @@ defmodule VendorOnboardingWeb.ReviewLiveTest do
   test "approve calls resume_review and shows a flash", %{conn: conn} do
     {:ok, onboarding} = needs_review_onboarding()
 
-    Req.Test.stub(VendorOnboarding.AgentService, fn conn ->
+    Req.Test.stub(AgentService, fn conn ->
       Req.Test.json(conn, %{"accepted" => true})
     end)
 
@@ -51,7 +59,7 @@ defmodule VendorOnboardingWeb.ReviewLiveTest do
   test "shows an error flash when the agent service call fails", %{conn: conn} do
     {:ok, onboarding} = needs_review_onboarding()
 
-    Req.Test.stub(VendorOnboarding.AgentService, fn conn ->
+    Req.Test.stub(AgentService, fn conn ->
       Plug.Conn.send_resp(conn, 500, "boom")
     end)
 
@@ -63,9 +71,9 @@ defmodule VendorOnboardingWeb.ReviewLiveTest do
 
   test "hides approve/reject once no longer awaiting review", %{conn: conn} do
     {:ok, onboarding} =
-      Repository.insert(%{idempotency_key: "review-approved", document_paths: %{}})
+      Onboardings.Repository.insert(%{idempotency_key: "review-approved", document_paths: %{}})
 
-    {:ok, onboarding} = Repository.update_agent_result(onboarding, %{status: :approved})
+    {:ok, onboarding} = Onboardings.update_status(onboarding.id, :approved)
 
     {:ok, _view, html} = live(conn, ~p"/onboardings/#{onboarding.id}")
 

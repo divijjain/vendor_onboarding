@@ -37,9 +37,9 @@ config :vendor_onboarding, VendorOnboarding.Mailer, adapter: Swoosh.Adapters.Tes
 config :swoosh, :api_client, false
 
 # Stub the agent service HTTP calls with Req.Test — no real Python process in tests.
-config :vendor_onboarding, VendorOnboarding.AgentService,
+config :vendor_onboarding, VendorOnboarding.AgentRuns.AgentService,
   base_url: "http://localhost:8001",
-  plug: {Req.Test, VendorOnboarding.AgentService}
+  plug: {Req.Test, VendorOnboarding.AgentRuns.AgentService}
 
 # Keep test-generated documents out of priv/uploads entirely.
 config :vendor_onboarding,

@@ -20,7 +20,7 @@ defmodule VendorOnboardingWeb.WebhookControllerTest do
     conn = post_webhook(conn, payload())
 
     assert %{"id" => id, "status" => "received"} = json_response(conn, 201)
-    assert {:ok, onboarding} = VendorOnboarding.get_onboarding(id)
+    assert {:ok, onboarding} = VendorOnboarding.Onboardings.get_onboarding(id)
 
     on_exit(fn ->
       onboarding.document_paths["contract"] |> Path.dirname() |> File.rm_rf()
@@ -35,7 +35,7 @@ defmodule VendorOnboardingWeb.WebhookControllerTest do
     conn2 = post_webhook(build_conn(), raw_payload)
     assert json_response(conn2, 200) == %{"status" => "duplicate_ignored"}
 
-    assert {:ok, onboarding} = VendorOnboarding.get_onboarding(id)
+    assert {:ok, onboarding} = VendorOnboarding.Onboardings.get_onboarding(id)
 
     on_exit(fn ->
       onboarding.document_paths["contract"] |> Path.dirname() |> File.rm_rf()

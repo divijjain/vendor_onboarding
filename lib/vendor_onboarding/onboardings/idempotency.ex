@@ -1,4 +1,4 @@
-defmodule VendorOnboarding.Idempotency do
+defmodule VendorOnboarding.Onboardings.Idempotency do
   @moduledoc """
   Pure hash computation — no DB, no side effects. See `Repository` for
   the uniqueness check this key is used against.

@@ -1,7 +1,7 @@
-defmodule VendorOnboarding.RepositoryTest do
+defmodule VendorOnboarding.Onboardings.RepositoryTest do
   use VendorOnboarding.DataCase, async: true
 
-  alias VendorOnboarding.Repository
+  alias VendorOnboarding.Onboardings.Repository
 
   @valid_attrs %{
     idempotency_key: "abc123",
@@ -52,39 +52,16 @@ defmodule VendorOnboarding.RepositoryTest do
     end
   end
 
-  describe "update_agent_result/2" do
-    test "writes back status, thread_id, and encrypted tax_id" do
+  describe "update_status/2" do
+    test "updates the status" do
       {:ok, onboarding} = Repository.insert(@valid_attrs)
 
-      assert {:ok, updated} =
-               Repository.update_agent_result(onboarding, %{
-                 status: :needs_review,
-                 thread_id: "thread-1",
-                 company_name: "Acme Corp",
-                 tax_id: "12-3456789",
-                 payment_terms: "Net 30",
-                 liability_clauses: "Standard indemnification clause."
-               })
-
-      assert updated.status == :needs_review
-      assert updated.thread_id == "thread-1"
-      assert updated.tax_id == "12-3456789"
+      assert {:ok, updated} = Repository.update_status(onboarding.id, :processing)
+      assert updated.status == :processing
     end
 
-    test "persists tax_id encrypted at rest, not as plaintext" do
-      {:ok, onboarding} = Repository.insert(@valid_attrs)
-
-      {:ok, _updated} =
-        Repository.update_agent_result(onboarding, %{status: :approved, tax_id: "12-3456789"})
-
-      %{rows: [[raw_binary]]} =
-        Ecto.Adapters.SQL.query!(
-          VendorOnboarding.Repo,
-          "SELECT tax_id FROM vendor_onboardings WHERE id = $1",
-          [onboarding.id]
-        )
-
-      refute raw_binary == "12-3456789"
+    test "returns {:error, :not_found} for a missing id" do
+      assert Repository.update_status(-1, :processing) == {:error, :not_found}
     end
   end
 
@@ -98,7 +75,7 @@ defmodule VendorOnboarding.RepositoryTest do
           document_paths: @valid_attrs.document_paths
         })
 
-      {:ok, approved} = Repository.update_agent_result(approved, %{status: :approved})
+      {:ok, approved} = Repository.update_status(approved.id, :approved)
 
       assert [found] = Repository.list(status: :approved)
       assert found.id == approved.id

@@ -1,13 +1,15 @@
 defmodule VendorOnboardingWeb.DashboardLive do
   use VendorOnboardingWeb, :live_view
 
+  alias VendorOnboarding.Onboardings
+
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
       Phoenix.PubSub.subscribe(VendorOnboarding.PubSub, "vendor_onboarding")
     end
 
-    {:ok, assign(socket, onboardings: VendorOnboarding.list_onboardings())}
+    {:ok, assign(socket, onboardings: Onboardings.list_onboardings_with_latest_run())}
   end
 
   @impl true
@@ -16,7 +18,7 @@ defmodule VendorOnboardingWeb.DashboardLive do
   end
 
   defp reload_row(onboardings, id) do
-    case VendorOnboarding.get_onboarding(id) do
+    case Onboardings.reload_onboarding_row(id) do
       {:ok, updated} -> replace_or_prepend(onboardings, updated)
       {:error, :not_found} -> onboardings
     end

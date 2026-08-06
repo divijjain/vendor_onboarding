@@ -1,7 +1,7 @@
-defmodule VendorOnboarding.IdempotencyTest do
+defmodule VendorOnboarding.Onboardings.IdempotencyTest do
   use ExUnit.Case, async: true
 
-  alias VendorOnboarding.Idempotency
+  alias VendorOnboarding.Onboardings.Idempotency
 
   test "hash/1 is deterministic for identical payloads" do
     payload = ~s({"contract":"abc","w9":"def"})

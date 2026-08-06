@@ -1,14 +1,15 @@
-defmodule VendorOnboarding.Actions.IngestWebhook do
+defmodule VendorOnboarding.Onboardings.Actions.IngestWebhook do
   @moduledoc """
   Idempotency check, document storage, row creation, and job enqueue for
-  an incoming vendor webhook payload. Called only via `VendorOnboarding.ingest_webhook/1`.
+  an incoming vendor webhook payload. Called only via `VendorOnboarding.Onboardings.ingest_webhook/1`.
   """
 
-  alias VendorOnboarding.{Idempotency, Repository, Storage}
-  alias VendorOnboarding.Workers.TriggerAgentRunWorker
+  alias VendorOnboarding.AgentRuns
+  alias VendorOnboarding.Onboardings.{Idempotency, Repository}
+  alias VendorOnboarding.Storage
 
   @spec call(binary()) ::
-          {:ok, VendorOnboarding.Schema.VendorOnboarding.t()}
+          {:ok, VendorOnboarding.Onboardings.Schema.Onboarding.t()}
           | {:error, :duplicate | :invalid_payload | Ecto.Changeset.t()}
   def call(raw_payload) when is_binary(raw_payload) do
     idempotency_key = Idempotency.hash(raw_payload)
@@ -23,7 +24,7 @@ defmodule VendorOnboarding.Actions.IngestWebhook do
                idempotency_key: idempotency_key,
                document_paths: document_paths
              }) do
-        enqueue_agent_run(onboarding)
+        AgentRuns.enqueue_trigger(onboarding.id)
         {:ok, onboarding}
       end
     end
@@ -44,11 +45,5 @@ defmodule VendorOnboarding.Actions.IngestWebhook do
          {:ok, w9_path} <- Storage.store("#{idempotency_key}/w9.pdf", w9) do
       {:ok, %{"contract" => contract_path, "w9" => w9_path}}
     end
-  end
-
-  defp enqueue_agent_run(onboarding) do
-    %{onboarding_id: onboarding.id}
-    |> TriggerAgentRunWorker.new()
-    |> Oban.insert()
   end
 end

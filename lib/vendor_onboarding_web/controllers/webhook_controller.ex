@@ -2,7 +2,7 @@ defmodule VendorOnboardingWeb.WebhookController do
   use VendorOnboardingWeb, :controller
 
   def create(conn, _params) do
-    case VendorOnboarding.ingest_webhook(conn.assigns.raw_body) do
+    case VendorOnboarding.Onboardings.ingest_webhook(conn.assigns.raw_body) do
       {:ok, onboarding} ->
         conn
         |> put_status(:created)

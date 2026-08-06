@@ -9,9 +9,13 @@
 Phoenix is the durable control plane; the Python/FastAPI + LangGraph service under
 `agent_service/` is the stateless-per-call agent brain. Phoenix never calls it
 synchronously — always webhook → Oban job → async HTTP call → callback webhook.
-`thread_id` on the `vendor_onboarding` row is what lets a human approval in LiveView
-resume a specific paused LangGraph run. See CONTEXT.md for the full rationale; don't
-re-litigate the async/callback shape without a real reason.
+The Elixir side is two contexts, not one: `Onboardings` owns the ingestion record
+and aggregate status (`onboardings` table), `AgentRuns` owns each run's
+extracted/validated output as its own row (`agent_runs` table, `belongs_to :vendor_onboarding`)
+so re-runs keep history instead of overwriting columns. `thread_id` lives on the
+`agent_runs` row and is what lets a human approval in LiveView resume a specific
+paused LangGraph run. See CONTEXT.md for the full rationale; don't re-litigate the
+async/callback shape or the two-context split without a real reason.
 
 ---
 
@@ -19,13 +23,15 @@ re-litigate the async/callback shape without a real reason.
 
 Follow **PRINCIPLES.md** exactly. Key reminders:
 
-- `vendor_onboarding.ex` contains **only `defdelegate`** — no logic
-- All `Repo.*` calls live exclusively in `vendor_onboarding/repository.ex`
-- All HTTP calls to the Python service live exclusively in `vendor_onboarding/agent_service.ex`,
+- `onboardings.ex` / `agent_runs.ex` contain **only `defdelegate`** — no logic
+- All `Repo.*` calls for a context's table live exclusively in that context's `repository.ex`
+- Neither context ever queries the other's schema directly — only via its public API
+  (`Onboardings.*` / `AgentRuns.*`)
+- All HTTP calls to the Python service live exclusively in `agent_runs/agent_service.ex`,
   built on `Req` (never HTTPoison/Tesla/httpc)
-- Actions (`actions/*.ex`) coordinate repository + agent_service calls — never call `Repo.*` or
-  `Req.*` directly themselves
-- LiveView `handle_event` callbacks are ≤ 5 lines — delegate to `VendorOnboarding` immediately
+- Actions (`actions/*.ex`) coordinate repository + the other context's public API + agent_service
+  calls — never call `Repo.*` or `Req.*` directly themselves
+- LiveView `handle_event` callbacks are ≤ 5 lines — delegate to `Onboardings`/`AgentRuns` immediately
 - Return `{:ok, result} | {:error, reason}` from every context function
 - Bang functions (`get_onboarding!/1`) only in LiveView assigns — never in business logic
 
@@ -84,20 +90,32 @@ mix precommit
 
 This runs: `compile --warnings-as-errors`, `deps.unlock --unused`, `format`, `test`.
 
+`mix dialyzer` is set up separately (not part of `precommit` — the first PLT build is
+slow, ~1 min; reruns are fast, a few seconds). Run it after touching `@spec`s or schema
+types. Every schema module must declare `@type t` — Ecto doesn't generate one, and a
+`@spec` referencing `SomeSchema.t()` without it is a silent `unknown_type` dialyzer
+error, not a compile error.
+
 ---
 
 ## File naming conventions
 
 ```
-lib/vendor_onboarding/schema/vendor_onboarding.ex
-lib/vendor_onboarding/actions/ingest_webhook.ex
-lib/vendor_onboarding/actions/trigger_agent_run.ex
-lib/vendor_onboarding/actions/handle_agent_callback.ex
-lib/vendor_onboarding/actions/resume_review.ex
-lib/vendor_onboarding/agent_service.ex
-lib/vendor_onboarding/repository.ex
-lib/vendor_onboarding/idempotency.ex
-lib/vendor_onboarding.ex
+lib/vendor_onboarding/onboardings/schema/onboarding.ex
+lib/vendor_onboarding/onboardings/actions/ingest_webhook.ex
+lib/vendor_onboarding/onboardings/actions/list_with_latest_run.ex
+lib/vendor_onboarding/onboardings/repository.ex
+lib/vendor_onboarding/onboardings/idempotency.ex
+lib/vendor_onboarding/onboardings.ex
+
+lib/vendor_onboarding/agent_runs/schema/agent_run.ex
+lib/vendor_onboarding/agent_runs/actions/trigger_agent_run.ex
+lib/vendor_onboarding/agent_runs/actions/handle_agent_callback.ex
+lib/vendor_onboarding/agent_runs/actions/resume_review.ex
+lib/vendor_onboarding/agent_runs/workers/trigger_agent_run_worker.ex
+lib/vendor_onboarding/agent_runs/agent_service.ex
+lib/vendor_onboarding/agent_runs/repository.ex
+lib/vendor_onboarding/agent_runs.ex
 
 lib/vendor_onboarding_web/controllers/webhook_controller.ex
 lib/vendor_onboarding_web/controllers/agent_callback_controller.ex
