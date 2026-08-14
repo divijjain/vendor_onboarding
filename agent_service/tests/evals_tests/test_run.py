@@ -9,7 +9,13 @@ import re
 
 import evals.judge as judge_module
 from app.graph import build_graph
-from app.schemas import ContractExtraction, EntityMatchResult, W9Extraction
+from app.schemas import (
+    ContractExtraction,
+    EntityMatchResult,
+    SanctionsScreeningResult,
+    TaxValidationResult,
+    W9Extraction,
+)
 from evals.fixtures import FIXTURES
 from evals.run import bucket_accuracy, run_all, run_judge_tier
 
@@ -42,12 +48,12 @@ async def fake_entity_match(contract_name: str, w9_name: str) -> EntityMatchResu
     return EntityMatchResult(match=match, explanation="fake normalized token-set comparison")
 
 
-async def fake_validate_tax_id(tax_id: str) -> dict:
-    return {"valid": bool(_EIN_PATTERN.match(tax_id.strip()))}
+async def fake_validate_tax_id(tax_id: str) -> TaxValidationResult:
+    return TaxValidationResult(valid=bool(_EIN_PATTERN.match(tax_id.strip())))
 
 
-async def fake_screen_vendor(company_name: str) -> dict:
-    return {"flagged": False, "reason": None}
+async def fake_screen_vendor(company_name: str) -> SanctionsScreeningResult:
+    return SanctionsScreeningResult(flagged=False, reason=None)
 
 
 async def fake_draft_explanation(findings: str) -> str:

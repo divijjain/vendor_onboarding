@@ -9,7 +9,7 @@ defmodule VendorOnboarding.Onboardings.Schema.Onboarding do
   use Ecto.Schema
   import Ecto.Changeset
 
-  @statuses [:received, :processing, :needs_review, :approved, :rejected]
+  @statuses [:received, :processing, :needs_review, :approved, :rejected, :failed]
 
   schema "onboardings" do
     field :status, Ecto.Enum, values: @statuses, default: :received
@@ -21,7 +21,7 @@ defmodule VendorOnboarding.Onboardings.Schema.Onboarding do
 
   @type t :: %__MODULE__{
           id: pos_integer() | nil,
-          status: :received | :processing | :needs_review | :approved | :rejected,
+          status: :received | :processing | :needs_review | :approved | :rejected | :failed,
           idempotency_key: String.t() | nil,
           document_paths: %{optional(String.t()) => String.t()},
           inserted_at: DateTime.t() | nil,

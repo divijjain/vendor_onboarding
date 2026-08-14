@@ -2,7 +2,13 @@ from langgraph.types import Command
 
 from app.checkpointer import get_checkpointer
 from app.graph import build_graph
-from app.schemas import ContractExtraction, EntityMatchResult, W9Extraction
+from app.schemas import (
+    ContractExtraction,
+    EntityMatchResult,
+    SanctionsScreeningResult,
+    TaxValidationResult,
+    W9Extraction,
+)
 
 
 async def fake_extract_contract(contract_text: str) -> ContractExtraction:
@@ -24,20 +30,20 @@ async def fake_entity_match(contract_name: str, w9_name: str) -> EntityMatchResu
     return EntityMatchResult(match=match, explanation="fake exact-string comparison")
 
 
-async def fake_validate_tax_id_valid(tax_id: str) -> dict:
-    return {"valid": True}
+async def fake_validate_tax_id_valid(tax_id: str) -> TaxValidationResult:
+    return TaxValidationResult(valid=True)
 
 
-async def fake_validate_tax_id_invalid(tax_id: str) -> dict:
-    return {"valid": False}
+async def fake_validate_tax_id_invalid(tax_id: str) -> TaxValidationResult:
+    return TaxValidationResult(valid=False)
 
 
-async def fake_screen_vendor_clean(company_name: str) -> dict:
-    return {"flagged": False, "reason": None}
+async def fake_screen_vendor_clean(company_name: str) -> SanctionsScreeningResult:
+    return SanctionsScreeningResult(flagged=False, reason=None)
 
 
-async def fake_screen_vendor_flagged(company_name: str) -> dict:
-    return {"flagged": True, "reason": "Matched sanctions watchlist entry"}
+async def fake_screen_vendor_flagged(company_name: str) -> SanctionsScreeningResult:
+    return SanctionsScreeningResult(flagged=True, reason="Matched sanctions watchlist entry")
 
 
 async def fake_draft_explanation(findings: str) -> str:

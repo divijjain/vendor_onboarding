@@ -8,7 +8,7 @@ defmodule VendorOnboarding.AgentRuns.Schema.AgentRun do
   use Ecto.Schema
   import Ecto.Changeset
 
-  @statuses [:processing, :needs_review, :approved, :rejected]
+  @statuses [:processing, :needs_review, :approved, :rejected, :failed]
 
   schema "agent_runs" do
     belongs_to :vendor_onboarding, VendorOnboarding.Onboardings.Schema.Onboarding
@@ -29,7 +29,7 @@ defmodule VendorOnboarding.AgentRuns.Schema.AgentRun do
   @type t :: %__MODULE__{
           id: pos_integer() | nil,
           vendor_onboarding_id: pos_integer() | nil,
-          status: :processing | :needs_review | :approved | :rejected,
+          status: :processing | :needs_review | :approved | :rejected | :failed,
           thread_id: String.t() | nil,
           company_name: String.t() | nil,
           w9_company_name: String.t() | nil,

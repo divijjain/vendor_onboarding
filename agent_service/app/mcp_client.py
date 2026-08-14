@@ -9,6 +9,8 @@ import os
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from app.schemas import SanctionsScreeningResult, TaxValidationResult
+
 
 def tax_api_url() -> str:
     return os.environ.get("TAX_API_MCP_URL", "http://localhost:8010/mcp")
@@ -26,9 +28,11 @@ async def _call_tool(url: str, tool_name: str, arguments: dict) -> dict:
             return json.loads(result.content[0].text)
 
 
-async def validate_tax_id(tax_id: str) -> dict:
-    return await _call_tool(tax_api_url(), "validate_tax_id", {"tax_id": tax_id})
+async def validate_tax_id(tax_id: str) -> TaxValidationResult:
+    raw = await _call_tool(tax_api_url(), "validate_tax_id", {"tax_id": tax_id})
+    return TaxValidationResult(**raw)
 
 
-async def screen_vendor(company_name: str) -> dict:
-    return await _call_tool(sanctions_db_url(), "screen_vendor", {"company_name": company_name})
+async def screen_vendor(company_name: str) -> SanctionsScreeningResult:
+    raw = await _call_tool(sanctions_db_url(), "screen_vendor", {"company_name": company_name})
+    return SanctionsScreeningResult(**raw)

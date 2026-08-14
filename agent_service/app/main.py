@@ -1,3 +1,4 @@
+import logging
 import os
 
 import httpx
@@ -8,14 +9,17 @@ from pydantic import BaseModel
 
 from app.checkpointer import get_checkpointer
 from app.graph import build_graph
+from app.schemas import CallbackPayload
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
-PHOENIX_CALLBACK_URL = os.environ.get(
-    "PHOENIX_CALLBACK_URL", "http://localhost:4000/webhooks/agent_callback"
-)
+
+def callback_url() -> str:
+    return os.environ.get("PHOENIX_CALLBACK_URL", "http://localhost:4000/webhooks/agent_callback")
 
 
 class TriggerRequest(BaseModel):
@@ -29,6 +33,11 @@ class ResumeRequest(BaseModel):
     decision: str
 
 
+class AcceptedResponse(BaseModel):
+    accepted: bool
+    onboarding_id: int
+
+
 def read_document(path: str) -> str:
     # Documents are simulated vendor emails, not real binary PDFs — see
     # CONTEXT.md's "(simulated payload)" framing — so plain-text read is enough.
@@ -36,8 +45,11 @@ def read_document(path: str) -> str:
         return f.read()
 
 
-def send_callback(payload: dict) -> None:
-    httpx.post(PHOENIX_CALLBACK_URL, json=payload, timeout=30)
+async def send_callback(payload: CallbackPayload) -> None:
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            callback_url(), json=payload.model_dump(exclude_none=True), timeout=30
+        )
 
 
 def thread_id_for(onboarding_id: int) -> str:
@@ -57,61 +69,81 @@ def _extraction_fields(result: dict) -> dict:
     }
 
 
-def _callback_payload(onboarding_id: int, result: dict) -> dict:
-    payload = {"onboarding_id": onboarding_id, **_extraction_fields(result)}
+def _callback_payload(onboarding_id: int, result: dict) -> CallbackPayload:
+    fields = _extraction_fields(result)
 
     if "__interrupt__" in result:
-        payload["status"] = "needs_review"
-        payload["thread_id"] = thread_id_for(onboarding_id)
-        payload["explanation"] = result["__interrupt__"][0].value["explanation"]
-    else:
-        payload["status"] = "approved"
+        return CallbackPayload(
+            onboarding_id=onboarding_id,
+            status="needs_review",
+            thread_id=thread_id_for(onboarding_id),
+            explanation=result["__interrupt__"][0].value["explanation"],
+            **fields,
+        )
 
-    return payload
+    return CallbackPayload(onboarding_id=onboarding_id, status="approved", **fields)
+
+
+def _failure_payload(onboarding_id: int, exc: Exception) -> CallbackPayload:
+    return CallbackPayload(
+        onboarding_id=onboarding_id,
+        status="failed",
+        explanation=f"Agent run failed: {type(exc).__name__}: {exc}",
+    )
 
 
 async def run_agent_run(onboarding_id: int, document_paths: dict[str, str]) -> None:
-    contract_text = read_document(document_paths["contract"])
-    w9_text = read_document(document_paths["w9"])
+    try:
+        contract_text = read_document(document_paths["contract"])
+        w9_text = read_document(document_paths["w9"])
 
-    async with get_checkpointer() as checkpointer:
-        await checkpointer.setup()
-        graph = build_graph(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": thread_id_for(onboarding_id)}}
-        result = await graph.ainvoke(
-            {"contract_text": contract_text, "w9_text": w9_text}, config
-        )
+        async with get_checkpointer() as checkpointer:
+            await checkpointer.setup()
+            graph = build_graph(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": thread_id_for(onboarding_id)}}
+            result = await graph.ainvoke(
+                {"contract_text": contract_text, "w9_text": w9_text}, config
+            )
+    except Exception as exc:
+        logger.exception("agent run failed for onboarding %s", onboarding_id)
+        await send_callback(_failure_payload(onboarding_id, exc))
+        return
 
-    send_callback(_callback_payload(onboarding_id, result))
+    await send_callback(_callback_payload(onboarding_id, result))
 
 
 async def run_resume(onboarding_id: int, thread_id: str, decision: str) -> None:
-    async with get_checkpointer() as checkpointer:
-        graph = build_graph(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": thread_id}}
-        result = await graph.ainvoke(Command(resume=decision), config)
+    try:
+        async with get_checkpointer() as checkpointer:
+            graph = build_graph(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": thread_id}}
+            result = await graph.ainvoke(Command(resume=decision), config)
+    except Exception as exc:
+        logger.exception("resume failed for onboarding %s", onboarding_id)
+        await send_callback(_failure_payload(onboarding_id, exc))
+        return
 
-    send_callback(
-        {
-            "onboarding_id": onboarding_id,
-            "status": result["decision"],
-            "explanation": result.get("explanation"),
+    await send_callback(
+        CallbackPayload(
+            onboarding_id=onboarding_id,
+            status=result["decision"],
+            explanation=result.get("explanation"),
             **_extraction_fields(result),
-        }
+        )
     )
 
 
 @app.post("/trigger", status_code=202)
-def trigger(request: TriggerRequest, background_tasks: BackgroundTasks) -> dict:
+def trigger(request: TriggerRequest, background_tasks: BackgroundTasks) -> AcceptedResponse:
     background_tasks.add_task(
         run_agent_run, request.onboarding_id, request.document_paths
     )
-    return {"accepted": True, "onboarding_id": request.onboarding_id}
+    return AcceptedResponse(accepted=True, onboarding_id=request.onboarding_id)
 
 
 @app.post("/resume", status_code=202)
-def resume(request: ResumeRequest, background_tasks: BackgroundTasks) -> dict:
+def resume(request: ResumeRequest, background_tasks: BackgroundTasks) -> AcceptedResponse:
     background_tasks.add_task(
         run_resume, request.onboarding_id, request.thread_id, request.decision
     )
-    return {"accepted": True, "onboarding_id": request.onboarding_id}
+    return AcceptedResponse(accepted=True, onboarding_id=request.onboarding_id)

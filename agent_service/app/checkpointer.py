@@ -9,7 +9,9 @@ HTTP and the sync `PostgresSaver` doesn't implement the async checkpoint
 methods LangGraph's `ainvoke` needs (`aget_tuple` raises `NotImplementedError`).
 """
 
+import asyncio
 import os
+from contextlib import asynccontextmanager
 
 import psycopg
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -27,6 +29,9 @@ ALLOWED_MSGPACK_MODULES = [
     ("app.schemas", "EntityMatchResult"),
 ]
 
+_schema_ready = False
+_schema_lock = asyncio.Lock()
+
 
 def database_url() -> str:
     return os.environ.get(
@@ -39,13 +44,36 @@ def _conn_string() -> str:
     return f"{database_url()}?options=-c%20search_path%3D{SCHEMA},public"
 
 
-def ensure_schema() -> None:
-    with psycopg.connect(database_url(), autocommit=True) as conn:
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+async def ensure_schema() -> None:
+    """Idempotent, but the schema must exist before any checkpointer query —
+    otherwise Postgres silently creates the checkpoint tables in `public`
+    instead (the next schema in search_path), quietly defeating the whole
+    point of keeping this separate from Ecto's tables. Memoized so it's a
+    real no-op (no DB round trip at all) after the first call in this
+    process, rather than reconnecting on every /trigger and /resume.
+    """
+    global _schema_ready
+
+    if _schema_ready:
+        return
+
+    async with _schema_lock:
+        if _schema_ready:
+            return
+
+        async with await psycopg.AsyncConnection.connect(
+            database_url(), autocommit=True
+        ) as conn:
+            await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+
+        _schema_ready = True
 
 
-def get_checkpointer():
+@asynccontextmanager
+async def get_checkpointer():
     """Async context manager yielding an `AsyncPostgresSaver` scoped to the `langgraph` schema."""
-    ensure_schema()
+    await ensure_schema()
     serde = JsonPlusSerializer(allowed_msgpack_modules=ALLOWED_MSGPACK_MODULES)
-    return AsyncPostgresSaver.from_conn_string(_conn_string(), serde=serde)
+
+    async with AsyncPostgresSaver.from_conn_string(_conn_string(), serde=serde) as saver:
+        yield saver

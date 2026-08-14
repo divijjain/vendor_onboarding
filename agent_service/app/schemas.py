@@ -38,6 +38,19 @@ class EntityMatchResult(BaseModel):
     explanation: str = Field(description="Brief explanation grounded in the two names compared")
 
 
+class TaxValidationResult(BaseModel):
+    """The mock Tax API's response — see mcp_servers/tax_api."""
+
+    valid: bool = Field(description="Whether the Tax ID matched a valid EIN format")
+
+
+class SanctionsScreeningResult(BaseModel):
+    """The mock Sanctions DB's response — see mcp_servers/sanctions_db."""
+
+    flagged: bool = Field(description="Whether the vendor name matched a sanctions watchlist entry")
+    reason: str | None = Field(default=None, description="Present only when flagged")
+
+
 class ValidationResult(BaseModel):
     """Agent 2's combined validation output: entity match + the two MCP tool
     calls. `approved` is the decision branch input.
@@ -51,3 +64,22 @@ class ValidationResult(BaseModel):
     @property
     def approved(self) -> bool:
         return self.entity_match.match and self.tax_id_valid and not self.sanctions_flagged
+
+
+class CallbackPayload(BaseModel):
+    """The outbound shape posted to Phoenix's `/webhooks/agent_callback`.
+    Optional fields are genuinely optional on the wire — `send_callback`
+    dumps with `exclude_none=True`, since Elixir's `HandleAgentCallback`
+    only touches keys that are actually present (an explicit `null` would
+    overwrite an existing value, e.g. a `thread_id` from an earlier run).
+    """
+
+    onboarding_id: int
+    status: str
+    company_name: str | None = None
+    w9_company_name: str | None = None
+    tax_id: str | None = None
+    payment_terms: str | None = None
+    liability_clauses: str | None = None
+    thread_id: str | None = None
+    explanation: str | None = None

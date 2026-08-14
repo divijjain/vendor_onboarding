@@ -80,8 +80,19 @@ async def run_fixture(fixture: Fixture, graph_factory=build_graph) -> FixtureRes
     )
 
 
-async def run_all(fixtures: list[Fixture], graph_factory=build_graph) -> list[FixtureResult]:
-    return [await run_fixture(f, graph_factory=graph_factory) for f in fixtures]
+async def run_all(
+    fixtures: list[Fixture], graph_factory=build_graph, concurrency: int = 5
+) -> list[FixtureResult]:
+    # Bounded, not unbounded gather — 20 fixtures fired at once against a
+    # real OpenAI/Anthropic account risks tripping rate limits for no
+    # benefit; a modest concurrency cap still gets most of the speedup.
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def run_with_limit(fixture: Fixture) -> FixtureResult:
+        async with semaphore:
+            return await run_fixture(fixture, graph_factory=graph_factory)
+
+    return await asyncio.gather(*(run_with_limit(f) for f in fixtures))
 
 
 def bucket_accuracy(results: list[FixtureResult]) -> dict[str, dict[str, int]]:

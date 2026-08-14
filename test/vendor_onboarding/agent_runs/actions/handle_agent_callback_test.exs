@@ -41,6 +41,22 @@ defmodule VendorOnboarding.AgentRuns.Actions.HandleAgentCallbackTest do
     assert_received {:status_updated, ^onboarding_id}
   end
 
+  test "accepts a :failed status so a crashed agent run surfaces instead of hanging forever" do
+    onboarding = insert_onboarding_with_run("cb-3")
+
+    assert {:ok, updated_run} =
+             AgentRuns.handle_agent_callback(%{
+               "onboarding_id" => onboarding.id,
+               "status" => "failed",
+               "explanation" => "Agent run failed: OpenAIError: Missing credentials."
+             })
+
+    assert updated_run.status == :failed
+
+    assert {:ok, updated_onboarding} = Onboardings.get_onboarding(onboarding.id)
+    assert updated_onboarding.status == :failed
+  end
+
   test "returns {:error, :not_found} when no run has started for that onboarding" do
     {:ok, onboarding} =
       Onboardings.Repository.insert(%{idempotency_key: "cb-2", document_paths: %{}})

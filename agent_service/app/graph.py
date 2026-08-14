@@ -8,6 +8,7 @@ Decision branch: auto-approve, or draft an explanation and `interrupt()`
 for human review, checkpointed to Postgres so the pause survives a restart.
 """
 
+from functools import lru_cache
 from typing import Awaitable, Callable, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -17,6 +18,8 @@ from app.mcp_client import screen_vendor, validate_tax_id
 from app.schemas import (
     ContractExtraction,
     EntityMatchResult,
+    SanctionsScreeningResult,
+    TaxValidationResult,
     ValidationResult,
     W9Extraction,
 )
@@ -35,8 +38,8 @@ class GraphState(TypedDict, total=False):
 ContractExtractorFn = Callable[[str], Awaitable[ContractExtraction]]
 W9ExtractorFn = Callable[[str], Awaitable[W9Extraction]]
 EntityMatcherFn = Callable[[str, str], Awaitable[EntityMatchResult]]
-TaxIdValidatorFn = Callable[[str], Awaitable[dict]]
-VendorScreenerFn = Callable[[str], Awaitable[dict]]
+TaxIdValidatorFn = Callable[[str], Awaitable[TaxValidationResult]]
+VendorScreenerFn = Callable[[str], Awaitable[SanctionsScreeningResult]]
 ExplanationDrafterFn = Callable[[str], Awaitable[str]]
 
 CONTRACT_EXTRACTION_PROMPT = (
@@ -63,7 +66,12 @@ EXPLANATION_PROMPT = (
 )
 
 
+@lru_cache(maxsize=1)
 def _default_llm(temperature: float = 0):
+    # Cached — every default_extract_*/entity_match/draft_explanation call
+    # was constructing a fresh ChatOpenAI client (new HTTP client setup)
+    # per call. `.with_structured_output(...)` on top of it is cheap to
+    # keep per-call, since it's just a wrapping Runnable, not a new client.
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(model="gpt-4o-mini", temperature=temperature)
@@ -135,9 +143,9 @@ def build_graph(
 
         validation = ValidationResult(
             entity_match=match_result,
-            tax_id_valid=tax_result["valid"],
-            sanctions_flagged=sanctions_result["flagged"],
-            sanctions_reason=sanctions_result.get("reason"),
+            tax_id_valid=tax_result.valid,
+            sanctions_flagged=sanctions_result.flagged,
+            sanctions_reason=sanctions_result.reason,
         )
         return {"validation": validation}
 

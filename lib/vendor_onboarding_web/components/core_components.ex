@@ -470,6 +470,7 @@ defmodule VendorOnboardingWeb.CoreComponents do
   defp status_badge_class(:approved), do: "badge-success"
   defp status_badge_class(:needs_review), do: "badge-warning"
   defp status_badge_class(:rejected), do: "badge-error"
+  defp status_badge_class(:failed), do: "badge-error"
   defp status_badge_class(_status), do: "badge-neutral"
 
   ## JS Commands
