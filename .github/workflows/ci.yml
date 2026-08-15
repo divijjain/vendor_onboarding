@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  OTP_VERSION: "27.2"
+  ELIXIR_VERSION: "1.17.3"
+
+jobs:
+  phoenix:
+    name: vendor_onboarding (mix precommit)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Restore deps/build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/vendor_onboarding/deps
+            apps/vendor_onboarding/_build
+          key: ${{ runner.os }}-mix-vendor_onboarding-${{ hashFiles('apps/vendor_onboarding/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-vendor_onboarding-
+
+      - working-directory: apps/vendor_onboarding
+        run: mix deps.get
+
+      - working-directory: apps/vendor_onboarding
+        run: mix precommit
+
+      # mix dialyzer intentionally isn't run here: CLAUDE.md documents it as
+      # a separate check (slow first-PLT-build), and as of this workflow's
+      # introduction it fails on pre-existing errors unrelated to CI setup
+      # (lib/mix/tasks/eval.run.ex, agent/evals/run.ex, agent/run.ex) that
+      # weren't introduced by this change. Wire it in once those are fixed.
+
+  mcp_server:
+    name: ${{ matrix.app }} (mix precommit)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [tax_api, sanctions_db]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Restore deps/build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/${{ matrix.app }}/deps
+            apps/${{ matrix.app }}/_build
+          key: ${{ runner.os }}-mix-${{ matrix.app }}-${{ hashFiles(format('apps/{0}/mix.lock', matrix.app)) }}
+          restore-keys: ${{ runner.os }}-mix-${{ matrix.app }}-
+
+      - working-directory: apps/${{ matrix.app }}
+        run: mix deps.get
+
+      - working-directory: apps/${{ matrix.app }}
+        run: mix precommit

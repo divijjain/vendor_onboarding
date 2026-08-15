@@ -6,16 +6,49 @@
 
 ## Architecture in one paragraph
 
-Phoenix is the durable control plane; the Python/FastAPI + LangGraph service under
-`agent_service/` is the stateless-per-call agent brain. Phoenix never calls it
-synchronously — always webhook → Oban job → async HTTP call → callback webhook.
-The Elixir side is two contexts, not one: `Onboardings` owns the ingestion record
-and aggregate status (`onboardings` table), `AgentRuns` owns each run's
-extracted/validated output as its own row (`agent_runs` table, `belongs_to :vendor_onboarding`)
-so re-runs keep history instead of overwriting columns. `thread_id` lives on the
-`agent_runs` row and is what lets a human approval in LiveView resume a specific
-paused LangGraph run. See CONTEXT.md for the full rationale; don't re-litigate the
-async/callback shape or the two-context split without a real reason.
+One Elixir release. `VendorOnboarding.Agent` (`apps/vendor_onboarding/lib/vendor_onboarding/agent/`) is
+the agent brain — a plain module tree, not a separate application — driven by
+Oban: webhook → Oban job → `Agent.Run.trigger/2` runs the pipeline to completion
+*inside* that job → the result is written back to `AgentRuns` via a direct
+function call, never HTTP. The job process is what keeps the web/LiveView side
+unblocked; OTP's own process-level crash isolation is what protects the rest of
+the app if the pipeline blows up — a separate deployable was tried first and
+deliberately collapsed in because it was only buying independent-deploy/scale
+properties this project doesn't need, at the cost of an HTTP hop, a duplicate
+`schema_migrations` table, and an extra process to run. See CONTEXT.md's dated
+entries for the full history. The two MCP tool servers (`apps/tax_api/`,
+`apps/sanctions_db/`) stay genuinely separate OTP applications — they're
+external tools, not part of the agent brain.
+
+The repo root is a Mix umbrella (`apps_path: "apps"`) purely for a clear,
+consistent directory boundary between the three applications — it is
+**not** a standard shared-dependency umbrella. Each app under `apps/` sets
+its own `build_path`/`config_path`/`deps_path`/`lockfile` pointing at
+itself, so they stay exactly as independent as they were as sibling
+top-level directories. **Never run `mix` commands from the repo root** —
+`deps: []` there is deliberate, and a root-level `mix deps.get`/`mix test`
+triggers Mix's umbrella-wide combined dependency resolution regardless of
+those per-app overrides, pulling every app's deps into a stray root
+`deps/`/`_build/` and starting all three OTP applications together in one
+BEAM node (they collide). Always `cd apps/<name>` first — see CONTEXT.md's
+dated entry on the umbrella restructuring.
+
+The Phoenix side is three contexts: `DocumentJobs` owns the ingestion record
+and aggregate status (`document_jobs` table, `document_type_slug`),
+`AgentRuns` owns each run's extracted/validated output as its own row
+(`agent_runs` table, `belongs_to :document_job`) so re-runs keep history
+instead of overwriting columns, and `DocumentTypes` (`document_types` table)
+is a small config registry of known document types — what a job's
+`document_type_slug` refers to, and (not yet read by the agent pipeline)
+each type's intended `extraction_schema`/`validation_rules`. `thread_id`
+lives on the `agent_runs` row and is what lets a human approval in LiveView
+resume a specific paused agent run. Don't re-litigate the context split
+without a real reason. See CONTEXT.md's dated entry: `DocumentJobs` was
+`Onboardings` until the data model was generalized beyond the
+vendor-contract-plus-W9 case it started as — the agent pipeline itself
+(`OnboardingReactor`, still so named) was deliberately left alone in that
+pass, so it still only implements the one document type the migration
+seeded (`vendor_contract_w9`).
 
 ---
 
@@ -23,17 +56,19 @@ async/callback shape or the two-context split without a real reason.
 
 Follow **PRINCIPLES.md** exactly. Key reminders:
 
-- `onboardings.ex` / `agent_runs.ex` contain **only `defdelegate`** — no logic
+- `document_jobs.ex` / `agent_runs.ex` / `document_types.ex` contain **only `defdelegate`** — no logic
 - All `Repo.*` calls for a context's table live exclusively in that context's `repository.ex`
-- Neither context ever queries the other's schema directly — only via its public API
-  (`Onboardings.*` / `AgentRuns.*`)
-- All HTTP calls to the Python service live exclusively in `agent_runs/agent_service.ex`,
-  built on `Req` (never HTTPoison/Tesla/httpc)
-- Actions (`actions/*.ex`) coordinate repository + the other context's public API + agent_service
-  calls — never call `Repo.*` or `Req.*` directly themselves
-- LiveView `handle_event` callbacks are ≤ 5 lines — delegate to `Onboardings`/`AgentRuns` immediately
+- No context ever queries another's schema directly — only via its public API
+  (`DocumentJobs.*` / `AgentRuns.*` / `DocumentTypes.*`)
+- `TriggerAgentRun`/`ResumeReview` call `VendorOnboarding.Agent.Run.trigger/2` and
+  `.resume/3` directly — no HTTP, no Req, no controller. `Agent.Run` reports its result
+  back via `AgentRuns.handle_agent_callback/1` (also a direct call), never the other way
+  around — `Agent.*` depends on `AgentRuns`'s public API, `AgentRuns` never depends on `Agent`
+- Actions (`actions/*.ex`) coordinate repository + another context's public API + `Agent.Run`
+  calls — never call `Repo.*` directly themselves
+- LiveView `handle_event` callbacks are ≤ 5 lines — delegate to `DocumentJobs`/`AgentRuns` immediately
 - Return `{:ok, result} | {:error, reason}` from every context function
-- Bang functions (`get_onboarding!/1`) only in LiveView assigns — never in business logic
+- Bang functions (`get_document_job!/1`) only in LiveView assigns — never in business logic
 
 ---
 
@@ -49,25 +84,72 @@ Follow **PRINCIPLES.md** exactly. Key reminders:
 
 ---
 
-## Two-runtime layout
+## Application layout
+
+An umbrella root for directory clarity only (see "Architecture in one
+paragraph" above — not a shared-dependency umbrella), with three fully
+independent apps underneath: one Mix project for the whole control plane +
+agent brain, plus two genuinely separate OTP applications for the external
+mock tools:
 
 ```
-vendor_onboarding/          # this Phoenix app
-  lib/vendor_onboarding/
-  lib/vendor_onboarding_web/
-agent_service/               # separate Python/FastAPI + LangGraph service, own repo-local venv
-  app/
-    graph.py                 # LangGraph graph definition
-    schemas.py                # Pydantic extraction schema
-    checkpointer.py           # Postgres checkpointer setup (own schema, own migrations — NOT Ecto's)
-  mcp_servers/
-    tax_api/                 # separate FastAPI process exposing MCP
-    sanctions_db/             # separate FastAPI process exposing MCP
+mix.exs                         # umbrella root — apps_path only, deps: []
+apps/
+  vendor_onboarding/             # this Phoenix app — control plane AND agent brain
+    mix.exs                       # own deps/build/config/lockfile, self-contained
+    lib/vendor_onboarding/
+      document_jobs/               # ingestion context (was `onboardings/` — see CONTEXT.md)
+      document_types/              # document-type config registry — slug, name, extraction_schema,
+                                    # validation_rules; not yet read by the agent pipeline
+      agent_runs/                  # agent-run context — workers/actions call Agent.Run directly
+      system_health.ex             # operational snapshot for the dashboard — not a context,
+                                    # no table; reads Oban's table directly + AgentRuns' public API
+      agent/                       # the agent brain, a plain module tree, NOT a separate app
+        onboarding_reactor.ex       # the pipeline, as Reactor steps
+        schemas/                    # Ecto embedded schemas for structured LLM output
+        checks.ex                   # entity match + the two MCP tool calls
+        mcp_client.ex               # JSON-RPC-over-HTTP client for the tool servers
+        run.ex                      # trigger/resume, reports via AgentRuns.handle_agent_callback/1
+        checkpoint/                  # schema + repository for the halted-run checkpoint
+        evals/                      # fixtures, deterministic tier, LLM judge
+    lib/mix/tasks/eval.run.ex     # mix eval.run
+    lib/vendor_onboarding_web/
+    priv/repo/migrations/         # includes the checkpoint table (own Postgres schema, see below)
+  tax_api/                       # separate OTP app exposing MCP (port 8010), own mix.exs
+  sanctions_db/                  # separate OTP app exposing MCP (port 8011), own mix.exs
 ```
 
-The Postgres checkpointer schema is owned by LangGraph's own setup, not Ecto migrations —
-decided explicitly to keep the two stacks decoupled. Do not add checkpointer tables to
-Ecto migrations.
+The checkpoint table (`agent_checkpoints.run_checkpoints`) shares `VendorOnboarding.Repo`
+now but still lives in its own Postgres schema, not `public`, via `@schema_prefix` on the
+Ecto schema and `prefix:` in its migration — keeps "don't let checkpoint tables leak into
+business-domain migrations" true even with one shared Repo.
+
+### Agent-brain gotchas
+
+- **The `:gate`/`:finalize` split in `agent/onboarding_reactor.ex` is load-bearing.** Reactor
+  caches a halted step's `{:halt, value}` as its final result and never re-runs it, so
+  the human's decision must be consumed by a *downstream* step. Merging them compiles
+  fine and silently returns the stale halt value instead of the reviewer's decision.
+- **Resume requires every original input re-supplied**, not just the new one — that's why
+  the checkpoint row stores `inputs` alongside the serialized reactor.
+- **Don't swap the MCP client for `hermes_mcp`'s client.** It passes `transport_opts` as a
+  per-request Finch option, which Finch >= 0.21 rejects; the only Req old enough to hold
+  Finch back has published CVEs. The two `apps/tax_api` and `apps/sanctions_db` apps use
+  `hermes_mcp` (unaffected — server side, not client); `agent/mcp_client.ex` is deliberately
+  hand-rolled on Req.
+- **`Agent.Run.trigger/2` runs the pipeline synchronously** — by design. It's only ever
+  called from inside `TriggerAgentRunWorker`/`ResumeAgentRunWorker` (already off the
+  web/LiveView process via Oban), so there's no separate async hop needed the way there
+  was when this was an HTTP call to a different process. Never call `Agent.Run.*` from a
+  controller or LiveView `handle_event` directly.
+- **`Agent.Run` always reports `:ok`**, even when writing the result back to `AgentRuns`
+  fails — logged, not propagated to the Oban job. An Oban retry re-runs the *whole*
+  pipeline from scratch (re-extraction included) and would hit the checkpoint's unique
+  `thread_id` constraint on a halt; swallowing is deliberately safer than that cascade.
+- External calls (extraction, entity match, both MCP tools, explanation drafting, the eval
+  judge, and the `AgentRuns.handle_agent_callback/1` report itself) are overridable via
+  `Application.get_env(:vendor_onboarding, :agent_*)` so tests need no API keys or running
+  tool servers. See `apps/vendor_onboarding/test/support/agent_fakes.ex`.
 
 ---
 
@@ -82,13 +164,18 @@ Ecto migrations.
 
 ## Pre-commit
 
-Run before committing:
+Run before committing, from inside the app you touched — `cd apps/vendor_onboarding`,
+`cd apps/tax_api`, or `cd apps/sanctions_db` first, never from the repo root:
 
 ```
 mix precommit
 ```
 
 This runs: `compile --warnings-as-errors`, `deps.unlock --unused`, `format`, `test`.
+
+Each of the two MCP server applications defines the same `precommit` alias — run it in
+whichever ones you touched (`apps/tax_api/`, `apps/sanctions_db/`), in addition to the
+main app's, if you touched those.
 
 `mix dialyzer` is set up separately (not part of `precommit` — the first PLT build is
 slow, ~1 min; reruns are fast, a few seconds). Run it after touching `@spec`s or schema
@@ -101,24 +188,32 @@ error, not a compile error.
 ## File naming conventions
 
 ```
-lib/vendor_onboarding/onboardings/schema/onboarding.ex
-lib/vendor_onboarding/onboardings/actions/ingest_webhook.ex
-lib/vendor_onboarding/onboardings/actions/list_with_latest_run.ex
-lib/vendor_onboarding/onboardings/repository.ex
-lib/vendor_onboarding/onboardings/idempotency.ex
-lib/vendor_onboarding/onboardings.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/schema/document_job.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/actions/ingest_webhook.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/actions/list_with_latest_run.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/repository.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/idempotency.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_jobs.ex
 
-lib/vendor_onboarding/agent_runs/schema/agent_run.ex
-lib/vendor_onboarding/agent_runs/actions/trigger_agent_run.ex
-lib/vendor_onboarding/agent_runs/actions/handle_agent_callback.ex
-lib/vendor_onboarding/agent_runs/actions/resume_review.ex
-lib/vendor_onboarding/agent_runs/workers/trigger_agent_run_worker.ex
-lib/vendor_onboarding/agent_runs/agent_service.ex
-lib/vendor_onboarding/agent_runs/repository.ex
-lib/vendor_onboarding/agent_runs.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_types/schema/document_type.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_types/repository.ex
+apps/vendor_onboarding/lib/vendor_onboarding/document_types.ex
 
-lib/vendor_onboarding_web/controllers/webhook_controller.ex
-lib/vendor_onboarding_web/controllers/agent_callback_controller.ex
-lib/vendor_onboarding_web/live/dashboard_live.ex
-lib/vendor_onboarding_web/live/review_live.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/schema/agent_run.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/actions/trigger_agent_run.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/actions/handle_agent_callback.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/actions/resume_review.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/workers/trigger_agent_run_worker.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/workers/resume_agent_run_worker.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/repository.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent_runs.ex
+
+apps/vendor_onboarding/lib/vendor_onboarding/agent/run.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent/onboarding_reactor.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent/checkpoint/repository.ex
+apps/vendor_onboarding/lib/vendor_onboarding/agent/checkpoint/schema/run_checkpoint.ex
+
+apps/vendor_onboarding/lib/vendor_onboarding_web/controllers/webhook_controller.ex
+apps/vendor_onboarding/lib/vendor_onboarding_web/live/dashboard_live.ex
+apps/vendor_onboarding/lib/vendor_onboarding_web/live/review_live.ex
 ```

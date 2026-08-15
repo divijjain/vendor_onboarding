@@ -1,40 +1,12 @@
-# The directory Mix will write compiled artifacts to.
+# Umbrella root. Each app under apps/ has its own .gitignore for its own
+# build artifacts (deps/, _build/, etc.) — this file only covers things
+# that could ever land at the umbrella root itself. Root mix.exs declares
+# `deps: []` deliberately (see its moduledoc) — always run mix commands
+# from inside apps/<name>, never from here, or Mix's umbrella-wide combined
+# dependency resolution pulls in every child's deps at the root and the
+# apps collide trying to start together in one BEAM node.
 /_build/
-
-# If you run "mix test --cover", coverage assets end up here.
-/cover/
-
-# The directory Mix downloads your dependencies sources to.
 /deps/
-
-# Where 3rd-party dependencies like ExDoc output generated docs.
-/doc/
-
-# Ignore .fetch files in case you like to edit your project deps locally.
-/.fetch
-
-# If the VM crashes, it generates a dump, let's ignore it too.
+/mix.lock
 erl_crash.dump
-
-# Also ignore archive artifacts (built via "mix archive.build").
-*.ez
-
-# Temporary files, for example, from tests.
-/tmp/
-
-# Ignore package tarball (built via "mix hex.build").
-vendor_onboarding-*.tar
-
-# Ignore assets that are produced by build tools.
-/priv/static/assets/
-
-# Ignore digested assets cache.
-/priv/static/cache_manifest.json
-
-# Locally-stored vendor documents (dev storage adapter) — never commit vendor PII.
-/priv/uploads/
-
-# In case you use Node.js/npm, you want to ignore these.
-npm-debug.log
-/assets/node_modules/
-
+.elixir_ls/

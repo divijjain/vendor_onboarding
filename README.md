@@ -10,45 +10,79 @@ This project builds the middle ground: an agentic pipeline that automates the ex
 
 ## Architecture
 
-**System overview** — Elixir/Phoenix as the durable control plane, Python/LangGraph as the stateless-per-call agent brain, Postgres as the shared source of truth for both status and workflow checkpoints:
+**System overview** — one Phoenix release: Oban's job process is the async
+boundary between the web/LiveView side and the agent pipeline (a plain
+module tree, not a separate service), Postgres is the shared source of
+truth for both status and workflow checkpoints:
 
 ```mermaid
 flowchart TD
-    A[Vendor email] --> B[Phoenix webhook<br/>S3 store + idempotency]
+    A[Vendor email] --> W[Phoenix webhook<br/>HMAC signature check]
+    W --> B[S3 store + idempotency]
     B --> C[Oban job queue<br/>async dispatch]
-    C -->|trigger| D[Python / FastAPI<br/>LangGraph agents]
+    C -->|runs in-process| D[Agent.Run<br/>Reactor pipeline]
     C -.->|status writes| E[(Postgres<br/>checkpoint + status)]
     D <-.->|checkpoint r/w| E
     D --> F[Phoenix LiveView<br/>review + resume]
     E -.-> F
 ```
 
-**Agent workflow detail** — what runs inside the Python/LangGraph service on each trigger:
+**Agent workflow detail** — what runs inside `VendorOnboarding.Agent.Run` on each trigger:
 
 ```mermaid
 flowchart TD
-    A1[Agent 1: extraction<br/>PDF to Pydantic schema] --> A2[Agent 2: validation<br/>calls MCP tools]
+    A1[Agent 1: extraction<br/>documents to Ecto schema] --> A2[Agent 2: validation<br/>calls MCP tools]
     A2 --> T1[MCP: tax API<br/>mock, validates Tax ID]
     A2 --> T2[MCP: sanctions DB<br/>mock, screens vendor]
     T1 --> M[Match check<br/>compare entities]
     T2 --> M
     M -->|pass| APR[Auto-approve<br/>all checks pass]
-    M -->|discrepancy| INT[Interrupt + pause<br/>checkpoint to Postgres]
+    M -->|discrepancy| INT[Halt + pause<br/>checkpoint to Postgres]
+```
+
+**Deployment topology** — three OTP applications, not four and not one. The
+agent brain lives *inside* the Phoenix release (see "why this shape" below);
+the two mock tools stay genuinely separate processes, because faking that
+boundary away would make the MCP framing decorative rather than real. All
+three live as equal siblings under `apps/` (a Mix umbrella for directory
+clarity only — each keeps its own deps/build/config, see Local development):
+
+```mermaid
+flowchart LR
+    subgraph P["apps/vendor_onboarding<br/>(Phoenix release, one OTP app)"]
+        direction TB
+        WH[Webhook] --> OB[Oban job]
+        OB --> AR["Agent.Run<br/>(Reactor pipeline,<br/>in-process)"]
+        AR <--> PG[(Postgres<br/>checkpoint + status)]
+        AR --> LV[LiveView]
+    end
+
+    subgraph T["apps/tax_api<br/>(separate OTP app, :8010)"]
+        TS[hermes_mcp server]
+    end
+
+    subgraph S["apps/sanctions_db<br/>(separate OTP app, :8011)"]
+        SS[hermes_mcp server]
+    end
+
+    AR -->|MCP / JSON-RPC over HTTP| TS
+    AR -->|MCP / JSON-RPC over HTTP| SS
 ```
 
 ### Why this shape, specifically
 
-- **Phoenix does not call LangGraph synchronously.** A webhook handler blocking on a multi-minute agent run is a request-timeout waiting to happen. Phoenix enqueues an Oban job, which makes an async call to the Python service; the Python service calls back into a Phoenix webhook endpoint (or emits to a queue Phoenix consumes) when done.
-- **The HITL pause is backed by a Postgres-persisted LangGraph checkpointer**, not in-memory state. If the Python process restarts mid-review, the paused workflow survives. The `thread_id` for a paused run is stored on the Elixir side (`vendor_onboarding` row) so a human approving in LiveView can trigger a resume call back into Python. The checkpointer's Postgres schema is owned and migrated by LangGraph's own setup, kept separate from Ecto's migrations, so the two stacks can evolve independently.
-- **MCP is used deliberately, not decoratively.** The mock Tax API and mock Sanctions DB are two real, separate FastAPI processes each exposing an MCP tool interface, not two functions folded into one process — because MCP's value is standardizing tool access across processes, and the README should be honest that for exactly two fixed mock tools, plain function-calling would work identically. The MCP framing is there because it's the pattern that scales to N real tools, and that's the argument to make explicit, not assume.
+- **Phoenix does not run the agent pipeline on the request process.** A webhook handler blocking on a multi-minute agent run is a request-timeout waiting to happen. Phoenix enqueues an Oban job; the job process runs the pipeline to completion and writes the result back — Oban's own supervision is what keeps a pipeline crash from ever touching the web/LiveView side, no separate deployable required for that isolation. (An earlier pass built the agent brain as a genuinely separate OTP application talking over HTTP; collapsed back into one release once it was clear the HTTP hop was only buying independent-deploy/scale properties this project doesn't need — see `CONTEXT.md`'s dated entries.)
+- **The HITL pause is backed by a Postgres-persisted checkpoint**, not in-memory state. If the app restarts mid-review, the paused workflow survives — verified by killing and restarting the whole node with a paused case in flight, not assumed. The `thread_id` for a paused run is stored on the `agent_runs` row so a human approving in LiveView can trigger a resume. The checkpoint table lives in its own Postgres schema (`agent_checkpoints`), owned by its own migration prefix rather than mixed into the business-domain tables, even though it shares the same Ecto Repo now.
+- **MCP is used deliberately, not decoratively.** The mock Tax API and mock Sanctions DB are two real, separate OTP applications each exposing an MCP tool interface over HTTP, not two functions folded into one process — because MCP's value is standardizing tool access across processes, and the README should be honest that for exactly two fixed mock tools, plain function-calling would work identically. The MCP framing is there because it's the pattern that scales to N real tools, and that's the argument to make explicit, not assume.
 - **Idempotency and PII are first-class, not afterthoughts.** The webhook computes an idempotency key (hash of raw payload) so a duplicated vendor email doesn't double-process a contract. Extracted Tax IDs and other PII get encrypted at rest and access-controlled storage — noted explicitly, since a project whose pitch is "compliance" loses credibility if its own data handling is naive.
+- **The webhook is signature-verified, not just idempotency-checked.** `POST /webhooks/vendor_onboarding` requires an `x-webhook-signature: sha256=<hex>` header — an HMAC-SHA256 over the exact raw body bytes, checked with a constant-time compare (`VendorOnboardingWeb.Plugs.VerifyWebhookSignature`). Idempotency alone stops duplicate processing of a *legitimate* payload; it does nothing to stop an unauthenticated caller from injecting a fabricated one, which is the actual threat model for an internet-facing ingestion endpoint on a compliance-pitched system.
 
 ## Evaluation
 
 The core resume claim — "0% hallucination rate on extracted entities" — is only credible if it's backed by the right kind of check. This project uses a **two-tier eval**, not LLM-as-judge for everything:
 
-1. **Deterministic checks** (no LLM, fast, free): does the extracted Tax ID exist verbatim in the source document text? Does the extracted JSON parse against the Pydantic schema? These produce the hallucination-rate number.
-2. **LLM-as-judge checks** (DeepEval `GEval`, for genuinely ambiguous judgment): does the entity mapping in the extraction hold up under formatting differences ("J. Smith" vs "John Smith")? Is the agent's drafted mismatch explanation actually grounded in the real discrepancy? The judge model (Claude Sonnet) is a different provider than the agent model (GPT-4o-mini), to avoid self-grading inflation.
+1. **Deterministic checks** (no LLM, fast, free): does the extracted Tax ID exist verbatim in the source document text? Does the model's output validate against the extraction schema's changeset? These produce the hallucination-rate number.
+2. **LLM-as-judge checks** (for genuinely ambiguous judgment): does the entity mapping in the extraction hold up under formatting differences ("J. Smith" vs "John Smith")? Is the agent's drafted mismatch explanation actually grounded in the real discrepancy? The judge model (Claude Sonnet) is a different provider than the agent model (GPT-4o-mini), to avoid self-grading inflation.
 
 **Synthetic test set (20 documents), structured deliberately:**
 
@@ -59,21 +93,22 @@ The core resume claim — "0% hallucination rate on extracted entities" — is o
 | Subtle formatting difference, not a real mismatch | 3 | false-positive rate — the detail that makes "100% accuracy" credible rather than cherry-picked |
 | Missing/malformed fields | 2 | graceful degradation |
 
-Results are written up as a short metrics table in this README once the harness runs for real (with both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` configured), not just asserted. See `agent_service/evals/` and the Status section below for where that stands.
+Results are written up as a short metrics table in this README once the harness runs for real (with both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` configured), not just asserted. See `apps/vendor_onboarding/lib/vendor_onboarding/agent/evals/` and the Status section below for where that stands.
 
 ## Tech stack
 
-- **Elixir / Phoenix / LiveView** — webhook ingestion, Oban job orchestration, human review UI, PubSub status updates
-- **Ecto / PostgreSQL** — `vendor_onboarding` status table + LangGraph's Postgres checkpointer (same instance, separate schema, owned by LangGraph's own migrations)
-- **Python / FastAPI** — service wrapping the LangGraph graph, exposes trigger + resume endpoints
-- **LangGraph** — two-agent graph (extraction, validation), `interrupt` + Postgres checkpointer for durable HITL pause
-- **Pydantic** — extraction schema (Company Name, Tax ID strictly typed; Payment Terms, Liability Clauses free text, LLM-judge validated)
-- **MCP** — two mock tool servers (Tax API, Sanctions DB), each a real separate FastAPI process, consumed by the validation agent
-- **DeepEval** — two-tier evaluation harness (deterministic + `GEval` LLM-as-judge; agents on GPT-4o-mini, judge on Claude Sonnet)
+- **Elixir / Phoenix / LiveView** — webhook ingestion, Oban job orchestration, human review UI, PubSub status updates, and the agent pipeline itself — one release
+- **Ecto / PostgreSQL** — the `document_jobs`/`agent_runs`/`document_types` tables, plus the agent pipeline's checkpoint table (same Repo, separate Postgres schema via a migration prefix)
+- **Bandit** — the Phoenix endpoint, and the transport for both MCP tool servers
+- **Reactor** — the agent pipeline as dependency-resolved steps, with `{:halt, …}` + a persisted checkpoint for the durable HITL pause
+- **Instructor** — structured LLM output into Ecto embedded schemas (Company Name, Tax ID; Payment Terms and Liability Clauses free text, LLM-judge validated)
+- **MCP** (`hermes_mcp` servers, JSON-RPC-over-HTTP client on Req) — two mock tool servers (Tax API, Sanctions DB), each a real separate OTP application, consumed by the validation agent
+- **Eval harness** (`mix eval.run`) — two-tier evaluation (deterministic + LLM-as-judge; agents on GPT-4o-mini, judge on Claude Sonnet via the Anthropic Messages API)
+- **GitHub Actions** (`.github/workflows/ci.yml`) — `mix precommit` on every push/PR for the Phoenix app plus each of the two MCP server apps (`mix dialyzer` deliberately left out for now — see Status)
 
 ## Status
 
-Build order steps 1–7 complete:
+Build order steps 1–7 complete. The step-by-step entries below are a dated build log: steps 4–7 and the two hardening passes describe the Python/LangGraph implementation as it stood at the time, which the all-Elixir migration (last entry in this section) later replaced component-for-component. They're kept as history rather than rewritten.
 
 - Step 1: `vendor_onboarding` Ecto schema + migrations, Cloak-encrypted Tax ID column, Oban wired into the supervision tree, the repository/context layering from `PRINCIPLES.md`.
 - Step 2: webhook ingestion end to end — idempotency-key hashing off the raw request body, a config-swappable document storage boundary (local disk for dev/test), the `IngestWebhook` action, and a stub Oban job enqueue, all reachable via `POST /webhooks/vendor_onboarding`.
@@ -91,19 +126,57 @@ Build order steps 1–7 complete:
 
 Also added `dialyzer` (wasn't set up at all) — caught a real gap: neither Ecto schema declared `@type t`, so every `@spec` referencing `Onboarding.t()`/`AgentRun.t()` across both repositories and three actions pointed at an undefined type. Fixed; `mix dialyzer` now runs clean and is documented in `CLAUDE.md` as a separate check (not folded into `precommit`, since the first PLT build is slow).
 
-60 Elixir tests + 31 Python tests passing, `mix precommit` clean. Every LLM call (both extractions, entity-match, explanation-drafting, and the DeepEval judge) is built against GPT-4o-mini / Claude Sonnet but is dependency-injected — there's no `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` configured in this dev environment yet, so all of the above is verified with injected fake LLM calls plus the two *real* MCP servers and the *real* Postgres checkpointer, not a live model call. See `CONTEXT.md` for the full build plan and architectural decisions.
+**All-Elixir migration:** the Python/FastAPI + LangGraph service and both Python MCP tool servers were replaced with three Elixir/OTP applications (`agent_service`, `mcp_servers/tax_api`, `mcp_servers/sanctions_db`). The wire contract is unchanged — same `/trigger` and `/resume` shapes, same callback payload — so the Phoenix app's `lib/` needed no code changes at all. Component swaps: Pydantic → Ecto embedded schemas via `instructor`; LangGraph's `StateGraph`/`interrupt()` → [Reactor](https://github.com/ash-project/reactor)'s halt/resume; LangGraph's Postgres checkpointer → one Ecto table in this service's own `agent_checkpoints` schema with its own migrations (same stack-decoupling rule, now between two Elixir apps); DeepEval's `GEval` → a hand-rolled judge calling Anthropic's Messages API directly, scoring the same two criteria and keeping the cross-provider anti-self-grading property.
+
+Three findings worth recording, each verified rather than assumed:
+
+1. **Reactor's `{:halt, value}` is not LangGraph's `interrupt()`.** A halted step is *finished* — its halt value is cached permanently and it never re-executes on resume. So the human's decision cannot be read by the step that halts; it must land in a downstream step that hasn't run yet. Hence the `:gate` (halts) / `:finalize` (consumes the decision) split in `onboarding_reactor.ex`. Collapsing those two would silently return the stale halt value instead of the reviewer's decision — a bug that type-checks and compiles fine. Resume also requires *all* original inputs re-supplied, which is why the checkpoint row stores them alongside the serialized reactor.
+2. **The durable-pause claim was re-verified end to end**, not inherited: a halted reactor survives `:erlang.term_to_binary/1` → a genuinely separate BEAM instance → `binary_to_term` → resume, with the fresh human decision reaching the post-halt step. Completed steps do *not* re-run, so resuming costs no repeated LLM calls.
+3. **The restart-survives-a-pause claim was re-verified live**, not just in the ExUnit round-trip: all four applications running as real separate OS processes, a webhook mismatch case paused with a checkpoint persisted to Postgres, the `agent_service` BEAM process killed outright (`kill -9`, not a graceful stop) and restarted as a fresh process with no in-memory state, then resumed via `POST /resume` against that new process. The human's decision (`rejected`) landed correctly on the Phoenix `onboardings`/`agent_runs` rows and the checkpoint was marked `resumed` — the same guarantee the original LangGraph checkpointer made, now proven under the new implementation rather than assumed to carry over.
+4. **`hermes_mcp`'s client is unusable on current dependencies**: it passes `transport_opts` as a per-request Finch option, which Finch ≥ 0.21 rejects outright, and the only Req old enough to hold Finch back (0.5.17) has published CVEs. Rather than adopt a vulnerable dependency, the two tool servers remain real `hermes_mcp` servers (server side is Plug/Bandit, unaffected) and the agent talks to them with a small JSON-RPC-over-HTTP client on current Req — MCP's streamable-HTTP transport being `initialize` → `notifications/initialized` → `tools/call`, confirmed by curl against the running servers before it was written. The "two real, separate MCP servers" claim stays literally true.
+
+**Collapsed `agent_service` back into one release**, same day as the migration above. Discussed the four-application shape directly: OTP already isolates a crashing process from the rest of its own release, so the HTTP boundary between Phoenix and `agent_service` was only buying independent-deploy/independent-scale properties, at the cost of an HTTP hop, an extra process to run, and (discovered in the process) two Ecto Repos silently sharing one `public.schema_migrations` table across two codebases pointed at the same physical database. Moved `agent_service/lib` into `lib/vendor_onboarding/agent/` as a plain module tree, replaced the HTTP trigger/resume/callback round trip with Oban's job process (already off the web/LiveView process) calling the pipeline directly and reporting through `AgentRuns.handle_agent_callback/1` in-process, and relocated the two MCP tool servers to a top-level `mcp_servers/` — they stay genuinely separate deployables since they're external tools, not the agent brain. One real, observable behavior change: `trigger_agent_run/1` now blocks until the whole pipeline finishes, so the onboarding is at its *final* status by the time it returns rather than still `:processing` — tests were updated to match, not preserved incorrectly. Full details in `CONTEXT.md`'s second dated entry.
+
+**2026-08-14 hardening pass:** a from-scratch critical read of the post-collapse system turned up three real gaps, all fixed:
+
+1. **The webhook endpoint had no authentication.** Idempotency and Tax ID encryption were already covered, but `POST /webhooks/vendor_onboarding` accepted any POST body from anyone who found the URL — a real hole for a system whose pitch is compliance. Added `VendorOnboardingWeb.Plugs.VerifyWebhookSignature`: an HMAC-SHA256 signature (`x-webhook-signature: sha256=<hex>`) over the exact raw body bytes, checked with `Plug.Crypto.secure_compare/2`. The signing secret is `WEBHOOK_SECRET` in prod (required, same pattern as `CLOAK_KEY` — raises on boot if missing), a fixed dev-only value in `config/dev.exs`, and a fixed test-only value backing a `sign_webhook_body/1` test helper in `ConnCase`.
+2. **No CI.** `mix precommit` and `mix dialyzer` only ran locally — nothing enforced them on push. Added `.github/workflows/ci.yml`: one job runs `mix precommit` for the Phoenix app against a real Postgres service container, a second (matrix) job runs `mix precommit` for each MCP server. (Both jobs' paths were later updated to `apps/vendor_onboarding`, `apps/tax_api`, `apps/sanctions_db` by the umbrella restructuring below.) `mix dialyzer` is deliberately *not* wired into CI yet — running it while building this workflow surfaced 4 pre-existing errors (`lib/mix/tasks/eval.run.ex`, `agent/evals/run.ex`, `agent/run.ex`) unrelated to this pass; fixing those is separate follow-up work, not something to bundle silently into a CI-plumbing change.
+3. **Oban's retry policy on the `agent_runs` queue wasn't tuned for the checkpoint-collision risk this project itself documents** (a retry replays the whole pipeline and can hit the checkpoint's unique `thread_id` constraint on a halt — see the "Agent-brain gotchas" section of `CLAUDE.md`). Both `TriggerAgentRunWorker` and `ResumeAgentRunWorker` were already capped below Oban's default of 20; lowered further to `max_attempts: 3` so a transient failure burns at most three full re-extractions instead of five.
+
+**2026-08-15 umbrella restructuring:** the repo root became a Mix umbrella (`apps_path: "apps"`) so the three applications are visually equal siblings — `apps/vendor_onboarding/`, `apps/tax_api/`, `apps/sanctions_db/` — instead of `mcp_servers/tax_api` and `mcp_servers/sanctions_db` nesting under a top-level directory that happened to share its name with the Phoenix app, which was genuinely ambiguous at a glance despite the Mix-project boundary underneath always being real. Deliberately **not** a standard shared-dependency umbrella: each app's `mix.exs` sets its own `build_path`/`config_path`/`deps_path`/`lockfile` pointing at itself, preserving the independently-buildable/deployable property `CLAUDE.md` already documented for the two MCP servers. Confirmed by running `mix precommit` inside each of the three directories independently — same 88 + 3 + 3 tests passing as before the move. One real gotcha worth recording: running any `mix` command from the umbrella *root* (rather than `cd`-ing into an app first) still triggers Mix's umbrella-wide combined dependency resolution regardless of the per-app path overrides — it fetched every app's deps into a stray root `deps/`/`_build/` and then tried to start all three OTP applications together in one BEAM node, which collided. Root-level commands are unsupported by design here; `.github/workflows/ci.yml` and this README's Local development section both always `cd` into the specific app first.
+
+**2026-08-15 generalized to `DocumentJobs` + `DocumentTypes`:** the ingestion domain was hardcoded to one document bundle (a contract + a W-9) with no notion of "what kind of document is this." `Onboardings` (context, `onboardings` table, `Onboarding` schema) was renamed to `DocumentJobs` throughout — modules, files, function names, the `AgentRuns` foreign key (`vendor_onboarding_id` → `document_job_id`), LiveView routes (`/onboardings` → `/document_jobs`) — and a new `DocumentTypes` context (`document_types` table: `slug`, `name`, `extraction_schema`, `validation_rules`) was added as a config registry, with `document_jobs.document_type_slug` referencing it. `DashboardLive` gained a document-type filter. Scoped deliberately to the data model: the agent pipeline (`Extraction`, `Checks`, `OnboardingReactor` — still so named on purpose, see `CONTEXT.md`) still only implements the one document type the migration seeds (`vendor_contract_w9`); teaching it to actually vary extraction/validation by document type is separate, real work, not done here. Two bugs caught in the process, both detailed in `CONTEXT.md`'s dated entry: a schema/migration mismatch on the checkpoint table's `onboarding_id` column (caught by `mix compile --warnings-as-errors`, fixed before it ever reached a test), and two camelCase-fused identifiers (`OnboardingsTest`, `OnboardingsRepository`) that the word-boundary-safe rename regex correctly skipped for the wrong reason, caught by a second grep pass. `mix precommit` clean, 95 tests passing (88 prior + 7 new).
+
+**2026-08-15 system health panel:** `DashboardLive` now shows a live operational snapshot — BEAM process count, Oban queue depth, active agent run count, and an HTTP reachability check against each MCP server — via a new `VendorOnboarding.SystemHealth` module (not a context; it reads Oban's own job table directly, since that table belongs to neither `DocumentJobs` nor `AgentRuns`, and goes through `AgentRuns.count_active/0` for the one domain figure it needs). Refreshes every 5 seconds. The MCP health check hits each server's bare root rather than `/mcp`, so it doesn't need to speak real MCP JSON-RPC just to prove the process is up. See `CONTEXT.md`'s dated entry for the full rationale.
+
+**2026-08-15 fixed the dead-end root path:** `/` and the navbar were still the unmodified `mix phx.new` scaffold — a Phoenix marketing landing page and links to phoenixframework.org, with nothing pointing at `/document_jobs`. `PageController.home/2` now redirects to `/document_jobs`; the navbar links there from every page. Verified against a real running server (curled both routes), not just the test suite. See `CONTEXT.md`'s dated entry.
+
+100 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite now) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently. Every LLM call (both extractions, entity-match, explanation-drafting, and the judge) is built against GPT-4o-mini / Claude Sonnet but is dependency-injected — there's no `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` configured in this dev environment yet, so all of the above is verified with injected fake LLM calls plus the two *real* MCP servers and the *real* Postgres checkpointer, not a live model call. See `CONTEXT.md` for the full build plan and architectural decisions.
 
 ## Local development
 
-* Run `mix setup` to install and setup dependencies
-* Start Phoenix endpoint with `mix phx.server` or inside IEx with `iex -S mix phx.server`
+The repo root is a Mix umbrella (`apps/vendor_onboarding`, `apps/tax_api`,
+`apps/sanctions_db`) for directory clarity only — each app is fully
+independent (own deps, own build, own config). **Always `cd` into the
+specific app first; never run `mix` commands from the repo root** — see
+`CLAUDE.md`'s "Architecture in one paragraph" for why a root-level command
+doesn't do what you'd expect here.
+
+* `cd apps/vendor_onboarding && mix setup` to install dependencies and run migrations (includes the agent pipeline's checkpoint table, in its own `agent_checkpoints` schema)
+* Set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (LLM judge) in your environment to run the real LLM calls (neither is required to run the test suite — it uses injected fakes)
+* Start Phoenix with `mix phx.server` or inside IEx with `iex -S mix phx.server` (from `apps/vendor_onboarding`)
 * Visit [`localhost:4000`](http://localhost:4000)
+* Webhook requests must be HMAC-SHA256 signed (`x-webhook-signature: sha256=<hex>` over the raw body). Dev uses the fixed secret in `apps/vendor_onboarding/config/dev.exs`; sign a local curl request with:
+  ```sh
+  BODY='{"contract":"...","w9":"..."}'
+  SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "dev-only-webhook-secret-change-me" | sed 's/^.* //')
+  curl -X POST localhost:4000/webhooks/vendor_onboarding \
+    -H "content-type: application/json" -H "x-webhook-signature: sha256=$SIG" -d "$BODY"
+  ```
 
-The Python agent service (`agent_service/`) and its two MCP tool servers run as separate processes alongside Phoenix during local development:
+The two mock MCP tool servers are still separate OTP applications — genuinely external tools, not part of the agent pipeline — and run alongside Phoenix during local development:
 
-* Copy `agent_service/.env.example` to `agent_service/.env` and set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (DeepEval judge) to actually run the real LLM calls (neither is required to run `agent_service`'s own test suite)
-* `cd agent_service && uv run uvicorn app.main:app --port 8001`
-* `cd agent_service && uv run uvicorn mcp_servers.tax_api.main:app --port 8010`
-* `cd agent_service && uv run uvicorn mcp_servers.sanctions_db.main:app --port 8011`
-* `cd agent_service && uv run pytest`
-* `cd agent_service && uv run python -m evals.run` — the eval harness; deterministic tier only needs `OPENAI_API_KEY` (+ the two MCP servers running), the GEval judge tier also needs `ANTHROPIC_API_KEY`
+* `cd apps/tax_api && mix deps.get && iex -S mix` — mock Tax API MCP server, port 8010
+* `cd apps/sanctions_db && mix deps.get && iex -S mix` — mock Sanctions DB MCP server, port 8011
+* `mix test` from inside each app's own directory (likewise `cd apps/tax_api && mix test`, etc.)
+* `mix eval.run` (from `apps/vendor_onboarding`) — the eval harness; the deterministic tier needs `OPENAI_API_KEY` (+ the two MCP servers running), the LLM-judge tier also needs `ANTHROPIC_API_KEY`
