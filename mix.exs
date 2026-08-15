@@ -1,4 +1,4 @@
-defmodule VendorOnboarding.Umbrella.MixProject do
+defmodule DocumentComplianceEngine.Umbrella.MixProject do
   use Mix.Project
 
   @moduledoc """

@@ -11,7 +11,7 @@ env:
 
 jobs:
   phoenix:
-    name: vendor_onboarding (mix precommit)
+    name: document_compliance_engine (mix precommit)
     runs-on: ubuntu-latest
 
     services:
@@ -39,15 +39,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            apps/vendor_onboarding/deps
-            apps/vendor_onboarding/_build
-          key: ${{ runner.os }}-mix-vendor_onboarding-${{ hashFiles('apps/vendor_onboarding/mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-vendor_onboarding-
+            apps/document_compliance_engine/deps
+            apps/document_compliance_engine/_build
+          key: ${{ runner.os }}-mix-document_compliance_engine-${{ hashFiles('apps/document_compliance_engine/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-document_compliance_engine-
 
-      - working-directory: apps/vendor_onboarding
+      - working-directory: apps/document_compliance_engine
         run: mix deps.get
 
-      - working-directory: apps/vendor_onboarding
+      - working-directory: apps/document_compliance_engine
         run: mix precommit
 
       # mix dialyzer intentionally isn't run here: CLAUDE.md documents it as

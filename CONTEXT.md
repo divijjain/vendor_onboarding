@@ -293,6 +293,76 @@ feature was already knowing that URL.
 - `mix precommit` clean, same 100 tests (the root-path test was rewritten
   to assert the redirect, not added to).
 
+## 2026-08-15 — renamed the app: `VendorOnboarding` → `DocumentComplianceEngine`
+
+The `Onboardings` → `DocumentJobs`/`DocumentTypes` generalization earlier
+this day only renamed the *ingestion context*. Everything above it — the
+OTP app (`:vendor_onboarding`), the Elixir module namespace
+(`VendorOnboarding.*`/`VendorOnboardingWeb.*`), the `apps/vendor_onboarding/`
+directory, the dev/test databases — was still the original name, prompted
+directly: "the name must also reflect the same." Two scopes were on the
+table — branding/docs only, or that plus the full technical rename
+(app atom, module namespace, directory, database) — the fuller option was
+chosen explicitly.
+
+- **Renamed**: `apps/vendor_onboarding/` → `apps/document_compliance_engine/`
+  (and its inner `lib/vendor_onboarding{,_web}/`, `test/vendor_onboarding{,_web}/`
+  directories); every `VendorOnboarding`/`vendor_onboarding` token across
+  `lib/`, `test/`, `config/*.exs`, `mix.exs`, and the asset pipeline
+  (`assets/js/app.js`, `assets/css/app.css` — the `phoenix-colocated/<app>`
+  import path is derived from the app name and needed the same rename);
+  the dev/test Postgres databases (`vendor_onboarding_dev/_test` →
+  `document_compliance_engine_dev/_test`, old ones dropped after the new
+  ones were confirmed migrating cleanly); the umbrella root `mix.exs`
+  module (`VendorOnboarding.Umbrella.MixProject` →
+  `DocumentComplianceEngine.Umbrella.MixProject`); `.github/workflows/ci.yml`'s
+  `apps/vendor_onboarding` paths; the navbar text and page `<title>`
+  (previously still "Vendor Onboarding"/plain Phoenix defaults — English
+  prose with a space, so untouched by the mechanical `VendorOnboarding`/
+  `vendor_onboarding` substitution and needed a manual pass); and
+  `CLAUDE.md`/`PRINCIPLES.md`, both blanket-substituted since neither
+  carries dated history to protect.
+- **Deliberately left alone**: the webhook route path
+  (`/webhooks/vendor_onboarding`) — it names the one ingestion flow that
+  exists today (a vendor's contract + W-9), not the application, and
+  wasn't part of what was actually offered/chosen (app atom, module
+  namespace, directory, database — not API route naming). Also
+  `OnboardingReactor`, for the same reason it survived the `DocumentJobs`
+  rename: it's the agent pipeline's own module describing the workflow it
+  runs, not the ingestion context.
+- **README.md and this file's own dated entries were *not* retroactively
+  rewritten.** Every existing dated entry describes what was literally
+  true when it was written — and at every one of those points, the app
+  really was named `vendor_onboarding`/`VendorOnboarding`. Rewriting them
+  would be revisionist, the same principle already applied when
+  `Onboardings` became `DocumentJobs` and old entries kept saying
+  `Onboardings`. Only this new entry and README's evergreen
+  (non-dated) sections — Architecture prose, Tech stack, Local
+  development — were updated to the current name.
+- **A real mistake, caught before it reached a test.** The rename script
+  swept `priv/repo/migrations/*.exs`, which includes fully historical,
+  already-applied migrations — corrupting literal Postgres identifier
+  strings that describe what was actually run (e.g. the real index name
+  `agent_runs_vendor_onboarding_id_index`, derived from a *column* that
+  was named `vendor_onboarding_id` for reasons unrelated to the app's own
+  name — coincidental string overlap, not the same fact). `mix compile`
+  didn't catch this one (it's a valid Elixir file either way — the bug is
+  in a runtime SQL string), but `mix ecto.migrate` against a fresh
+  database did: renaming a Postgres index that was never actually created
+  under its corrupted name would fail outright the moment a real replay
+  was attempted. Caught before that by inspection, restored every
+  migration file's content from the last commit (`055e22b`, which
+  predated this rename), and dropped + recreated both databases from the
+  corrected files rather than trusting the state left by the one
+  corrupted run. This is the exact discipline `CLAUDE.md`/this file
+  already state for migrations — never edit one already applied — just
+  violated once, by a blanket find/replace that didn't carve migrations
+  out the way the `DocumentJobs` rename's script deliberately had.
+- **Verified**: `mix compile --warnings-as-errors` clean, `mix precommit`
+  clean, 100 tests passing (unchanged count — a rename, not new
+  behavior), both databases dropped and recreated from the corrected
+  migrations, `.github/workflows/ci.yml` paths updated to match.
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow

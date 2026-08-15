@@ -1,6 +1,6 @@
-# Agentic Vendor Onboarding & Compliance Pipeline
+# Agentic Document Compliance Engine
 
-A back-office automation system that ingests a new vendor's contract and W-9 tax form, extracts structured data with an LLM, cross-validates it against external systems via MCP tools, and routes discrepancies to a human reviewer — with a durable, resumable pause instead of a dropped thread.
+A back-office automation system that ingests a document bundle, extracts structured data with an LLM, cross-validates it against external systems via MCP tools, and routes discrepancies to a human reviewer — with a durable, resumable pause instead of a dropped thread. Started as a vendor-onboarding-specific pipeline (a contract + a W-9); the ingestion data model has since been generalized to configurable document types (`DocumentTypes`, see Status below), though the one type the agent pipeline actually implements today is still that original contract-plus-W9 bundle.
 
 ## The business problem
 
@@ -27,7 +27,7 @@ flowchart TD
     E -.-> F
 ```
 
-**Agent workflow detail** — what runs inside `VendorOnboarding.Agent.Run` on each trigger:
+**Agent workflow detail** — what runs inside `DocumentComplianceEngine.Agent.Run` on each trigger:
 
 ```mermaid
 flowchart TD
@@ -49,7 +49,7 @@ clarity only — each keeps its own deps/build/config, see Local development):
 
 ```mermaid
 flowchart LR
-    subgraph P["apps/vendor_onboarding<br/>(Phoenix release, one OTP app)"]
+    subgraph P["apps/document_compliance_engine<br/>(Phoenix release, one OTP app)"]
         direction TB
         WH[Webhook] --> OB[Oban job]
         OB --> AR["Agent.Run<br/>(Reactor pipeline,<br/>in-process)"]
@@ -75,7 +75,7 @@ flowchart LR
 - **The HITL pause is backed by a Postgres-persisted checkpoint**, not in-memory state. If the app restarts mid-review, the paused workflow survives — verified by killing and restarting the whole node with a paused case in flight, not assumed. The `thread_id` for a paused run is stored on the `agent_runs` row so a human approving in LiveView can trigger a resume. The checkpoint table lives in its own Postgres schema (`agent_checkpoints`), owned by its own migration prefix rather than mixed into the business-domain tables, even though it shares the same Ecto Repo now.
 - **MCP is used deliberately, not decoratively.** The mock Tax API and mock Sanctions DB are two real, separate OTP applications each exposing an MCP tool interface over HTTP, not two functions folded into one process — because MCP's value is standardizing tool access across processes, and the README should be honest that for exactly two fixed mock tools, plain function-calling would work identically. The MCP framing is there because it's the pattern that scales to N real tools, and that's the argument to make explicit, not assume.
 - **Idempotency and PII are first-class, not afterthoughts.** The webhook computes an idempotency key (hash of raw payload) so a duplicated vendor email doesn't double-process a contract. Extracted Tax IDs and other PII get encrypted at rest and access-controlled storage — noted explicitly, since a project whose pitch is "compliance" loses credibility if its own data handling is naive.
-- **The webhook is signature-verified, not just idempotency-checked.** `POST /webhooks/vendor_onboarding` requires an `x-webhook-signature: sha256=<hex>` header — an HMAC-SHA256 over the exact raw body bytes, checked with a constant-time compare (`VendorOnboardingWeb.Plugs.VerifyWebhookSignature`). Idempotency alone stops duplicate processing of a *legitimate* payload; it does nothing to stop an unauthenticated caller from injecting a fabricated one, which is the actual threat model for an internet-facing ingestion endpoint on a compliance-pitched system.
+- **The webhook is signature-verified, not just idempotency-checked.** `POST /webhooks/vendor_onboarding` requires an `x-webhook-signature: sha256=<hex>` header — an HMAC-SHA256 over the exact raw body bytes, checked with a constant-time compare (`DocumentComplianceEngineWeb.Plugs.VerifyWebhookSignature`). Idempotency alone stops duplicate processing of a *legitimate* payload; it does nothing to stop an unauthenticated caller from injecting a fabricated one, which is the actual threat model for an internet-facing ingestion endpoint on a compliance-pitched system. (The route path itself stays `/webhooks/vendor_onboarding` — it names the one ingestion flow that exists today, not the app; see `CONTEXT.md`'s dated entry on the app rename for why that's deliberately out of scope.)
 
 ## Evaluation
 
@@ -93,7 +93,7 @@ The core resume claim — "0% hallucination rate on extracted entities" — is o
 | Subtle formatting difference, not a real mismatch | 3 | false-positive rate — the detail that makes "100% accuracy" credible rather than cherry-picked |
 | Missing/malformed fields | 2 | graceful degradation |
 
-Results are written up as a short metrics table in this README once the harness runs for real (with both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` configured), not just asserted. See `apps/vendor_onboarding/lib/vendor_onboarding/agent/evals/` and the Status section below for where that stands.
+Results are written up as a short metrics table in this README once the harness runs for real (with both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` configured), not just asserted. See `apps/document_compliance_engine/lib/document_compliance_engine/agent/evals/` and the Status section below for where that stands.
 
 ## Tech stack
 
@@ -151,22 +151,24 @@ Three findings worth recording, each verified rather than assumed:
 
 **2026-08-15 fixed the dead-end root path:** `/` and the navbar were still the unmodified `mix phx.new` scaffold — a Phoenix marketing landing page and links to phoenixframework.org, with nothing pointing at `/document_jobs`. `PageController.home/2` now redirects to `/document_jobs`; the navbar links there from every page. Verified against a real running server (curled both routes), not just the test suite. See `CONTEXT.md`'s dated entry.
 
+**2026-08-15 renamed the app itself, `VendorOnboarding` → `DocumentComplianceEngine`:** the data-model generalization above (`Onboardings` → `DocumentJobs` + `DocumentTypes`) only renamed the ingestion context — the OTP app (`:vendor_onboarding`), the Elixir module namespace (`VendorOnboarding.*`/`VendorOnboardingWeb.*`), the `apps/vendor_onboarding/` directory, and the dev/test databases were all still the original vendor-onboarding-specific name. Renamed all of it — app atom to `:document_compliance_engine`, every module to `DocumentComplianceEngine.*`/`DocumentComplianceEngineWeb.*`, the directory to `apps/document_compliance_engine/`, the databases to `document_compliance_engine_dev`/`_test`, plus the navbar text, page title, and this README's own title. The webhook route path (`/webhooks/vendor_onboarding`) and `OnboardingReactor` were deliberately left alone — see `CONTEXT.md`'s dated entry for why. One real mistake caught mid-pass: the blanket rename swept `priv/repo/migrations/*.exs` too, corrupting literal historical SQL identifier strings in already-applied migrations (e.g. turning the real Postgres index name `agent_runs_vendor_onboarding_id_index` into a nonexistent `agent_runs_document_compliance_engine_id_index`) — migrations describe what was actually run and should never be retroactively edited, the same discipline already applied during the `Onboardings` → `DocumentJobs` rename. Caught before it reached a test, restored from the last commit, both databases dropped and recreated clean. `mix precommit` clean, same 100 tests.
+
 100 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite now) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently. Every LLM call (both extractions, entity-match, explanation-drafting, and the judge) is built against GPT-4o-mini / Claude Sonnet but is dependency-injected — there's no `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` configured in this dev environment yet, so all of the above is verified with injected fake LLM calls plus the two *real* MCP servers and the *real* Postgres checkpointer, not a live model call. See `CONTEXT.md` for the full build plan and architectural decisions.
 
 ## Local development
 
-The repo root is a Mix umbrella (`apps/vendor_onboarding`, `apps/tax_api`,
+The repo root is a Mix umbrella (`apps/document_compliance_engine`, `apps/tax_api`,
 `apps/sanctions_db`) for directory clarity only — each app is fully
 independent (own deps, own build, own config). **Always `cd` into the
 specific app first; never run `mix` commands from the repo root** — see
 `CLAUDE.md`'s "Architecture in one paragraph" for why a root-level command
 doesn't do what you'd expect here.
 
-* `cd apps/vendor_onboarding && mix setup` to install dependencies and run migrations (includes the agent pipeline's checkpoint table, in its own `agent_checkpoints` schema)
+* `cd apps/document_compliance_engine && mix setup` to install dependencies and run migrations (includes the agent pipeline's checkpoint table, in its own `agent_checkpoints` schema)
 * Set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (LLM judge) in your environment to run the real LLM calls (neither is required to run the test suite — it uses injected fakes)
-* Start Phoenix with `mix phx.server` or inside IEx with `iex -S mix phx.server` (from `apps/vendor_onboarding`)
+* Start Phoenix with `mix phx.server` or inside IEx with `iex -S mix phx.server` (from `apps/document_compliance_engine`)
 * Visit [`localhost:4000`](http://localhost:4000)
-* Webhook requests must be HMAC-SHA256 signed (`x-webhook-signature: sha256=<hex>` over the raw body). Dev uses the fixed secret in `apps/vendor_onboarding/config/dev.exs`; sign a local curl request with:
+* Webhook requests must be HMAC-SHA256 signed (`x-webhook-signature: sha256=<hex>` over the raw body). Dev uses the fixed secret in `apps/document_compliance_engine/config/dev.exs`; sign a local curl request with:
   ```sh
   BODY='{"contract":"...","w9":"..."}'
   SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "dev-only-webhook-secret-change-me" | sed 's/^.* //')
@@ -179,4 +181,4 @@ The two mock MCP tool servers are still separate OTP applications — genuinely 
 * `cd apps/tax_api && mix deps.get && iex -S mix` — mock Tax API MCP server, port 8010
 * `cd apps/sanctions_db && mix deps.get && iex -S mix` — mock Sanctions DB MCP server, port 8011
 * `mix test` from inside each app's own directory (likewise `cd apps/tax_api && mix test`, etc.)
-* `mix eval.run` (from `apps/vendor_onboarding`) — the eval harness; the deterministic tier needs `OPENAI_API_KEY` (+ the two MCP servers running), the LLM-judge tier also needs `ANTHROPIC_API_KEY`
+* `mix eval.run` (from `apps/document_compliance_engine`) — the eval harness; the deterministic tier needs `OPENAI_API_KEY` (+ the two MCP servers running), the LLM-judge tier also needs `ANTHROPIC_API_KEY`

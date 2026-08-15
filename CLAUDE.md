@@ -1,4 +1,4 @@
-# vendor_onboarding — Claude working instructions
+# document_compliance_engine — Claude working instructions
 
 > Read PRINCIPLES.md and CONTEXT.md before touching any code.
 
@@ -6,7 +6,7 @@
 
 ## Architecture in one paragraph
 
-One Elixir release. `VendorOnboarding.Agent` (`apps/vendor_onboarding/lib/vendor_onboarding/agent/`) is
+One Elixir release. `DocumentComplianceEngine.Agent` (`apps/document_compliance_engine/lib/document_compliance_engine/agent/`) is
 the agent brain — a plain module tree, not a separate application — driven by
 Oban: webhook → Oban job → `Agent.Run.trigger/2` runs the pipeline to completion
 *inside* that job → the result is written back to `AgentRuns` via a direct
@@ -60,7 +60,7 @@ Follow **PRINCIPLES.md** exactly. Key reminders:
 - All `Repo.*` calls for a context's table live exclusively in that context's `repository.ex`
 - No context ever queries another's schema directly — only via its public API
   (`DocumentJobs.*` / `AgentRuns.*` / `DocumentTypes.*`)
-- `TriggerAgentRun`/`ResumeReview` call `VendorOnboarding.Agent.Run.trigger/2` and
+- `TriggerAgentRun`/`ResumeReview` call `DocumentComplianceEngine.Agent.Run.trigger/2` and
   `.resume/3` directly — no HTTP, no Req, no controller. `Agent.Run` reports its result
   back via `AgentRuns.handle_agent_callback/1` (also a direct call), never the other way
   around — `Agent.*` depends on `AgentRuns`'s public API, `AgentRuns` never depends on `Agent`
@@ -95,9 +95,9 @@ mock tools:
 ```
 mix.exs                         # umbrella root — apps_path only, deps: []
 apps/
-  vendor_onboarding/             # this Phoenix app — control plane AND agent brain
+  document_compliance_engine/             # this Phoenix app — control plane AND agent brain
     mix.exs                       # own deps/build/config/lockfile, self-contained
-    lib/vendor_onboarding/
+    lib/document_compliance_engine/
       document_jobs/               # ingestion context (was `onboardings/` — see CONTEXT.md)
       document_types/              # document-type config registry — slug, name, extraction_schema,
                                     # validation_rules; not yet read by the agent pipeline
@@ -113,13 +113,13 @@ apps/
         checkpoint/                  # schema + repository for the halted-run checkpoint
         evals/                      # fixtures, deterministic tier, LLM judge
     lib/mix/tasks/eval.run.ex     # mix eval.run
-    lib/vendor_onboarding_web/
+    lib/document_compliance_engine_web/
     priv/repo/migrations/         # includes the checkpoint table (own Postgres schema, see below)
   tax_api/                       # separate OTP app exposing MCP (port 8010), own mix.exs
   sanctions_db/                  # separate OTP app exposing MCP (port 8011), own mix.exs
 ```
 
-The checkpoint table (`agent_checkpoints.run_checkpoints`) shares `VendorOnboarding.Repo`
+The checkpoint table (`agent_checkpoints.run_checkpoints`) shares `DocumentComplianceEngine.Repo`
 now but still lives in its own Postgres schema, not `public`, via `@schema_prefix` on the
 Ecto schema and `prefix:` in its migration — keeps "don't let checkpoint tables leak into
 business-domain migrations" true even with one shared Repo.
@@ -148,8 +148,8 @@ business-domain migrations" true even with one shared Repo.
   `thread_id` constraint on a halt; swallowing is deliberately safer than that cascade.
 - External calls (extraction, entity match, both MCP tools, explanation drafting, the eval
   judge, and the `AgentRuns.handle_agent_callback/1` report itself) are overridable via
-  `Application.get_env(:vendor_onboarding, :agent_*)` so tests need no API keys or running
-  tool servers. See `apps/vendor_onboarding/test/support/agent_fakes.ex`.
+  `Application.get_env(:document_compliance_engine, :agent_*)` so tests need no API keys or running
+  tool servers. See `apps/document_compliance_engine/test/support/agent_fakes.ex`.
 
 ---
 
@@ -164,7 +164,7 @@ business-domain migrations" true even with one shared Repo.
 
 ## Pre-commit
 
-Run before committing, from inside the app you touched — `cd apps/vendor_onboarding`,
+Run before committing, from inside the app you touched — `cd apps/document_compliance_engine`,
 `cd apps/tax_api`, or `cd apps/sanctions_db` first, never from the repo root:
 
 ```
@@ -188,32 +188,32 @@ error, not a compile error.
 ## File naming conventions
 
 ```
-apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/schema/document_job.ex
-apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/actions/ingest_webhook.ex
-apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/actions/list_with_latest_run.ex
-apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/repository.ex
-apps/vendor_onboarding/lib/vendor_onboarding/document_jobs/idempotency.ex
-apps/vendor_onboarding/lib/vendor_onboarding/document_jobs.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_jobs/schema/document_job.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_jobs/actions/ingest_webhook.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_jobs/actions/list_with_latest_run.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_jobs/repository.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_jobs/idempotency.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_jobs.ex
 
-apps/vendor_onboarding/lib/vendor_onboarding/document_types/schema/document_type.ex
-apps/vendor_onboarding/lib/vendor_onboarding/document_types/repository.ex
-apps/vendor_onboarding/lib/vendor_onboarding/document_types.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_types/schema/document_type.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_types/repository.ex
+apps/document_compliance_engine/lib/document_compliance_engine/document_types.ex
 
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/schema/agent_run.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/actions/trigger_agent_run.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/actions/handle_agent_callback.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/actions/resume_review.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/workers/trigger_agent_run_worker.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/workers/resume_agent_run_worker.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs/repository.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent_runs.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/schema/agent_run.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/actions/trigger_agent_run.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/actions/handle_agent_callback.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/actions/resume_review.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/workers/trigger_agent_run_worker.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/workers/resume_agent_run_worker.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/repository.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent_runs.ex
 
-apps/vendor_onboarding/lib/vendor_onboarding/agent/run.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent/onboarding_reactor.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent/checkpoint/repository.ex
-apps/vendor_onboarding/lib/vendor_onboarding/agent/checkpoint/schema/run_checkpoint.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent/run.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent/onboarding_reactor.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent/checkpoint/repository.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent/checkpoint/schema/run_checkpoint.ex
 
-apps/vendor_onboarding/lib/vendor_onboarding_web/controllers/webhook_controller.ex
-apps/vendor_onboarding/lib/vendor_onboarding_web/live/dashboard_live.ex
-apps/vendor_onboarding/lib/vendor_onboarding_web/live/review_live.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/controllers/webhook_controller.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/live/dashboard_live.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/live/review_live.ex
 ```

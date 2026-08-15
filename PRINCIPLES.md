@@ -1,4 +1,4 @@
-# vendor_onboarding — Elixir design principles
+# document_compliance_engine — Elixir design principles
 
 Ported from `better_me`/`dentos`. Applies without change except where
 this project's shape differs (an `Agent` module tree calling out to LLMs/MCP
@@ -31,7 +31,8 @@ DocumentTypes — a small config registry: what document types this system
 ```
 
 This was originally one context/one table (`vendor_onboarding.ex` +
-`vendor_onboardings`). Split into `Onboardings`/`AgentRuns` because the row
+`vendor_onboardings` — the app's literal name at that point in the project's
+history, before either rename below). Split into `Onboardings`/`AgentRuns` because the row
 conflated "the ingestion record" with "the latest agent run's output" —
 overwriting the same columns on every run meant no history, and no real
 context boundary existed since there was nothing to draw one around.
@@ -67,7 +68,7 @@ belong in the owning domain" pattern.
 
 ### structure
 ```
-apps/vendor_onboarding/lib/vendor_onboarding/
+apps/document_compliance_engine/lib/document_compliance_engine/
   repo.ex                        infra — shared by all contexts
   vault.ex / encrypted/binary.ex infra — Cloak encryption (used by AgentRuns' tax_id)
   storage.ex / storage/          infra — document storage boundary (used by DocumentJobs)
@@ -105,7 +106,7 @@ apps/vendor_onboarding/lib/vendor_onboarding/
 - `document_jobs.ex` / `agent_runs.ex` / `document_types.ex` contain only `defdelegate` — nothing else, ever
 - Each context's `repository.ex` is the only file that calls `Repo.*` for that context's table
 - Action modules call their own context's `Repository.*`, another context's public
-  API (`DocumentJobs.*` / `AgentRuns.*` / `DocumentTypes.*`), `VendorOnboarding.Agent.Run.*`,
+  API (`DocumentJobs.*` / `AgentRuns.*` / `DocumentTypes.*`), `DocumentComplianceEngine.Agent.Run.*`,
   and other actions in the same context — never `Repo.*` directly, never another context's
   `Repository.*` or `Schema.*`
 - Action modules are private — never called from outside their context
@@ -119,7 +120,7 @@ apps/vendor_onboarding/lib/vendor_onboarding/
 ### the strict boundary rule
 - **`repository.ex` only touches `Repo.*`** — no coordination, no calling another context
 - **`actions/*.ex` never calls `Repo.*` directly** — actions call their own `Repository.*`,
-  another context's public API, and `VendorOnboarding.Agent.Run.*`
+  another context's public API, and `DocumentComplianceEngine.Agent.Run.*`
 - **Anything that bridges a repo call and a call into the agent pipeline belongs in an action** —
   e.g. `TriggerAgentRun` reads the document job via `DocumentJobs.get_document_job/1`, starts a run via
   `Repository.insert/1`, then calls `Agent.Run.trigger/2` (which reports its result straight back
@@ -174,7 +175,7 @@ create_document_type(attrs)                       # {:ok, document_type} | {:err
   one type the agent pipeline actually implements today
 - `AgentRun.status` (`Ecto.Enum`: `:processing, :needs_review, :approved, :rejected`) is
   that specific run's outcome — a re-run gets a new row, not an overwritten one
-- **Tax ID is PII** — encrypt at rest (`Cloak.Ecto` custom type, `VendorOnboarding.Encrypted.Binary`),
+- **Tax ID is PII** — encrypt at rest (`Cloak.Ecto` custom type, `DocumentComplianceEngine.Encrypted.Binary`),
   never a plaintext column. Lives on `AgentRun`, not `DocumentJob`. Hard requirement from
   CONTEXT.md, not a nice-to-have.
 - Payment Terms / Liability Clauses are free text (`:string`) — not strictly typed,
@@ -226,7 +227,7 @@ create_document_type(attrs)                       # {:ok, document_type} | {:err
   (`AgentRuns.get_latest_for_document_job/1`), calls each context directly rather than
   through an intermediary)
 - `handle_event` callbacks ≤ 5 lines — delegate to `DocumentJobs.*` / `AgentRuns.*` / `DocumentTypes.*` immediately
-- PubSub topic per document job row (or a single `"vendor_onboarding"` topic broadcasting
+- PubSub topic per document job row (or a single `"document_compliance_engine"` topic broadcasting
   `{:status_updated, id}`) — dashboard subscribes and reloads the affected row, not the whole list
 
 ---
@@ -245,7 +246,7 @@ over `for`, `snake_case`/`PascalCase` naming, `?`/`!` suffix conventions.
 - [ ] No context aliases or queries another context's `Schema`/`Repository` — only its public API
 - [ ] All functions return `{:ok, _} | {:error, _}`
 - [ ] No bare `Repo.*` calls outside a context's own `repository.ex`
-- [ ] No bare `Repo.*`/coordination calls into the agent pipeline outside `VendorOnboarding.Agent.Run`
+- [ ] No bare `Repo.*`/coordination calls into the agent pipeline outside `DocumentComplianceEngine.Agent.Run`
 - [ ] Tax ID stored via an encrypted Ecto type, never plaintext
 - [ ] Idempotency key checked before any row is created
 - [ ] `thread_id` is written to the run row on every pause callback — this is what makes resume possible
