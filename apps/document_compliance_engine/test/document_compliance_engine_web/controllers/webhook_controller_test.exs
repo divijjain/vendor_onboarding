@@ -5,8 +5,11 @@ defmodule DocumentComplianceEngineWeb.WebhookControllerTest do
     unique = System.unique_integer([:positive])
 
     Jason.encode!(%{
-      "contract" => Base.encode64("contract-bytes-#{unique}"),
-      "w9" => Base.encode64("w9-bytes-#{unique}")
+      "document_type_slug" => "vendor_contract_w9",
+      "documents" => %{
+        "contract" => Base.encode64("contract-bytes-#{unique}"),
+        "w9" => Base.encode64("w9-bytes-#{unique}")
+      }
     })
   end
 
@@ -45,10 +48,23 @@ defmodule DocumentComplianceEngineWeb.WebhookControllerTest do
     end)
   end
 
-  test "POST /webhooks/document_compliance_engine rejects a well-formed JSON body missing contract/w9",
+  test "POST /webhooks/document_compliance_engine rejects a well-formed JSON body missing document_type_slug/documents",
        %{conn: conn} do
     conn = post_webhook(conn, Jason.encode!(%{}))
     assert json_response(conn, 422) == %{"error" => "invalid_payload"}
+  end
+
+  test "POST /webhooks/document_compliance_engine rejects an unknown document_type_slug", %{
+    conn: conn
+  } do
+    raw_payload =
+      Jason.encode!(%{
+        "document_type_slug" => "not_a_real_type",
+        "documents" => %{"invoice" => Base.encode64("x")}
+      })
+
+    conn = post_webhook(conn, raw_payload)
+    assert json_response(conn, 422) == %{"error" => "unknown_document_type"}
   end
 
   test "POST /webhooks/document_compliance_engine rejects a request with no signature header", %{

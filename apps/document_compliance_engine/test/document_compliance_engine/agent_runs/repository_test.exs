@@ -6,7 +6,11 @@ defmodule DocumentComplianceEngine.AgentRuns.RepositoryTest do
 
   defp insert_document_job(key) do
     {:ok, document_job} =
-      DocumentJobsRepository.insert(%{idempotency_key: key, document_paths: %{}})
+      DocumentJobsRepository.insert(%{
+        idempotency_key: key,
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     document_job
   end

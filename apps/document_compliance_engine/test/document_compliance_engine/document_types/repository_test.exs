@@ -3,13 +3,13 @@ defmodule DocumentComplianceEngine.DocumentTypes.RepositoryTest do
 
   alias DocumentComplianceEngine.DocumentTypes.Repository
 
-  @valid_attrs %{slug: "invoice", name: "Invoice"}
+  @valid_attrs %{slug: "purchase_order", name: "Purchase Order"}
 
   describe "insert/1" do
     test "creates a row on the happy path" do
       assert {:ok, document_type} = Repository.insert(@valid_attrs)
-      assert document_type.slug == "invoice"
-      assert document_type.name == "Invoice"
+      assert document_type.slug == "purchase_order"
+      assert document_type.name == "Purchase Order"
       assert document_type.extraction_schema == %{}
       assert document_type.validation_rules == []
     end
@@ -29,7 +29,7 @@ defmodule DocumentComplianceEngine.DocumentTypes.RepositoryTest do
   describe "get_by_slug/1" do
     test "finds an existing row" do
       {:ok, document_type} = Repository.insert(@valid_attrs)
-      assert %{id: id} = Repository.get_by_slug("invoice")
+      assert %{id: id} = Repository.get_by_slug("purchase_order")
       assert id == document_type.id
     end
 
@@ -44,7 +44,7 @@ defmodule DocumentComplianceEngine.DocumentTypes.RepositoryTest do
 
       slugs = Repository.list() |> Enum.map(& &1.slug)
       assert "vendor_contract_w9" in slugs
-      assert "invoice" in slugs
+      assert "purchase_order" in slugs
     end
   end
 end

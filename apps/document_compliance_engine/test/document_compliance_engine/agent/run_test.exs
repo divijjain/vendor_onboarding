@@ -6,6 +6,8 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
   alias DocumentComplianceEngine.Agent.Checkpoint.Repository
   alias DocumentComplianceEngine.Agent.Run
 
+  @document_type_slug "vendor_contract_w9"
+
   setup do
     # Capture reported results instead of writing through to AgentRuns —
     # these tests use bare integers as document_job_id, not real rows.
@@ -34,10 +36,13 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
 
   setup :write_documents
 
+  defp trigger(document_job_id, paths),
+    do: Run.trigger(document_job_id, @document_type_slug, paths)
+
   test "sends an approved callback when everything checks out", %{document_paths: paths} do
     stub_defaults()
 
-    Run.trigger(7, paths)
+    trigger(7, paths)
 
     assert_received {:callback, payload}
     assert payload["document_job_id"] == 7
@@ -49,9 +54,14 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
   test "sends needs_review with a thread_id and persists a checkpoint on a mismatch", %{
     document_paths: paths
   } do
-    stub_defaults(extract_w9: fn _text -> {:ok, w9(%{company_name: "Totally Different LLC"})} end)
+    stub_defaults(
+      extract: fn
+        "w9", _schema, _text -> {:ok, w9(%{company_name: "Totally Different LLC"})}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
 
-    Run.trigger(9, paths)
+    trigger(9, paths)
 
     assert_received {:callback, payload}
     assert payload["status"] == "needs_review"
@@ -62,13 +72,18 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     assert {:ok, checkpoint} = Repository.get_by_thread_id("document_job-9")
     assert checkpoint.document_job_id == 9
     assert checkpoint.status == :awaiting_review
-    assert checkpoint.inputs["contract_text"] == "contract text"
+    assert checkpoint.inputs["documents"]["contract"] == "contract text"
   end
 
   test "resumes a persisted checkpoint with the human's decision", %{document_paths: paths} do
-    stub_defaults(extract_w9: fn _text -> {:ok, w9(%{company_name: "Totally Different LLC"})} end)
+    stub_defaults(
+      extract: fn
+        "w9", _schema, _text -> {:ok, w9(%{company_name: "Totally Different LLC"})}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
 
-    Run.trigger(11, paths)
+    trigger(11, paths)
     assert_received {:callback, _needs_review}
 
     Run.resume(11, "document_job-11", "rejected")
@@ -84,7 +99,7 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
   test "sends a failed callback when a document is missing" do
     stub_defaults()
 
-    Run.trigger(12, %{"contract" => "/no/such/file.pdf", "w9" => "/no/such/w9.pdf"})
+    trigger(12, %{"contract" => "/no/such/file.pdf", "w9" => "/no/such/w9.pdf"})
 
     assert_received {:callback, payload}
     assert payload["status"] == "failed"
@@ -92,9 +107,14 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
   end
 
   test "sends a failed callback when extraction fails", %{document_paths: paths} do
-    stub_defaults(extract_contract: fn _text -> {:error, "simulated extraction failure"} end)
+    stub_defaults(
+      extract: fn
+        "contract", _schema, _text -> {:error, "simulated extraction failure"}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
 
-    Run.trigger(13, paths)
+    trigger(13, paths)
 
     assert_received {:callback, payload}
     assert payload["status"] == "failed"
@@ -107,9 +127,15 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     # A real Reactor.Error.Invalid struct inspects far past 255 chars —
     # writing it verbatim overflows the column and crashes the callback.
     long_reason = %{very_long: String.duplicate("x", 1000)}
-    stub_defaults(extract_contract: fn _text -> {:error, long_reason} end)
 
-    Run.trigger(16, paths)
+    stub_defaults(
+      extract: fn
+        "contract", _schema, _text -> {:error, long_reason}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
+
+    trigger(16, paths)
 
     assert_received {:callback, payload}
     assert payload["status"] == "failed"
@@ -133,6 +159,6 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
       {:error, :changeset_invalid}
     end)
 
-    assert :ok = Run.trigger(15, %{"contract" => "/no/such/file.pdf", "w9" => "/no/such/w9.pdf"})
+    assert :ok = trigger(15, %{"contract" => "/no/such/file.pdf", "w9" => "/no/such/w9.pdf"})
   end
 end

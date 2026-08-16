@@ -22,7 +22,11 @@ defmodule DocumentComplianceEngine.SystemHealthTest do
     end)
 
     {:ok, document_job} =
-      DocumentJobsRepository.insert(%{idempotency_key: "health-1", document_paths: %{}})
+      DocumentJobsRepository.insert(%{
+        idempotency_key: "health-1",
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     {:ok, _run} =
       AgentRunsRepository.insert(%{document_job_id: document_job.id, status: :processing})

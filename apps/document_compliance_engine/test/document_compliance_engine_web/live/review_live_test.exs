@@ -8,7 +8,8 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     {:ok, document_job} =
       DocumentJobs.Repository.insert(%{
         idempotency_key: "review-#{System.unique_integer([:positive])}",
-        document_paths: %{}
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
       })
 
     {:ok, run} =
@@ -53,7 +54,11 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
 
   test "hides approve/reject once no longer awaiting review", %{conn: conn} do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: "review-approved", document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: "review-approved",
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     {:ok, document_job} = DocumentJobs.update_status(document_job.id, :approved)
 

@@ -3,68 +3,92 @@ defmodule DocumentComplianceEngine.Agent.ChecksTest do
 
   import DocumentComplianceEngine.AgentFakes
 
-  alias DocumentComplianceEngine.Agent.Checks
+  alias DocumentComplianceEngine.Agent.{Checks, ValidationResult}
   alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
-  alias DocumentComplianceEngine.Agent.ValidationResult
 
-  defp validation(overrides) do
-    struct(
-      %ValidationResult{
-        entity_match: %EntityMatchResult{match: true, explanation: "same entity"},
-        tax_id_valid: true,
-        sanctions_flagged: false
-      },
-      overrides
+  @extracted %{
+    "contract" => %{company_name: "Acme Corp"},
+    "w9" => %{company_name: "Acme Corp", tax_id: "12-3456789"}
+  }
+
+  @entity_match_rule %{
+    "type" => "entity_match",
+    "fields" => [
+      %{"role" => "contract", "name" => "company_name"},
+      %{"role" => "w9", "name" => "company_name"}
+    ]
+  }
+
+  @tax_id_rule %{
+    "type" => "mcp_tool",
+    "tool" => "validate_tax_id",
+    "field" => %{"role" => "w9", "name" => "tax_id"}
+  }
+
+  @sanctions_rule %{
+    "type" => "mcp_tool",
+    "tool" => "screen_vendor",
+    "field" => %{"role" => "contract", "name" => "company_name"}
+  }
+
+  test "entity_match rule passes when the two named fields match" do
+    stub_defaults()
+
+    assert {:ok, %ValidationResult{checks: [check]}} =
+             Checks.validate_all(@extracted, [@entity_match_rule])
+
+    assert check.passed
+    assert check.detail == nil
+  end
+
+  test "entity_match rule fails and records a detail on mismatch" do
+    stub_defaults(
+      entity_match: fn _a, _b ->
+        {:ok, %EntityMatchResult{match: false, explanation: "different entities"}}
+      end
     )
-  end
 
-  test "approved? requires a match, a valid tax id, and no sanctions hit" do
-    assert ValidationResult.approved?(validation(%{}))
-
-    refute ValidationResult.approved?(
-             validation(%{
-               entity_match: %EntityMatchResult{match: false, explanation: "different vendor"}
-             })
-           )
-
-    refute ValidationResult.approved?(validation(%{tax_id_valid: false}))
-    refute ValidationResult.approved?(validation(%{sanctions_flagged: true}))
-  end
-
-  test "describe_findings lists every failed check" do
-    findings =
-      Checks.describe_findings(
-        validation(%{
-          entity_match: %EntityMatchResult{match: false, explanation: "names differ"},
-          tax_id_valid: false,
-          sanctions_flagged: true,
-          sanctions_reason: "watchlist"
-        })
-      )
-
-    assert findings =~ "Entity name mismatch: names differ"
-    assert findings =~ "Tax ID failed validation"
-    assert findings =~ "Sanctions screening hit: watchlist"
-  end
-
-  test "describe_findings is empty when everything passes" do
-    assert Checks.describe_findings(validation(%{})) == ""
-  end
-
-  test "validate combines the entity match and both tool calls" do
-    stub_defaults(screen_vendor: fn _name -> {:ok, %{flagged: true, reason: "watchlist"}} end)
-
-    assert {:ok, result} = Checks.validate(%{contract: contract(), w9: w9()})
-    assert result.entity_match.match
-    assert result.tax_id_valid
-    assert result.sanctions_flagged
-    assert result.sanctions_reason == "watchlist"
+    assert {:ok, result} = Checks.validate_all(@extracted, [@entity_match_rule])
     refute ValidationResult.approved?(result)
+    assert [check] = result.checks
+    assert check.detail =~ "Entity name mismatch: different entities"
   end
 
-  test "validate propagates a tool failure instead of approving" do
-    stub_defaults(validate_tax_id: fn _tax_id -> {:error, :tool_unavailable} end)
+  test "mcp_tool validate_tax_id rule fails on an invalid tax id" do
+    stub_defaults(validate_tax_id: fn _tax_id -> {:ok, %{valid: false}} end)
 
-    assert {:error, :tool_unavailable} = Checks.validate(%{contract: contract(), w9: w9()})
+    assert {:ok, result} = Checks.validate_all(@extracted, [@tax_id_rule])
+    refute ValidationResult.approved?(result)
+    assert [check] = result.checks
+    assert check.detail =~ "Tax ID failed validation"
+  end
+
+  test "mcp_tool screen_vendor rule fails on a sanctions hit" do
+    stub_defaults(screen_vendor: fn _name -> {:ok, %{flagged: true, reason: "on watchlist"}} end)
+
+    assert {:ok, result} = Checks.validate_all(@extracted, [@sanctions_rule])
+    refute ValidationResult.approved?(result)
+    assert [check] = result.checks
+    assert check.detail =~ "Sanctions screening hit: on watchlist"
+  end
+
+  test "approved? is true only when every rule passes" do
+    stub_defaults()
+
+    assert {:ok, result} = Checks.validate_all(@extracted, [@tax_id_rule, @sanctions_rule])
+    assert ValidationResult.approved?(result)
+  end
+
+  test "describe_findings joins only the failed checks' details" do
+    stub_defaults(
+      validate_tax_id: fn _tax_id -> {:ok, %{valid: false}} end,
+      screen_vendor: fn _name -> {:ok, %{flagged: true, reason: "on watchlist"}} end
+    )
+
+    assert {:ok, result} = Checks.validate_all(@extracted, [@tax_id_rule, @sanctions_rule])
+    findings = Checks.describe_findings(result)
+
+    assert findings =~ "Tax ID failed validation"
+    assert findings =~ "Sanctions screening hit: on watchlist"
   end
 end

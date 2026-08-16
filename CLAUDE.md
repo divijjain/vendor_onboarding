@@ -39,16 +39,19 @@ and aggregate status (`document_jobs` table, `document_type_slug`),
 (`agent_runs` table, `belongs_to :document_job`) so re-runs keep history
 instead of overwriting columns, and `DocumentTypes` (`document_types` table)
 is a small config registry of known document types — what a job's
-`document_type_slug` refers to, and (not yet read by the agent pipeline)
-each type's intended `extraction_schema`/`validation_rules`. `thread_id`
-lives on the `agent_runs` row and is what lets a human approval in LiveView
-resume a specific paused agent run. Don't re-litigate the context split
-without a real reason. See CONTEXT.md's dated entry: `DocumentJobs` was
-`Onboardings` until the data model was generalized beyond the
-vendor-contract-plus-W9 case it started as — the agent pipeline itself
-(`OnboardingReactor`, still so named) was deliberately left alone in that
-pass, so it still only implements the one document type the migration
-seeded (`vendor_contract_w9`).
+`document_type_slug` refers to, and each type's `extraction_schema`/
+`validation_rules`, which `Agent.Run` resolves before invoking the reactor
+and the agent pipeline now genuinely interprets (`Extraction.extract_all/2`,
+`Checks.validate_all/2`) rather than hardcoding one document's fields.
+`thread_id` lives on the `agent_runs` row and is what lets a human approval
+in LiveView resume a specific paused agent run. Don't re-litigate the
+context split without a real reason. See CONTEXT.md's dated entries:
+`DocumentJobs` was `Onboardings` until the data model was generalized beyond
+the vendor-contract-plus-W9 case it started as, and the agent pipeline
+itself — renamed `OnboardingReactor` → `DocumentReactor` at the point it
+actually became document-type-generic — was generalized in a later pass,
+proven against a second real document type (`invoice`), not just reshaped
+config.
 
 ---
 
@@ -100,14 +103,15 @@ apps/
     lib/document_compliance_engine/
       document_jobs/               # ingestion context (was `onboardings/` — see CONTEXT.md)
       document_types/              # document-type config registry — slug, name, extraction_schema,
-                                    # validation_rules; not yet read by the agent pipeline
+                                    # validation_rules; resolved by Agent.Run and interpreted by
+                                    # Extraction/Checks — genuinely read by the agent pipeline
       agent_runs/                  # agent-run context — workers/actions call Agent.Run directly
       system_health.ex             # operational snapshot for the dashboard — not a context,
                                     # no table; reads Oban's table directly + AgentRuns' public API
       agent/                       # the agent brain, a plain module tree, NOT a separate app
-        onboarding_reactor.ex       # the pipeline, as Reactor steps
+        document_reactor.ex         # the pipeline, as Reactor steps (document-type-generic)
         schemas/                    # Ecto embedded schemas for structured LLM output
-        checks.ex                   # entity match + the two MCP tool calls
+        checks.ex                   # interprets validation_rules: entity-match + the two MCP tools
         mcp_client.ex               # JSON-RPC-over-HTTP client for the tool servers
         run.ex                      # trigger/resume, reports via AgentRuns.handle_agent_callback/1
         checkpoint/                  # schema + repository for the halted-run checkpoint
@@ -126,18 +130,23 @@ business-domain migrations" true even with one shared Repo.
 
 ### Agent-brain gotchas
 
-- **The `:gate`/`:finalize` split in `agent/onboarding_reactor.ex` is load-bearing.** Reactor
+- **The `:gate`/`:finalize` split in `agent/document_reactor.ex` is load-bearing.** Reactor
   caches a halted step's `{:halt, value}` as its final result and never re-runs it, so
   the human's decision must be consumed by a *downstream* step. Merging them compiles
   fine and silently returns the stale halt value instead of the reviewer's decision.
 - **Resume requires every original input re-supplied**, not just the new one — that's why
-  the checkpoint row stores `inputs` alongside the serialized reactor.
+  the checkpoint row stores `inputs` (including `documents`/`extraction_schema`/
+  `validation_rules`, not just the decision) alongside the serialized reactor.
+- **`extraction_schema`/`validation_rules` are resolved once in `Agent.Run`, before
+  `Reactor.run/2` is called — not looked up as a Reactor step.** It's a static, idempotent
+  config read with no pause/retry need, and keeping it outside Reactor keeps the
+  checkpoint's stored `inputs` self-contained for resume, same as every other input.
 - **Don't swap the MCP client for `hermes_mcp`'s client.** It passes `transport_opts` as a
   per-request Finch option, which Finch >= 0.21 rejects; the only Req old enough to hold
   Finch back has published CVEs. The two `apps/tax_api` and `apps/sanctions_db` apps use
   `hermes_mcp` (unaffected — server side, not client); `agent/mcp_client.ex` is deliberately
   hand-rolled on Req.
-- **`Agent.Run.trigger/2` runs the pipeline synchronously** — by design. It's only ever
+- **`Agent.Run.trigger/3` runs the pipeline synchronously** — by design. It's only ever
   called from inside `TriggerAgentRunWorker`/`ResumeAgentRunWorker` (already off the
   web/LiveView process via Oban), so there's no separate async hop needed the way there
   was when this was an HTTP call to a different process. Never call `Agent.Run.*` from a
@@ -209,7 +218,7 @@ apps/document_compliance_engine/lib/document_compliance_engine/agent_runs/reposi
 apps/document_compliance_engine/lib/document_compliance_engine/agent_runs.ex
 
 apps/document_compliance_engine/lib/document_compliance_engine/agent/run.ex
-apps/document_compliance_engine/lib/document_compliance_engine/agent/onboarding_reactor.ex
+apps/document_compliance_engine/lib/document_compliance_engine/agent/document_reactor.ex
 apps/document_compliance_engine/lib/document_compliance_engine/agent/checkpoint/repository.ex
 apps/document_compliance_engine/lib/document_compliance_engine/agent/checkpoint/schema/run_checkpoint.ex
 

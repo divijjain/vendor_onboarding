@@ -2,11 +2,13 @@ defmodule DocumentComplianceEngine.DocumentTypes.Schema.DocumentType do
   @moduledoc """
   A configurable document type: what a `DocumentJob` claims to be (its
   `document_type_slug`), what fields extraction is meant to produce for it,
-  and which validation tools apply. `extraction_schema`/`validation_rules`
-  are stored but not yet read by the agent pipeline — `OnboardingReactor`
-  still runs today's fixed contract+W9 extraction regardless of the
-  document type on the job. See CONTEXT.md's dated entry: this table is a
-  data-model generalization step, not a rewrite of the agent brain.
+  and which validation rules apply. `extraction_schema` is a map of
+  document role => field name => Ecto type (currently only `"string"`);
+  `validation_rules` is a list of typed rule maps (`entity_match` or
+  `mcp_tool`) interpreted by `Agent.Checks.validate_all/2`. Both are
+  resolved by `Agent.Run` and passed into `Agent.DocumentReactor` as plain
+  inputs — genuinely read by the agent pipeline, not just stored config.
+  See CONTEXT.md's dated entries for the generalization history.
   """
 
   use Ecto.Schema

@@ -5,7 +5,11 @@ defmodule DocumentComplianceEngine.DocumentJobsTest do
 
   test "get_document_job/1 delegates to the repository" do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: "ctx-1", document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: "ctx-1",
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     assert {:ok, found} = DocumentJobs.get_document_job(document_job.id)
     assert found.id == document_job.id
@@ -14,7 +18,11 @@ defmodule DocumentComplianceEngine.DocumentJobsTest do
 
   test "list_document_jobs/1 delegates to the repository" do
     {:ok, _document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: "ctx-2", document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: "ctx-2",
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     assert [_ | _] = DocumentJobs.list_document_jobs()
   end

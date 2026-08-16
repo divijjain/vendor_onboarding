@@ -6,11 +6,7 @@ defmodule DocumentComplianceEngine.AgentFakes do
   application env with the rest of the app now.
   """
 
-  alias DocumentComplianceEngine.Agent.Schemas.{
-    ContractExtraction,
-    EntityMatchResult,
-    W9Extraction
-  }
+  alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
 
   @doc "Overrides the agent's external calls for the duration of one test."
   def stub(overrides) do
@@ -26,31 +22,42 @@ defmodule DocumentComplianceEngine.AgentFakes do
   end
 
   def contract(overrides \\ %{}) do
-    struct(
-      %ContractExtraction{
-        company_name: "Acme Corp",
-        payment_terms: "Net 30",
-        liability_clauses: "Standard."
-      },
+    Map.merge(
+      %{company_name: "Acme Corp", payment_terms: "Net 30", liability_clauses: "Standard."},
       overrides
     )
   end
 
   def w9(overrides \\ %{}) do
-    struct(%W9Extraction{company_name: "Acme Corp", tax_id: "12-3456789"}, overrides)
+    Map.merge(%{company_name: "Acme Corp", tax_id: "12-3456789"}, overrides)
   end
 
   @doc "Entity match by exact string comparison — deterministic, no LLM."
-  def entity_match(contract_name, w9_name) do
-    match = String.downcase(String.trim(contract_name)) == String.downcase(String.trim(w9_name))
+  def entity_match(name_a, name_b) do
+    match = String.downcase(String.trim(name_a)) == String.downcase(String.trim(name_b))
 
     {:ok, %EntityMatchResult{match: match, explanation: "fake exact-string comparison"}}
   end
 
+  @doc "Fake extraction, keyed by document role. `contract`/`w9` return the
+  fixed fake data above; any other role (e.g. `invoice`) returns each
+  configured field name from its schema stringified as its own value."
+  def extract(role, response_model, _text) do
+    case role do
+      "contract" ->
+        {:ok, contract()}
+
+      "w9" ->
+        {:ok, w9()}
+
+      _ ->
+        {:ok, Map.new(response_model, fn {field, _type} -> {field, "fake-#{role}-#{field}"} end)}
+    end
+  end
+
   def defaults do
     [
-      extract_contract: fn _text -> {:ok, contract()} end,
-      extract_w9: fn _text -> {:ok, w9()} end,
+      extract: &extract/3,
       entity_match: &entity_match/2,
       validate_tax_id: fn _tax_id -> {:ok, %{valid: true}} end,
       screen_vendor: fn _name -> {:ok, %{flagged: false, reason: nil}} end,

@@ -2,11 +2,7 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.TriggerAgentRunTest do
   # async: false — stubs the agent pipeline via shared Application env.
   use DocumentComplianceEngine.DataCase, async: false
 
-  alias DocumentComplianceEngine.Agent.Schemas.{
-    ContractExtraction,
-    EntityMatchResult,
-    W9Extraction
-  }
+  alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
 
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.DocumentJobs
@@ -24,18 +20,15 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.TriggerAgentRunTest do
     on_exit(fn -> File.rm_rf!(dir) end)
 
     stub_agent(
-      agent_extract_contract: fn _text ->
-        {:ok,
-         %ContractExtraction{
-           company_name: "Acme Corp",
-           payment_terms: "Net 30",
-           liability_clauses: "Standard."
-         }}
+      agent_extract: fn
+        "contract", _schema, _text ->
+          {:ok,
+           %{company_name: "Acme Corp", payment_terms: "Net 30", liability_clauses: "Standard."}}
+
+        "w9", _schema, _text ->
+          {:ok, %{company_name: "Acme Corp", tax_id: "12-3456789"}}
       end,
-      agent_extract_w9: fn _text ->
-        {:ok, %W9Extraction{company_name: "Acme Corp", tax_id: "12-3456789"}}
-      end,
-      agent_entity_match: fn _contract_name, _w9_name ->
+      agent_entity_match: fn _name_a, _name_b ->
         {:ok, %EntityMatchResult{match: true, explanation: "same entity"}}
       end,
       agent_validate_tax_id: fn _tax_id -> {:ok, %{valid: true}} end,
@@ -59,7 +52,11 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.TriggerAgentRunTest do
 
   defp insert_document_job(key, document_paths) do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: key, document_paths: document_paths})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: key,
+        document_paths: document_paths,
+        document_type_slug: "vendor_contract_w9"
+      })
 
     document_job
   end

@@ -6,17 +6,12 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
   real needs OPENAI_API_KEY (+ ANTHROPIC_API_KEY for the judge tier).
   """
 
-  use ExUnit.Case, async: false
+  use DocumentComplianceEngine.DataCase, async: false
 
   import DocumentComplianceEngine.AgentFakes
 
   alias DocumentComplianceEngine.Agent.Evals.Run
-
-  alias DocumentComplianceEngine.Agent.Schemas.{
-    ContractExtraction,
-    EntityMatchResult,
-    W9Extraction
-  }
+  alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
 
   @suffixes ~w(inc llc corp corporation co ltd group)
   @synonyms %{"tech" => "technology"}
@@ -41,25 +36,22 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
     [_, terms] = Regex.run(~r/Payment Terms: (.+)/, text)
     [_, liability] = Regex.run(~r/Liability: (.+)/, text)
 
-    {:ok,
-     %ContractExtraction{
-       company_name: name,
-       payment_terms: terms,
-       liability_clauses: liability
-     }}
+    {:ok, %{company_name: name, payment_terms: terms, liability_clauses: liability}}
   end
 
   defp parse_w9(text) do
     [_, name] = Regex.run(~r/1\. Name of entity: (.*)/, text)
     [_, tax_id] = Regex.run(~r/2\. Taxpayer Identification Number \(EIN\): (.*)/, text)
 
-    {:ok, %W9Extraction{company_name: name, tax_id: tax_id}}
+    {:ok, %{company_name: name, tax_id: tax_id}}
   end
 
   setup do
     stub_defaults(
-      extract_contract: &parse_contract/1,
-      extract_w9: &parse_w9/1,
+      extract: fn
+        "contract", _schema, text -> parse_contract(text)
+        "w9", _schema, text -> parse_w9(text)
+      end,
       entity_match: fn contract_name, w9_name ->
         match = normalize(contract_name) == normalize(w9_name)
 
@@ -113,7 +105,12 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
   end
 
   test "a raising extractor is recorded as graceful degradation, not a crash" do
-    stub_defaults(extract_contract: fn _text -> {:error, "simulated extraction failure"} end)
+    stub_defaults(
+      extract: fn
+        "contract", _schema, _text -> {:error, "simulated extraction failure"}
+        "w9", _schema, text -> parse_w9(text)
+      end
+    )
 
     [result] = Run.run_all([hd(DocumentComplianceEngine.Agent.Evals.Fixtures.all())])
 

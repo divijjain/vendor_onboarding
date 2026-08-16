@@ -22,6 +22,10 @@ defmodule DocumentComplianceEngine.AgentRuns.Schema.AgentRun do
     field :payment_terms, :string
     field :liability_clauses, :string
     field :explanation, :string
+    # Non-sensitive extracted fields for document types with no dedicated
+    # columns above (e.g. `invoice`), keyed by role: %{"invoice" => %{...}}.
+    # Never a home for PII — Tax ID stays on its own encrypted column only.
+    field :extracted_fields, :map, default: %{}
 
     timestamps(type: :utc_datetime)
   end
@@ -37,6 +41,7 @@ defmodule DocumentComplianceEngine.AgentRuns.Schema.AgentRun do
           payment_terms: String.t() | nil,
           liability_clauses: String.t() | nil,
           explanation: String.t() | nil,
+          extracted_fields: %{optional(String.t()) => map()},
           inserted_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil
         }
@@ -59,7 +64,8 @@ defmodule DocumentComplianceEngine.AgentRuns.Schema.AgentRun do
       :tax_id,
       :payment_terms,
       :liability_clauses,
-      :explanation
+      :explanation,
+      :extracted_fields
     ])
     |> validate_required([:status])
   end

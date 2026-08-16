@@ -8,7 +8,11 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
 
   defp needs_review_document_job(key) do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: key, document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: key,
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     {:ok, run} =
       AgentRuns.Repository.insert(%{document_job_id: document_job.id, status: :processing})
@@ -41,7 +45,11 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
 
   test "rejects resuming an document_job that isn't :needs_review" do
     {:ok, received} =
-      DocumentJobs.Repository.insert(%{idempotency_key: "resume-2", document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: "resume-2",
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     assert {:error, :not_awaiting_review} = AgentRuns.resume_review(received.id, :approved)
     refute_enqueued(worker: ResumeAgentRunWorker)

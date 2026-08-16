@@ -6,7 +6,11 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.ListWithLatestRunTest do
 
   defp insert_document_job(key) do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: key, document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: key,
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     document_job
   end

@@ -18,6 +18,11 @@ defmodule DocumentComplianceEngineWeb.WebhookController do
         |> put_status(:unprocessable_entity)
         |> json(%{error: "invalid_payload"})
 
+      {:error, :unknown_document_type} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: "unknown_document_type"})
+
       {:error, %Ecto.Changeset{} = changeset} ->
         conn
         |> put_status(:unprocessable_entity)

@@ -363,6 +363,87 @@ chosen explicitly.
   behavior), both databases dropped and recreated from the corrected
   migrations, `.github/workflows/ci.yml` paths updated to match.
 
+## 2026-08-16 — generalized the agent pipeline to actually read `DocumentTypes`, proven with a second document type (`invoice`)
+
+The `DocumentJobs`/`DocumentTypes` split (2026-08-15) generalized the *data
+model* but deliberately left the agent brain alone — `OnboardingReactor`,
+`Extraction`, and `Checks` stayed hardcoded to the one contract+W-9 bundle,
+with `extraction_schema`/`validation_rules` sitting in the DB unread. This
+entry closes that gap. Scoped deliberately to **two real document types**,
+not an abstract N-type framework — full arbitrary genericity would be
+speculative work this project doesn't need; two concrete, structurally
+different cases (2 documents vs. 1, three validation rules vs. one, with vs.
+without entity-match) is what actually proves the abstraction, the same
+"don't design for hypothetical future requirements" discipline this file
+already applies elsewhere.
+
+- **Config shape formalized**: `extraction_schema` is `%{role => %{field =>
+  "string"}}` (only `"string"` supported — both real types only need it).
+  `validation_rules` becomes typed rule maps — `entity_match` (compares two
+  named fields) or `mcp_tool` (calls `validate_tax_id`/`screen_vendor`
+  against one named field) — replacing the old seed's bare `{"tool": ...}`
+  entries, which never actually covered the entity-match check at all and
+  were never read by anything. A migration reshapes the existing
+  `vendor_contract_w9` row's `validation_rules` to the typed format and
+  seeds `invoice` (one document, fields `vendor_name`/`invoice_number`/
+  `amount`/`due_date`, a single `screen_vendor` rule — no entity-match, no
+  tax ID check, reusing both existing MCP tools rather than building a
+  third).
+- **`Extraction.extract_all/2` replaces the two hardcoded `extract_contract`/
+  `extract_w9` functions.** Verified real, not assumed: Instructor genuinely
+  supports schemaless Ecto response models (`response_model: %{field:
+  :type}`, a plain map — no compiled `Ecto.Schema` module required), which
+  is what makes a runtime, DB-configured extraction schema possible at all.
+  Roles are extracted concurrently via `Task.async_stream`, preserving the
+  wall-clock behavior of what used to be two independent Reactor steps —
+  collapsing to one step and handling concurrency internally was the
+  deliberate call over building dynamic per-role Reactor steps via
+  `Reactor.Builder`, which would add real complexity to the already-fragile
+  halt/resume core for no functional upside on a pipeline this shape.
+- **`Checks.validate_all/2` replaces the fixed 3-check `validate/1`** with a
+  small interpreter over the two rule types above. The two MCP tools stay a
+  fixed, known pair — only which document/field feeds them varies by
+  document type — so their human-readable failure messages ("Tax ID failed
+  validation...", "Sanctions screening hit: ...") stay hardcoded per tool
+  name rather than generated generically. `ValidationResult` changed shape
+  accordingly: `%{checks: [%{rule:, passed:, detail:}]}`,
+  `approved?/1` = `Enum.all?`.
+- **`OnboardingReactor` → `DocumentReactor`**, the rename `CLAUDE.md` itself
+  flagged as appropriate "at the point the reactor actually becomes
+  document-type-generic... in the same change as that work" — closing the
+  loop from the earlier decision to leave it alone during the `DocumentJobs`
+  rename. New inputs: `document_type_slug`, `documents` (role => text),
+  `extraction_schema`, `validation_rules`, `human_decision`. The
+  `:gate`/`:finalize` halt-caching split is untouched — still load-bearing,
+  still the same failure mode if collapsed. `DocumentTypes` lookup happens
+  in `Agent.Run`, *before* `Reactor.run/2` — a static, idempotent config
+  read has no pause/retry need, and resolving it outside Reactor keeps the
+  checkpoint's stored `inputs` self-contained for resume, exactly like
+  every other input already was.
+- **Ingestion webhook payload changed shape**, deliberately, since no real
+  external caller exists yet: `{"contract": ..., "w9": ...}` (base64) becomes
+  `{"document_type_slug": ..., "documents": {role: base64, ...}}`.
+  `IngestWebhook` now resolves the `DocumentType`, validates the `documents`
+  map's keys exactly match its `extraction_schema` roles, and stores each
+  generically instead of two hardcoded keys.
+- **PII boundary decision**: `agent_runs` gained a generic `extracted_fields
+  :map` column (plain, unencrypted) for document types with no dedicated
+  columns of their own — today, `invoice`. Deliberately **not** a home for
+  arbitrary future PII: `contract`/`w9` roles still populate the existing
+  fixed, dedicated columns exactly as before (`tax_id` stays on its own
+  `Cloak`-encrypted column, populated only from the `w9` role, never swept
+  into the generic map), and every field `invoice` actually extracts is
+  genuinely non-sensitive. This is a deliberate, narrow boundary — generic
+  storage for a known-safe field set — not a general PII-aware framework,
+  which stays out of scope until a document type that actually needs one
+  exists.
+- **Verified**: `mix precommit` clean (110 tests, up from 100 — the new
+  `invoice` end-to-end scenarios, `Extraction`/`Checks` unit tests, plus
+  fixes to every pre-existing test that assumed the old fixed contract+W9
+  shape). The documented regression scenarios were re-run, not assumed
+  still true: the halted-reactor-survives-`term_to_binary`/`binary_to_term`
+  round trip, and resume not re-running a completed extraction step.
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow

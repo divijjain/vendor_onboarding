@@ -5,7 +5,8 @@ defmodule DocumentComplianceEngine.DocumentJobs.RepositoryTest do
 
   @valid_attrs %{
     idempotency_key: "abc123",
-    document_paths: %{"contract" => "priv/uploads/contract.pdf", "w9" => "priv/uploads/w9.pdf"}
+    document_paths: %{"contract" => "priv/uploads/contract.pdf", "w9" => "priv/uploads/w9.pdf"},
+    document_type_slug: "vendor_contract_w9"
   }
 
   describe "insert/1" do
@@ -72,7 +73,8 @@ defmodule DocumentComplianceEngine.DocumentJobs.RepositoryTest do
       {:ok, approved} =
         Repository.insert(%{
           idempotency_key: "other-key",
-          document_paths: @valid_attrs.document_paths
+          document_paths: @valid_attrs.document_paths,
+          document_type_slug: "vendor_contract_w9"
         })
 
       {:ok, approved} = Repository.update_status(approved.id, :approved)

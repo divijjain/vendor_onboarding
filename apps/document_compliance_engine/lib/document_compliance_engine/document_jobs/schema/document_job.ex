@@ -11,17 +11,11 @@ defmodule DocumentComplianceEngine.DocumentJobs.Schema.DocumentJob do
 
   @statuses [:received, :processing, :needs_review, :approved, :rejected, :failed]
 
-  # The only document type today's fixed pipeline actually implements —
-  # matches the row seeded by the generalize_onboardings_to_document_jobs
-  # migration. `IngestWebhook` defaults new jobs onto this slug until
-  # ingestion itself is extended to accept a document type per request.
-  @default_document_type_slug "vendor_contract_w9"
-
   schema "document_jobs" do
     field :status, Ecto.Enum, values: @statuses, default: :received
     field :idempotency_key, :string
     field :document_paths, :map, default: %{}
-    field :document_type_slug, :string, default: @default_document_type_slug
+    field :document_type_slug, :string
 
     timestamps(type: :utc_datetime)
   end
@@ -35,9 +29,6 @@ defmodule DocumentComplianceEngine.DocumentJobs.Schema.DocumentJob do
           inserted_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil
         }
-
-  @spec default_document_type_slug() :: String.t()
-  def default_document_type_slug, do: @default_document_type_slug
 
   @doc "Changeset for creating a row from an ingested webhook payload."
   def ingest_changeset(document_job, attrs) do

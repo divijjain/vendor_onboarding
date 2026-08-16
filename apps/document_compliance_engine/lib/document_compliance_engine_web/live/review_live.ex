@@ -68,17 +68,26 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
         </:subtitle>
       </.header>
 
-      <div class="grid grid-cols-2 gap-4">
+      <div
+        :if={@agent_run && (@agent_run.company_name || @agent_run.w9_company_name)}
+        class="grid grid-cols-2 gap-4"
+      >
         <.list>
-          <:item title="Contract — company name">{@agent_run && @agent_run.company_name}</:item>
-          <:item title="Contract — payment terms">{@agent_run && @agent_run.payment_terms}</:item>
+          <:item title="Contract — company name">{@agent_run.company_name}</:item>
+          <:item title="Contract — payment terms">{@agent_run.payment_terms}</:item>
           <:item title="Contract — liability clauses">
-            {@agent_run && @agent_run.liability_clauses}
+            {@agent_run.liability_clauses}
           </:item>
         </.list>
         <.list>
-          <:item title="W-9 — company name">{@agent_run && @agent_run.w9_company_name}</:item>
-          <:item title="W-9 — Tax ID">{@agent_run && @agent_run.tax_id}</:item>
+          <:item title="W-9 — company name">{@agent_run.w9_company_name}</:item>
+          <:item title="W-9 — Tax ID">{@agent_run.tax_id}</:item>
+        </.list>
+      </div>
+
+      <div :if={@agent_run && @agent_run.extracted_fields != %{}}>
+        <.list :for={{role, fields} <- @agent_run.extracted_fields}>
+          <:item :for={{field, value} <- fields} title={"#{role} — #{field}"}>{value}</:item>
         </.list>
       </div>
 

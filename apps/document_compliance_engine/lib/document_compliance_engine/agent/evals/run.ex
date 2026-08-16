@@ -2,7 +2,10 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   @moduledoc """
   Eval harness — drives the reactor directly, bypassing Phoenix, so
   agent-quality eval is isolated from integration latency/correctness
-  (CONTEXT.md's evaluation-design decision).
+  (CONTEXT.md's evaluation-design decision). Still reads the real
+  `vendor_contract_w9` `DocumentType` row (extraction schema + validation
+  rules) via `DocumentTypes`, rather than duplicating that config here, so
+  the harness can't silently drift from what production actually runs.
 
   Two tiers:
     - Deterministic (always runs, no judge key needed): Tax ID
@@ -18,7 +21,10 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   """
 
   alias DocumentComplianceEngine.Agent.Evals.{Deterministic, Fixtures, Judge}
-  alias DocumentComplianceEngine.Agent.OnboardingReactor
+  alias DocumentComplianceEngine.Agent.{Checks, DocumentReactor}
+  alias DocumentComplianceEngine.DocumentTypes
+
+  @document_type_slug "vendor_contract_w9"
 
   defmodule Result do
     @moduledoc false
@@ -37,23 +43,34 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
 
   @spec run_all([Fixtures.Fixture.t()], keyword()) :: [%Result{}]
   def run_all(fixtures \\ Fixtures.all(), opts \\ []) do
-    reactor = Keyword.get(opts, :reactor, OnboardingReactor)
+    reactor = Keyword.get(opts, :reactor, DocumentReactor)
+    document_type = Keyword.get_lazy(opts, :document_type, &fetch_document_type!/0)
 
     fixtures
     # Bounded, not unbounded — 20 fixtures fired at once against a real
     # account risks tripping rate limits for no benefit.
-    |> Task.async_stream(&run_fixture(&1, reactor),
+    |> Task.async_stream(&run_fixture(&1, reactor, document_type),
       max_concurrency: Keyword.get(opts, :concurrency, @concurrency),
       timeout: :infinity
     )
     |> Enum.map(fn {:ok, result} -> result end)
   end
 
-  @spec run_fixture(Fixtures.Fixture.t(), module()) :: %Result{}
-  def run_fixture(fixture, reactor \\ OnboardingReactor) do
+  defp fetch_document_type! do
+    DocumentTypes.get_document_type_by_slug(@document_type_slug) ||
+      raise "document type #{@document_type_slug} is not seeded"
+  end
+
+  @spec run_fixture(Fixtures.Fixture.t(), module(), DocumentTypes.Schema.DocumentType.t() | nil) ::
+          %Result{}
+  def run_fixture(fixture, reactor \\ DocumentReactor, document_type \\ nil) do
+    document_type = document_type || fetch_document_type!()
+
     inputs = %{
-      contract_text: fixture.contract_text,
-      w9_text: fixture.w9_text,
+      document_type_slug: document_type.slug,
+      documents: %{"contract" => fixture.contract_text, "w9" => fixture.w9_text},
+      extraction_schema: document_type.extraction_schema,
+      validation_rules: document_type.validation_rules,
       human_decision: nil
     }
 
@@ -63,20 +80,22 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   end
 
   defp to_result({:ok, final}, fixture) do
+    tax_id = get_in(final.extracted, ["w9", :tax_id])
+
     %Result{
       fixture: fixture,
       decision: "approved",
       # Approval requires the entity check to have passed, so it's known
       # true here without re-reading the (completed) validation step.
       entity_match: true,
-      tax_id_verbatim_ok: Deterministic.tax_id_verbatim?(final.w9.tax_id, fixture.w9_text)
+      tax_id_verbatim_ok: Deterministic.tax_id_verbatim?(tax_id, fixture.w9_text)
     }
   end
 
   defp to_result({:halted, reactor}, fixture) do
     results = reactor.intermediate_results || %{}
     validation = results[:validate]
-    w9 = results[:extract_w9]
+    tax_id = get_in(results[:extract] || %{}, ["w9", :tax_id])
 
     explanation =
       case results[:gate] do
@@ -84,13 +103,16 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
         _ -> nil
       end
 
+    entity_match_check =
+      validation && Enum.find(validation.checks, &(&1.rule["type"] == "entity_match"))
+
     %Result{
       fixture: fixture,
       decision: "needs_review",
-      entity_match: validation && validation.entity_match.match,
-      tax_id_verbatim_ok: w9 && Deterministic.tax_id_verbatim?(w9.tax_id, fixture.w9_text),
+      entity_match: entity_match_check && entity_match_check.passed,
+      tax_id_verbatim_ok: tax_id && Deterministic.tax_id_verbatim?(tax_id, fixture.w9_text),
       explanation: explanation,
-      findings: validation && DocumentComplianceEngine.Agent.Checks.describe_findings(validation)
+      findings: validation && Checks.describe_findings(validation)
     }
   end
 

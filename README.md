@@ -1,6 +1,6 @@
 # Agentic Document Compliance Engine
 
-A back-office automation system that ingests a document bundle, extracts structured data with an LLM, cross-validates it against external systems via MCP tools, and routes discrepancies to a human reviewer — with a durable, resumable pause instead of a dropped thread. Started as a vendor-onboarding-specific pipeline (a contract + a W-9); the ingestion data model has since been generalized to configurable document types (`DocumentTypes`, see Status below), though the one type the agent pipeline actually implements today is still that original contract-plus-W9 bundle.
+A back-office automation system that ingests a document bundle, extracts structured data with an LLM, cross-validates it against external systems via MCP tools, and routes discrepancies to a human reviewer — with a durable, resumable pause instead of a dropped thread. Started as a vendor-onboarding-specific pipeline (a contract + a W-9); both the ingestion data model *and* the agent pipeline itself are now genuinely document-type-generic (`DocumentTypes`, see Status below), proven with a second, structurally different document type (a single-document invoice) rather than just the original contract-plus-W9 bundle.
 
 ## The business problem
 
@@ -27,17 +27,19 @@ flowchart TD
     E -.-> F
 ```
 
-**Agent workflow detail** — what runs inside `DocumentComplianceEngine.Agent.Run` on each trigger:
+**Agent workflow detail** — what runs inside `DocumentComplianceEngine.Agent.DocumentReactor` on each trigger. Both steps are document-type-generic: extraction fields and validation rules come from the triggering job's `DocumentTypes` row, not a hardcoded shape:
 
 ```mermaid
 flowchart TD
-    A1[Agent 1: extraction<br/>documents to Ecto schema] --> A2[Agent 2: validation<br/>calls MCP tools]
+    A1[Extract<br/>one call per document role,<br/>schema from DocumentTypes] --> A2[Validate<br/>interprets validation_rules]
     A2 --> T1[MCP: tax API<br/>mock, validates Tax ID]
     A2 --> T2[MCP: sanctions DB<br/>mock, screens vendor]
-    T1 --> M[Match check<br/>compare entities]
-    T2 --> M
-    M -->|pass| APR[Auto-approve<br/>all checks pass]
-    M -->|discrepancy| INT[Halt + pause<br/>checkpoint to Postgres]
+    A2 --> EM[Entity-match LLM<br/>compares two named fields]
+    T1 --> G[Gate]
+    T2 --> G
+    EM --> G
+    G -->|every rule passes| APR[Auto-approve]
+    G -->|any rule fails| INT[Halt + pause<br/>checkpoint to Postgres]
 ```
 
 **Deployment topology** — three OTP applications, not four and not one. The
@@ -48,9 +50,8 @@ three live as equal siblings under `apps/` (a Mix umbrella for directory
 clarity only — each keeps its own deps/build/config, see Local development):
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph P["apps/document_compliance_engine<br/>(Phoenix release, one OTP app)"]
-        direction TB
         WH[Webhook] --> OB[Oban job]
         OB --> AR["Agent.Run<br/>(Reactor pipeline,<br/>in-process)"]
         AR <--> PG[(Postgres<br/>checkpoint + status)]
@@ -101,7 +102,7 @@ Results are written up as a short metrics table in this README once the harness 
 - **Ecto / PostgreSQL** — the `document_jobs`/`agent_runs`/`document_types` tables, plus the agent pipeline's checkpoint table (same Repo, separate Postgres schema via a migration prefix)
 - **Bandit** — the Phoenix endpoint, and the transport for both MCP tool servers
 - **Reactor** — the agent pipeline as dependency-resolved steps, with `{:halt, …}` + a persisted checkpoint for the durable HITL pause
-- **Instructor** — structured LLM output into Ecto embedded schemas (Company Name, Tax ID; Payment Terms and Liability Clauses free text, LLM-judge validated)
+- **Instructor** — structured LLM output via schemaless Ecto response models (`%{field: :type}`, no compiled schema module) built at runtime from each document type's `extraction_schema`, so extraction fields vary by document type instead of one hardcoded shape
 - **MCP** (`hermes_mcp` servers, JSON-RPC-over-HTTP client on Req) — two mock tool servers (Tax API, Sanctions DB), each a real separate OTP application, consumed by the validation agent
 - **Eval harness** (`mix eval.run`) — two-tier evaluation (deterministic + LLM-as-judge; agents on GPT-4o-mini, judge on Claude Sonnet via the Anthropic Messages API)
 - **GitHub Actions** (`.github/workflows/ci.yml`) — `mix precommit` on every push/PR for the Phoenix app plus each of the two MCP server apps (`mix dialyzer` deliberately left out for now — see Status)
@@ -153,7 +154,9 @@ Three findings worth recording, each verified rather than assumed:
 
 **2026-08-15 renamed the app itself, `VendorOnboarding` → `DocumentComplianceEngine`:** the data-model generalization above (`Onboardings` → `DocumentJobs` + `DocumentTypes`) only renamed the ingestion context — the OTP app (`:vendor_onboarding`), the Elixir module namespace (`VendorOnboarding.*`/`VendorOnboardingWeb.*`), the `apps/vendor_onboarding/` directory, and the dev/test databases were all still the original vendor-onboarding-specific name. Renamed all of it — app atom to `:document_compliance_engine`, every module to `DocumentComplianceEngine.*`/`DocumentComplianceEngineWeb.*`, the directory to `apps/document_compliance_engine/`, the databases to `document_compliance_engine_dev`/`_test`, plus the navbar text, page title, and this README's own title. The webhook route path (`/webhooks/vendor_onboarding`) and `OnboardingReactor` were deliberately left alone — see `CONTEXT.md`'s dated entry for why. One real mistake caught mid-pass: the blanket rename swept `priv/repo/migrations/*.exs` too, corrupting literal historical SQL identifier strings in already-applied migrations (e.g. turning the real Postgres index name `agent_runs_vendor_onboarding_id_index` into a nonexistent `agent_runs_document_compliance_engine_id_index`) — migrations describe what was actually run and should never be retroactively edited, the same discipline already applied during the `Onboardings` → `DocumentJobs` rename. Caught before it reached a test, restored from the last commit, both databases dropped and recreated clean. `mix precommit` clean, same 100 tests.
 
-100 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite now) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently. Every LLM call (both extractions, entity-match, explanation-drafting, and the judge) is built against GPT-4o-mini / Claude Sonnet but is dependency-injected — there's no `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` configured in this dev environment yet, so all of the above is verified with injected fake LLM calls plus the two *real* MCP servers and the *real* Postgres checkpointer, not a live model call. See `CONTEXT.md` for the full build plan and architectural decisions.
+**2026-08-16 generalized the agent pipeline itself, proven with a second document type:** the prior entry deliberately scoped the `DocumentTypes` work to the data model — `OnboardingReactor`/`Extraction`/`Checks` stayed hardcoded to the one contract+W-9 bundle. This closes that gap. `Extraction.extract_all/2` and `Checks.validate_all/2` now genuinely interpret a document type's `extraction_schema`/`validation_rules` (Instructor's schemaless-Ecto response models make a runtime-configured extraction shape possible without generating Ecto modules); `OnboardingReactor` is renamed `DocumentReactor` (the rename `CLAUDE.md` itself flagged as appropriate once the reactor stopped being document-type-specific), with generic `documents`/`extraction_schema`/`validation_rules` inputs replacing the fixed `contract_text`/`w9_text` — the `:gate`/`:finalize` halt-caching split is untouched. Proven against a second, structurally different real document type rather than just reshaped config: `invoice` (one document, no entity-match, a single sanctions-screen rule, reusing both existing MCP tools). The webhook payload shape changed accordingly (`{"document_type_slug", "documents"}` instead of hardcoded `{"contract", "w9"}`) since no real external caller exists yet. `agent_runs` gained a generic, non-encrypted `extracted_fields` column for document types with no dedicated columns of their own — deliberately never a path for PII: `tax_id` stays on its own `Cloak`-encrypted column, populated only from the `w9` role. `mix precommit` clean, 110 tests (100 prior + 10 new/updated for the second document type and the extraction/validation unit tests). See `CONTEXT.md`'s dated entry for the full design rationale, including why dynamic per-role Reactor steps were deliberately not built.
+
+110 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite now) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently. Every LLM call (both extractions, entity-match, explanation-drafting, and the judge) is built against GPT-4o-mini / Claude Sonnet but is dependency-injected — there's no `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` configured in this dev environment yet, so all of the above is verified with injected fake LLM calls plus the two *real* MCP servers and the *real* Postgres checkpointer, not a live model call. See `CONTEXT.md` for the full build plan and architectural decisions.
 
 ## Local development
 

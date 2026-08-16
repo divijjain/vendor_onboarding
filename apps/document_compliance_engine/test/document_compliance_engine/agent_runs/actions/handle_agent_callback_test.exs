@@ -6,7 +6,11 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallbackTest do
 
   defp insert_document_job_with_run(key) do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: key, document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: key,
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     {:ok, _run} =
       AgentRuns.Repository.insert(%{document_job_id: document_job.id, status: :processing})
@@ -59,7 +63,11 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallbackTest do
 
   test "returns {:error, :not_found} when no run has started for that document_job" do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: "cb-2", document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: "cb-2",
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     assert {:error, :not_found} =
              AgentRuns.handle_agent_callback(%{

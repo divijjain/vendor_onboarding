@@ -6,7 +6,11 @@ defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
 
   defp insert_document_job(key) do
     {:ok, document_job} =
-      DocumentJobs.Repository.insert(%{idempotency_key: key, document_paths: %{}})
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: key,
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
 
     document_job
   end
@@ -35,11 +39,7 @@ defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
   end
 
   test "filters the list by document type", %{conn: conn} do
-    {:ok, invoice_type} =
-      DocumentComplianceEngine.DocumentTypes.Repository.insert(%{
-        slug: "invoice",
-        name: "Invoice"
-      })
+    invoice_type = DocumentComplianceEngine.DocumentTypes.Repository.get_by_slug("invoice")
 
     default = insert_document_job("dash-filter-default")
 

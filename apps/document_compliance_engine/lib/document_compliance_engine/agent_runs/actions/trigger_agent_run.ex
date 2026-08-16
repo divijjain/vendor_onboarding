@@ -20,7 +20,13 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.TriggerAgentRun do
          {:ok, agent_run} <-
            Repository.insert(%{document_job_id: document_job.id, status: :processing}),
          {:ok, _document_job} <- DocumentJobs.update_status(document_job.id, :processing) do
-      :ok = Agent.Run.trigger(document_job.id, document_job.document_paths)
+      :ok =
+        Agent.Run.trigger(
+          document_job.id,
+          document_job.document_type_slug,
+          document_job.document_paths
+        )
+
       {:ok, agent_run}
     end
   end
