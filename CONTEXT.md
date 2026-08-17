@@ -769,6 +769,90 @@ does and doesn't support.
 real 55-fixture results, replacing the 20-fixture numbers (kept the debugging story about the
 earlier `n=4`-instead-of-`5` groundedness bug, since that's still true and still instructive).
 
+## 2026-08-17 — closed the PDF-extraction gap; live verification caught a real bug the plan didn't anticipate
+
+The long-documented gap ("Open / not yet decided", and the README's "Known limitation") finally
+closed: `Agent.Run.read_documents/2` used to read a document's bytes with `File.read/1` and feed
+them straight into the extraction prompt as if they were already clean text — no fixture or test
+had ever exercised a real PDF. Closed for the common case (a text-layer PDF); a scanned/image-only
+PDF still has no text layer for `pdftotext` to find, so OCR on top of this remains a separate,
+still-open gap, not something this closes.
+
+**`DocumentComplianceEngine.PdfText`** (`lib/document_compliance_engine/pdf_text.ex`): detects a
+PDF by its `%PDF-` magic-number header (not the file extension — `IngestWebhook` writes every
+stored file with a `.pdf` extension regardless of actual content), and runs it through
+`pdftotext` (poppler-utils, a new system dependency — `brew install poppler`, not bundled).
+Anything else (every eval fixture, a `.txt` upload) is returned as-is. `extract/1` takes raw
+*bytes*, not a path — `System.cmd/3` has no stdin-piping option, so the implementation writes to
+a temp file itself rather than pushing that detail onto callers. The real subprocess call is
+overridable via the same `Application.get_env(:document_compliance_engine, :agent_*)` seam
+(`:agent_pdf_to_text_fun`) as every other external call, added to `AgentFakes.defaults/0` so
+`mix test` never needs poppler installed — consistent with the rest of the DI convention, even
+though this one shells out to a local binary rather than calling a network API.
+
+**Not namespaced under `Agent.*`, on purpose — found live, not planned.** The first design put
+this under `Agent.PdfText` since the pipeline was the obvious caller. Verifying it against a
+*real* PDF (not a hand-typed fixture) — generating one with macOS's `cupsfilter`, POSTing it
+through the real signed webhook to a running `mix phx.server`, both real API keys live — worked
+for the pipeline itself (extraction and validation came back correct), but `ReviewLive`'s
+"original documents" card (added the day before, see that entry above) rendered raw PDF binary
+straight into the page instead of readable text. `DocumentJobs.Actions.ReadDocuments` reads
+document bytes independently of the pipeline (via `Storage`, for display) and had never been
+routed through any PDF-awareness — a real bug that only a real PDF through the real UI surfaced,
+exactly the kind of thing a hand-typed text fixture can't catch. Fix: moved the module to
+`DocumentComplianceEngine.PdfText` (dropping the `Agent.` namespace) since it's a genuine
+document-processing utility two different contexts now need, not an agent-specific concept, and
+wired `ReadDocuments.call/1` through it the same way `Agent.Run` is. `DocumentJobs` gaining a
+dependency on `PdfText` is a new context-boundary crossing worth naming explicitly — `PdfText`
+itself calls no LLM and belongs to neither context more than the other, so it living outside
+`Agent.*` is the more honest shape now that two contexts depend on it, not a violation of the
+`Agent`/`AgentRuns` dependency direction rule (that rule is about the `Agent` ↔ `AgentRuns`
+relationship specifically, not a blanket ban on `DocumentJobs` using a shared utility).
+
+**Real end-to-end verification, twice** — once catching the bug, once confirming the fix: two
+real single-page PDFs generated via `cupsfilter` (contract + W-9 text, matching the fixture
+shape), POSTed through the actual signed webhook endpoint against a running `mix phx.server`
+(real `OPENAI_API_KEY`, real mock MCP servers). First run: pipeline correctly reached `Approved`
+with the right extracted fields (`Acme Corp`, `12-3456789`, `Net 30`), but the review page's
+document cards showed raw binary. Second run, after the `ReadDocuments` fix: same correct
+`Approved` result, and the review page correctly rendered `VENDOR SERVICES AGREEMENT` / `FORM
+W-9` — the actual `pdftotext` output, not the raw bytes.
+
+**Verified**: `mix precommit` clean, 141 tests (137 prior + 3 `PdfTextTest` covering the
+detection/seam/error-propagation logic, + 1 `Agent.RunTest` case proving a `%PDF-`-prefixed
+document is routed through `pdf_to_text` before reaching extraction — replacing 1 that moved out
+of the now-deleted `agent/pdf_text_test.exs`). `mix dialyzer`: still 7 errors, all pre-existing,
+none new. README's Evaluation/Local-development/Current-state sections updated: `poppler`
+documented as a new (test-suite-optional) local dependency, both the webhook curl examples and
+the dashboard's upload form now accept `.pdf`, and the "Known limitation" language was rewritten
+from "doesn't exist" to "text-layer PDFs only, no OCR yet" — an honest narrowing of the gap, not
+a claim that it's fully closed.
+
+## 2026-08-17 — dashboard "Company" column was blank for every invoice job — not an extraction bug
+
+Reported as "it didn't pick up the vendor name and still approved," for `document_job #9` (one
+of the 10 sample invoice PDFs generated for manual testing). Checked the actual data before
+assuming the report was right: extraction had worked correctly the whole time —
+`agent_run.extracted_fields` had `"invoice" => %{"vendor_name" => "Northwind Traders Ltd.", ...}`,
+the sanctions screen ran against that real name and correctly passed. The dashboard *table's*
+"Company" column was the actual bug: `ListWithLatestRun.build_row/2` read only
+`agent_run.company_name`, the dedicated column that only ever gets populated for
+`vendor_contract_w9` (`Agent.Run.@known_roles`) — for `invoice`, that column is always `nil`
+since invoice fields live entirely in `extracted_fields`, so the column showed blank
+regardless of whether extraction succeeded. `ReviewLive`'s detail page never had this problem
+(it already renders `extracted_fields` generically); only the summary table did.
+
+Fixed with a `display_name/1` fallback: dedicated `company_name` first, then
+`extracted_fields["invoice"]["vendor_name"]`. Deliberately not a generic "guess which field
+looks like a company name" heuristic — same "known types get dedicated handling, nothing
+generic" tradeoff `Agent.Run.@known_roles` and the dashboard's `@upload_roles` already make;
+extending it for a third document type later means adding one more clause here, matching the
+existing pattern rather than inventing a new one.
+
+**Verified live**, not just via test: the real running server's `/document_jobs` table was
+checked before the fix (row `#9`'s Company cell genuinely empty) and after (renders "Northwind
+Traders Ltd."). `mix precommit` clean, 142 tests (1 new, covering the invoice fallback path).
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow

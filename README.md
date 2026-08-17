@@ -135,14 +135,15 @@ The pipeline is document-type-generic, proven against two real, structurally dif
 
 **Current state:**
 
-- 128 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently.
+- 142 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently.
+- Real PDF text extraction: `PdfText` detects a PDF by its magic-number header and runs it through `pdftotext` before extraction — text-layer PDFs only, no OCR yet. Both the webhook and the dashboard's upload form accept `.pdf` now, not just `.txt`.
 - Entity-match and Tax ID extraction are staged, not always-LLM: a calibrated string-similarity pre-filter resolves clear entity matches/mismatches without a call, and Tax ID resolves via regex when the EIN pattern is unambiguous in the source text — both fall through to the LLM only when genuinely ambiguous, never guess. See "Why this shape" above and `CONTEXT.md` for the research and calibration behind the thresholds.
 - `mix dialyzer` clean except 4 known, pre-existing errors — 2 `Mix.Task` callback-info warnings in `lib/mix/tasks/eval.run.ex`, 2 `guard_fail`s on a defensive `|| %{}` fallback that Reactor's own types prove unreachable — deliberately not wired into CI yet (see `CLAUDE.md`'s Pre-commit section).
 - Every LLM call (both extractions, entity-match, explanation-drafting, and the eval judge) is dependency-injected and overridable via `Application.get_env(:document_compliance_engine, :agent_*)`, so the ExUnit test suite (this project's correctness guarantee, run on every `mix precommit`) always uses injected fakes plus the two *real* MCP servers and the *real* Postgres checkpointer — never a live model call, by design, regardless of whether API keys happen to be configured locally. The eval harness is separate: `mix eval.run` has now been run for real, with both API keys and both MCP servers live — see the Evaluation section above for the results, and for the real bug that surfaced along the way.
 - The durable-pause guarantee (a paused review surviving a killed-and-restarted process, mid-review) and the resume-doesn't-re-extract guarantee have both been re-verified against the current, generalized reactor — not just inherited from the pre-generalization implementation.
 - Both document types were also verified against a real running server (not just the test suite): POSTed over real HTTP with a valid HMAC signature, correctly land on `document_jobs` with the right `document_type_slug`, and — with no `OPENAI_API_KEY` present — fail gracefully at extraction rather than hanging in `:processing`, for both document shapes.
 
-**Known limitation:** there is no real PDF/OCR text-extraction step. `Agent.Run.read_documents/2` reads a stored document's bytes with `File.read/1` and passes them straight into the extraction prompt as if they're already clean, plain text — every fixture and test in this project supplies literal text strings, never a real PDF. This isn't specific to the LLM call: the regex pre-filter for `tax_id` and the entity-match similarity staging above both inherit the same assumption. Closing it is real, separate, currently-unscoped work (at minimum a PDF-to-text step; a scanned/image source would need OCR on top), not a small addition — see `CONTEXT.md`'s "Open / not yet decided" section.
+**PDF text extraction:** `DocumentComplianceEngine.PdfText` detects a PDF by its `%PDF-` magic-number header and runs it through `pdftotext` (poppler-utils — `brew install poppler`, a real system dependency, not bundled) before anything reaches the extraction prompt; anything else (every eval fixture, a `.txt` upload) is treated as already-plain-text and passed through unchanged. **Known limitation:** this only handles PDFs with a real text layer — a scanned/image-only PDF has no text layer for `pdftotext` to find, and OCR on top of this remains real, separate, currently-unscoped work. See `CONTEXT.md`'s dated entry.
 
 Full dated build history and every architectural decision, with rationale, lives in `CONTEXT.md`.
 
@@ -156,6 +157,7 @@ specific app first; never run `mix` commands from the repo root** — see
 doesn't do what you'd expect here.
 
 * `cd apps/document_compliance_engine && mix setup` to install dependencies and run migrations (includes the agent pipeline's checkpoint table, in its own `agent_checkpoints` schema, and seeds both document types: `vendor_contract_w9`, `invoice`)
+* `brew install poppler` (or your platform's equivalent) for `pdftotext` — only needed to actually process a real PDF (uploading one, or a webhook payload containing one); not required for `mix test`, which fakes the PDF-extraction step like every other external call
 * Set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (LLM judge) to run the real LLM calls (neither is required to run the test suite — it uses injected fakes). Either export them in your shell, or `cp .env.example .env` and fill in real values — `.env` is gitignored and auto-loaded by `config/config.exs` (a real exported shell var always takes priority over it)
 * Start Phoenix with `mix phx.server` or inside IEx with `iex -S mix phx.server` (from `apps/document_compliance_engine`)
 * Visit [`localhost:4000`](http://localhost:4000)
@@ -178,8 +180,8 @@ doesn't do what you'd expect here.
   ```
 
   Two lighter-weight alternatives to hand-signing curl requests:
-  - `mix webhook.send <fixture_id>` (e.g. `mix webhook.send clean-01`) signs and posts one of the eval harness's 20 fixtures against a running `mix phx.server`
-  - The dashboard itself (`/document_jobs`) has a "Submit a document" form — plain-text file upload, calls the same `DocumentJobs.ingest_webhook/1` the real webhook hits (just without the HMAC step, since it's a trusted in-process LiveView action, not an untrusted network caller). `.txt` only: the pipeline reads stored bytes as plain text, so a real PDF would silently produce garbage rather than being parsed.
+  - `mix webhook.send <fixture_id>` (e.g. `mix webhook.send clean-01`) signs and posts one of the eval harness's 55 fixtures against a running `mix phx.server`
+  - The dashboard itself (`/document_jobs`) has a "Submit a document" form — file upload, calls the same `DocumentJobs.ingest_webhook/1` the real webhook hits (just without the HMAC step, since it's a trusted in-process LiveView action, not an untrusted network caller). `.txt` or `.pdf` (text-layer PDFs only, via `PdfText` — see "PDF text extraction" above; no OCR yet for a scanned/image PDF).
 
 The two mock MCP tool servers are still separate OTP applications — genuinely external tools, not part of the agent pipeline — and run alongside Phoenix during local development:
 
