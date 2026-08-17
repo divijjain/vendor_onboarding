@@ -87,29 +87,29 @@ The core resume claim — "0% hallucination rate on extracted entities" — is o
 1. **Deterministic checks** (no LLM, fast, free): does the extracted Tax ID exist verbatim in the source document text? Does the model's output conform to the document type's `extraction_schema` (enforced by Instructor's schemaless-changeset validation)? These produce the hallucination-rate number.
 2. **LLM-as-judge checks** (for genuinely ambiguous judgment): does the entity mapping in the extraction hold up under formatting differences ("J. Smith" vs "John Smith")? Is the agent's drafted mismatch explanation actually grounded in the real discrepancy? The judge model (Claude Sonnet) is a different provider than the agent model (GPT-4o-mini), to avoid self-grading inflation.
 
-**Synthetic test set (20 documents), structured deliberately:**
+**Synthetic test set (55 documents), structured deliberately** — grown from an original 20 (10/5/3/2) specifically so the two thinnest buckets aren't one failure away from a meaningless swing:
 
 | Bucket | Count | Tests |
 |---|---|---|
-| Clean, should auto-approve | 10 | happy path |
-| Genuine name/entity mismatch | 5 | true-positive flagging |
-| Subtle formatting difference, not a real mismatch | 3 | false-positive rate — the detail that makes "100% accuracy" credible rather than cherry-picked |
-| Missing/malformed fields | 2 | graceful degradation |
+| Clean, should auto-approve | 20 | happy path |
+| Genuine name/entity mismatch | 15 | true-positive flagging |
+| Subtle formatting difference, not a real mismatch | 12 | false-positive rate — the detail that makes "100% accuracy" credible rather than cherry-picked |
+| Missing/malformed fields | 8 | graceful degradation |
 
-This fixture set is specific to the `vendor_contract_w9` document type (the contract-vs-W-9 name-mismatch scenario) — `invoice` has no eval fixtures yet, and its own end-to-end correctness is proven by the ExUnit test suite, not the eval harness.
+This fixture set is specific to the `vendor_contract_w9` document type (the contract-vs-W-9 name-mismatch scenario) — `invoice` has no eval fixtures yet, and its own end-to-end correctness is proven by the ExUnit test suite, not the eval harness. Even at 55 cases this isn't benchmark-scale — a couple of buckets are still small enough that a single failure is visible in the headline number — but it's past the point where the numbers were mostly noise; see CONTEXT.md's dated entry for the sizing rationale.
 
 **Results, run for real** (`mix eval.run`, both API keys configured, both mock MCP servers running):
 
 | Bucket | Decision accuracy |
 |---|---|
-| Clean | 10/10 |
-| Genuine mismatch | 5/5 |
-| Formatting (false-positive control) | 3/3 |
-| Malformed | 2/2 |
+| Clean | 20/20 |
+| Genuine mismatch | 15/15 |
+| Formatting (false-positive control) | 12/12 |
+| Malformed | 8/8 |
 
-LLM-judge tier (Claude Sonnet, scoring the GPT-4o-mini agent's own judgments — cross-provider, not self-grading): entity-match correctness averaged **1.00** (n=18, every fixture with a known expected match/mismatch), groundedness of drafted mismatch explanations averaged **1.00** (n=5, the mismatch bucket, the only fixtures that actually halt and draft an explanation).
+LLM-judge tier (Claude Sonnet, scoring the GPT-4o-mini agent's own judgments — cross-provider, not self-grading): entity-match correctness averaged **1.00** (n=47, every fixture with a known expected match/mismatch), groundedness of drafted mismatch explanations averaged **1.00** (n=14, out of 15 mismatch-bucket fixtures — one judge call hit a transient `Req.TransportError{reason: :timeout}` and was correctly recorded as a surfaced error rather than silently dropped or retried).
 
-The first real run reported groundedness as `n=4`, not `5` — `judge_scores/1` used to silently drop a failed judge call from the average rather than count it, so the gap wasn't visible until it was made to surface failures explicitly. The dropped call turned out to be a real parsing bug, not a flaky network error: Claude's extended-thinking responses put a `type: "thinking"` block ahead of the `type: "text"` block in the response, and `Judge.extract_text/1` assumed the first content block was always the answer. Fixed to search for the actual `text` block instead of assuming its position — see `CONTEXT.md`'s dated entry for the full story, including why an eval harness silently hiding its own failures is exactly the failure mode this whole project is built to catch on the agent side.
+An earlier 20-fixture run once reported groundedness as `n=4` instead of the expected `n=5` — `judge_scores/1` used to silently drop a failed judge call from the average rather than count it, so the gap wasn't visible until it was made to surface failures explicitly. That dropped call turned out to be a real parsing bug, not a flaky network error: Claude's extended-thinking responses put a `type: "thinking"` block ahead of the `type: "text"` block in the response, and `Judge.extract_text/1` assumed the first content block was always the answer. Fixed to search for the actual `text` block instead of assuming its position — see `CONTEXT.md`'s dated entry for the full story, including why an eval harness silently hiding its own failures is exactly the failure mode this whole project is built to catch on the agent side.
 
 ## Tech stack
 

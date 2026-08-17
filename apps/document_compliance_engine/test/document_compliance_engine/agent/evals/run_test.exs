@@ -13,8 +13,9 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
   alias DocumentComplianceEngine.Agent.Evals.Run
   alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
 
-  @suffixes ~w(inc llc corp corporation co ltd group)
-  @synonyms %{"tech" => "technology"}
+  @suffixes ~w(inc llc corp corporation co company ltd incorporated group)
+  @stopwords ~w(the)
+  @synonyms %{"tech" => "technology", "svc" => "service"}
   @ein_pattern ~r/^\d{2}-\d{7}$/
 
   # Normalized token-set comparison: a stand-in for the entity-match LLM
@@ -26,7 +27,7 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
     |> String.replace(",", " ")
     |> then(&Regex.scan(~r/[a-z0-9]+/, &1))
     |> List.flatten()
-    |> Enum.reject(&(&1 in @suffixes))
+    |> Enum.reject(&(&1 in @suffixes or &1 in @stopwords))
     |> Enum.map(&Map.get(@synonyms, &1, &1))
     |> MapSet.new()
   end
@@ -81,16 +82,16 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
   test "bucket accuracy reports 100% when every decision matches" do
     accuracy = Run.run_all() |> Run.bucket_accuracy()
 
-    assert accuracy["clean"] == %{total: 10, correct: 10}
-    assert accuracy["mismatch"] == %{total: 5, correct: 5}
-    assert accuracy["formatting"] == %{total: 3, correct: 3}
-    assert accuracy["malformed"] == %{total: 2, correct: 2}
+    assert accuracy["clean"] == %{total: 20, correct: 20}
+    assert accuracy["mismatch"] == %{total: 15, correct: 15}
+    assert accuracy["formatting"] == %{total: 12, correct: 12}
+    assert accuracy["malformed"] == %{total: 8, correct: 8}
   end
 
   test "tax ids are extracted verbatim for every well-formed fixture" do
     well_formed = Enum.reject(Run.run_all(), &(&1.fixture.bucket == "malformed"))
 
-    assert length(well_formed) == 18
+    assert length(well_formed) == 47
     assert Enum.all?(well_formed, & &1.tax_id_verbatim_ok)
   end
 
@@ -99,7 +100,7 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
     # claim credible rather than cherry-picked.
     formatting = Enum.filter(Run.run_all(), &(&1.fixture.bucket == "formatting"))
 
-    assert length(formatting) == 3
+    assert length(formatting) == 12
     assert Enum.all?(formatting, &(&1.decision == "approved"))
     assert Enum.all?(formatting, & &1.entity_match)
   end
@@ -125,14 +126,14 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
 
     scores = Run.run_all() |> Run.judge_scores()
 
-    # 18 fixtures have a known expected_entity_match (excludes the 2 malformed).
-    assert length(scores.entity_match.scores) == 18
+    # 47 fixtures have a known expected_entity_match (excludes the 8 malformed).
+    assert length(scores.entity_match.scores) == 47
     assert Enum.all?(scores.entity_match.scores, &(&1 == 0.9))
     assert scores.entity_match.errors == []
 
     # Groundedness is only scored where an explanation was actually
     # drafted — the mismatch bucket, since clean/formatting auto-approve.
-    assert length(scores.groundedness.scores) == 5
+    assert length(scores.groundedness.scores) == 15
     assert scores.groundedness.errors == []
   end
 
@@ -142,9 +143,9 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
     scores = Run.run_all() |> Run.judge_scores()
 
     assert scores.entity_match.scores == []
-    assert scores.entity_match.errors == List.duplicate(:rate_limited, 18)
+    assert scores.entity_match.errors == List.duplicate(:rate_limited, 47)
 
     assert scores.groundedness.scores == []
-    assert scores.groundedness.errors == List.duplicate(:rate_limited, 5)
+    assert scores.groundedness.errors == List.duplicate(:rate_limited, 15)
   end
 end

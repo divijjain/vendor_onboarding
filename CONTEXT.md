@@ -728,6 +728,47 @@ configured. `mix precommit` clean, 137 tests (136 prior + 1 new, covering both t
 conditional visibility and that clicking it enqueues `TriggerAgentRunWorker` via
 `assert_enqueued`).
 
+## 2026-08-17 — grew the eval fixture set 20 -> 55, specifically to fix the thin-bucket problem
+
+Prompted by a direct question: is 20 fixtures enough to call the eval's numbers "accuracy"? No
+— honestly answered no. Two buckets (`formatting` n=3, `malformed` n=2) were thin enough that a
+single failure swung that bucket's reported accuracy by 33-50 points; the headline "20/20" also
+carried a wide enough confidence interval at that sample size that it couldn't distinguish a
+~95%-accurate system from a 100%-accurate one. Grew the set to 55 (20/15/12/8), weighting the
+growth toward the buckets that needed it most (formatting 3->12, malformed 2->8, a 4x increase
+each) rather than uniformly scaling every bucket — clean was already adequately powered.
+
+**Real bug caught by the expansion itself, before any fixture even ran for real**: several of
+the new `formatting` pairs (e.g. "Riverside Mfg. Co." / "Riverside Manufacturing Company",
+"The Wilson Group" / "Wilson Group LLC", "Delta Freight Svc. Inc." / "Delta Freight Service,
+Incorporated") failed the *unit test suite* (`run_test.exs`, which uses injected fakes, not a
+real LLM) — not because the pipeline is wrong, but because `run_test.exs`'s own fake
+entity-match stand-in (a normalized token-set comparison, deliberately simpler than a real LLM)
+didn't know "company" and "incorporated" are legal suffixes, didn't expand "svc" -> "service",
+and didn't strip a leading "the". Fixed by extending that fake's `@suffixes`/`@synonyms`/added
+`@stopwords` lists rather than avoiding the pairs — those are legitimate real-world formatting
+variants a real LLM would trivially get right, so the fake's coverage gap was the actual bug,
+not the fixture choice. Separately, one new `malformed` fixture used a genuinely empty (`""`)
+contract-side company name, which crashed `run_test.exs`'s regex-based fake contract parser
+(`~r/and (.+?) \("Vendor/` requires at least one character between "and " and the literal that
+follows, and an empty name leaves nothing for it to capture) — fixed by using a `"[not stated]"`
+placeholder instead, which is also more representative of how a real scanned/OCR'd document
+signals a missing field than a true zero-length string would be.
+
+**Real run, all 55 fixtures, both API keys + both mock MCP servers live**: 55/55 decision
+accuracy across all four buckets (20/20, 15/15, 12/12, 8/8). Judge tier: entity-match 1.00
+(n=47, every fixture with a known expected match/mismatch), groundedness 1.00 (n=14 of 15
+mismatch-bucket fixtures — one judge call hit a genuine `Req.TransportError{reason: :timeout}`,
+correctly surfaced as an error rather than silently dropped, per the earlier `judge_scores/1`
+fix). Not a coincidence that it's still 100% at 4x the malformed/formatting bucket sizes — it's
+evidence (not proof) that the earlier 100% wasn't a small-sample fluke, though 55 is still not
+benchmark-scale; see the README's Evaluation section for the honest framing of what this number
+does and doesn't support.
+
+**Verified**: `mix precommit` clean, 137 tests. README's Evaluation section updated with the
+real 55-fixture results, replacing the 20-fixture numbers (kept the debugging story about the
+earlier `n=4`-instead-of-`5` groundedness bug, since that's still true and still instructive).
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow
