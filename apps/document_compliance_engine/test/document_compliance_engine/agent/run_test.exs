@@ -51,6 +51,39 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     assert payload["tax_id"] == "12-3456789"
   end
 
+  test "routes a %PDF- prefixed document through pdf_to_text before extraction", %{
+    document_paths: paths
+  } do
+    contract_path = paths["contract"]
+    contract_pdf_bytes = "%PDF-1.4\nnot real PDF bytes, just needs the magic header"
+    File.write!(contract_path, contract_pdf_bytes)
+    test_pid = self()
+
+    stub_defaults(
+      pdf_to_text_fun: fn bytes ->
+        if bytes == contract_pdf_bytes,
+          do: {:ok, "text pdftotext extracted"},
+          else: {:ok, "w9 text"}
+      end,
+      extract: fn
+        "contract", _schema, text ->
+          # Task.async_stream (in Extraction.extract_all/2) runs this in a
+          # separate process — self() here isn't the test process.
+          send(test_pid, {:contract_text_seen, text})
+          {:ok, contract()}
+
+        role, schema, text ->
+          extract(role, schema, text)
+      end
+    )
+
+    trigger(19, paths)
+
+    assert_received {:contract_text_seen, "text pdftotext extracted"}
+    assert_received {:callback, payload}
+    assert payload["status"] == "approved"
+  end
+
   test "sends needs_review with a thread_id and persists a checkpoint on a mismatch", %{
     document_paths: paths
   } do

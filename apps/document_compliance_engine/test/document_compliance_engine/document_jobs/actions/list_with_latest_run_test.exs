@@ -46,6 +46,29 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.ListWithLatestRunTest do
 
       assert row.company_name == nil
     end
+
+    test "falls back to extracted_fields.invoice.vendor_name for an invoice document_job" do
+      {:ok, document_job} =
+        DocumentJobs.Repository.insert(%{
+          idempotency_key: "list-invoice-1",
+          document_paths: %{},
+          document_type_slug: "invoice"
+        })
+
+      {:ok, run} =
+        AgentRuns.Repository.insert(%{document_job_id: document_job.id, status: :processing})
+
+      {:ok, _updated} =
+        AgentRuns.Repository.update_result(run, %{
+          status: :approved,
+          extracted_fields: %{"invoice" => %{"vendor_name" => "Northwind Traders Ltd."}}
+        })
+
+      rows = DocumentJobs.list_document_jobs_with_latest_run()
+      row = Enum.find(rows, &(&1.id == document_job.id))
+
+      assert row.company_name == "Northwind Traders Ltd."
+    end
   end
 
   describe "reload/1" do

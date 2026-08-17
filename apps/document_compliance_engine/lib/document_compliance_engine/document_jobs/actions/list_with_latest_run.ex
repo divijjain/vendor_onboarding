@@ -38,8 +38,20 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.ListWithLatestRun do
       id: document_job.id,
       status: document_job.status,
       document_type_slug: document_job.document_type_slug,
-      company_name: agent_run && agent_run.company_name,
+      company_name: display_name(agent_run),
       updated_at: document_job.updated_at
     }
   end
+
+  # `agent_run.company_name` only ever gets populated for the
+  # `vendor_contract_w9` type (see `Agent.Run.@known_roles`) — any other
+  # document type's fields land in `extracted_fields` instead, so the
+  # dashboard's "Company" column would otherwise show blank even when
+  # extraction genuinely succeeded. `invoice` is the one other type that
+  # exists today; a real vendor name there is worth surfacing the same
+  # way. Same "known types get dedicated handling" tradeoff the rest of
+  # the dashboard already makes, not a generic field-guessing heuristic.
+  defp display_name(nil), do: nil
+  defp display_name(%{company_name: name}) when not is_nil(name), do: name
+  defp display_name(%{extracted_fields: fields}), do: get_in(fields, ["invoice", "vendor_name"])
 end

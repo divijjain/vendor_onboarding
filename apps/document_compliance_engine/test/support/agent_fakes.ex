@@ -61,7 +61,8 @@ defmodule DocumentComplianceEngine.AgentFakes do
       entity_match: &entity_match/2,
       validate_tax_id: fn _tax_id -> {:ok, %{valid: true}} end,
       screen_vendor: fn _name -> {:ok, %{flagged: false, reason: nil}} end,
-      draft_explanation: fn findings -> "Explanation: #{findings}" end
+      draft_explanation: fn findings -> "Explanation: #{findings}" end,
+      pdf_to_text_fun: fn _bytes -> {:ok, "fake extracted pdf text"} end
     ]
   end
 
