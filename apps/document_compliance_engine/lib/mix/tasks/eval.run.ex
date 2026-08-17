@@ -94,15 +94,25 @@ defmodule Mix.Tasks.Eval.Run do
 
       results
       |> Run.judge_scores()
-      |> Enum.each(fn {name, scores} ->
-        if scores == [] do
-          IO.puts("#{name}: no scored cases")
-        else
-          avg = Enum.sum(scores) / length(scores)
+      |> Enum.each(fn {name, %{scores: scores, errors: errors}} ->
+        error_note =
+          if errors == [],
+            do: "",
+            else: " -- #{length(errors)} judge call(s) FAILED: #{inspect(Enum.take(errors, 3))}"
 
-          IO.puts(
-            "#{name}: avg #{:erlang.float_to_binary(avg, decimals: 2)} (n=#{length(scores)})"
-          )
+        case scores do
+          [] when errors == [] ->
+            IO.puts("#{name}: no scored cases")
+
+          [] ->
+            IO.puts("#{name}: all judge calls failed#{error_note}")
+
+          _ ->
+            avg = Enum.sum(scores) / length(scores)
+
+            IO.puts(
+              "#{name}: avg #{:erlang.float_to_binary(avg, decimals: 2)} (n=#{length(scores)})#{error_note}"
+            )
         end
       end)
     end

@@ -126,11 +126,25 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
     scores = Run.run_all() |> Run.judge_scores()
 
     # 18 fixtures have a known expected_entity_match (excludes the 2 malformed).
-    assert length(scores.entity_match) == 18
-    assert Enum.all?(scores.entity_match, &(&1 == 0.9))
+    assert length(scores.entity_match.scores) == 18
+    assert Enum.all?(scores.entity_match.scores, &(&1 == 0.9))
+    assert scores.entity_match.errors == []
 
     # Groundedness is only scored where an explanation was actually
     # drafted — the mismatch bucket, since clean/formatting auto-approve.
-    assert length(scores.groundedness) == 5
+    assert length(scores.groundedness.scores) == 5
+    assert scores.groundedness.errors == []
+  end
+
+  test "judge_scores surfaces a failed judge call instead of silently dropping it" do
+    stub(judge_fun: fn _criteria, _evidence -> {:error, :rate_limited} end)
+
+    scores = Run.run_all() |> Run.judge_scores()
+
+    assert scores.entity_match.scores == []
+    assert scores.entity_match.errors == List.duplicate(:rate_limited, 18)
+
+    assert scores.groundedness.scores == []
+    assert scores.groundedness.errors == List.duplicate(:rate_limited, 5)
   end
 end

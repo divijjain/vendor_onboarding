@@ -34,7 +34,7 @@ flowchart TD
     A1[Extract<br/>one call per document role,<br/>schema from DocumentTypes] --> A2[Validate<br/>interprets validation_rules]
     A2 --> T1[MCP: tax API<br/>mock, validates Tax ID]
     A2 --> T2[MCP: sanctions DB<br/>mock, screens vendor]
-    A2 --> EM[Entity-match LLM<br/>compares two named fields]
+    A2 --> EM[Entity-match<br/>similarity pre-filter,<br/>LLM only if ambiguous]
     T1 --> G[Gate]
     T2 --> G
     EM --> G
@@ -78,6 +78,7 @@ flowchart TD
 - **MCP is used deliberately, not decoratively.** The mock Tax API and mock Sanctions DB are two real, separate OTP applications each exposing an MCP tool interface over HTTP, not two functions folded into one process — because MCP's value is standardizing tool access across processes, and the README should be honest that for exactly two fixed mock tools, plain function-calling would work identically. The MCP framing is there because it's the pattern that scales to N real tools, and that's the argument to make explicit, not assume.
 - **Idempotency and PII are first-class, not afterthoughts.** The webhook computes an idempotency key (hash of raw payload) so a duplicated submission doesn't double-process a document bundle. Tax ID is stored via an encrypted Ecto type (`Cloak`) on its own dedicated column — and stays there deliberately: the generic `extracted_fields` column added for document types with no dedicated columns of their own (today, `invoice`) never receives PII, by construction, not by convention.
 - **The webhook is signature-verified, not just idempotency-checked.** `POST /webhooks/document_compliance_engine` requires an `x-webhook-signature: sha256=<hex>` header — an HMAC-SHA256 over the exact raw body bytes, checked with a constant-time compare (`DocumentComplianceEngineWeb.Plugs.VerifyWebhookSignature`). Idempotency alone stops duplicate processing of a *legitimate* payload; it does nothing to stop an unauthenticated caller from injecting a fabricated one, which is the actual threat model for an internet-facing ingestion endpoint on a compliance-pitched system.
+- **Not every field is worth an LLM call.** `Checks.entity_match/2` runs a cheap `String.jaro_distance/2` pre-filter before ever calling the LLM, and `Extraction` resolves `tax_id` via regex (`\d{2}-\d{7}`) when it appears exactly once in the source text — both skip the LLM entirely for the clear-cut cases and fall through to it only for genuine ambiguity. This isn't a hunch: the entity-match thresholds are calibrated against this project's own 20 eval fixtures (a real, verified gap between the "formatting difference" and "genuine mismatch" buckets), and the regex-vs-LLM tradeoff for a rigidly-formatted field like an EIN is backed by published research showing near-identical accuracy at a large fraction of the cost — see `CONTEXT.md`'s dated entry for the sources and the full calibration data.
 
 ## Evaluation
 
@@ -95,7 +96,20 @@ The core resume claim — "0% hallucination rate on extracted entities" — is o
 | Subtle formatting difference, not a real mismatch | 3 | false-positive rate — the detail that makes "100% accuracy" credible rather than cherry-picked |
 | Missing/malformed fields | 2 | graceful degradation |
 
-This fixture set is specific to the `vendor_contract_w9` document type (the contract-vs-W-9 name-mismatch scenario) — `invoice` has no eval fixtures yet, and its own end-to-end correctness is proven by the ExUnit test suite, not the eval harness. Results are written up as a short metrics table in this README once the harness runs for real (with both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` configured), not just asserted. See `apps/document_compliance_engine/lib/document_compliance_engine/agent/evals/` and the Status section below for where that stands.
+This fixture set is specific to the `vendor_contract_w9` document type (the contract-vs-W-9 name-mismatch scenario) — `invoice` has no eval fixtures yet, and its own end-to-end correctness is proven by the ExUnit test suite, not the eval harness.
+
+**Results, run for real** (`mix eval.run`, both API keys configured, both mock MCP servers running):
+
+| Bucket | Decision accuracy |
+|---|---|
+| Clean | 10/10 |
+| Genuine mismatch | 5/5 |
+| Formatting (false-positive control) | 3/3 |
+| Malformed | 2/2 |
+
+LLM-judge tier (Claude Sonnet, scoring the GPT-4o-mini agent's own judgments — cross-provider, not self-grading): entity-match correctness averaged **1.00** (n=18, every fixture with a known expected match/mismatch), groundedness of drafted mismatch explanations averaged **1.00** (n=5, the mismatch bucket, the only fixtures that actually halt and draft an explanation).
+
+The first real run reported groundedness as `n=4`, not `5` — `judge_scores/1` used to silently drop a failed judge call from the average rather than count it, so the gap wasn't visible until it was made to surface failures explicitly. The dropped call turned out to be a real parsing bug, not a flaky network error: Claude's extended-thinking responses put a `type: "thinking"` block ahead of the `type: "text"` block in the response, and `Judge.extract_text/1` assumed the first content block was always the answer. Fixed to search for the actual `text` block instead of assuming its position — see `CONTEXT.md`'s dated entry for the full story, including why an eval harness silently hiding its own failures is exactly the failure mode this whole project is built to catch on the agent side.
 
 ## Tech stack
 
@@ -116,16 +130,19 @@ The pipeline is document-type-generic, proven against two real, structurally dif
 
 | Document type | Documents | Validation rules |
 |---|---|---|
-| `vendor_contract_w9` | contract + W-9 | entity-match (contract vs. W-9 name) + Tax ID check + sanctions screen |
+| `vendor_contract_w9` | contract + W-9 | entity-match (contract vs. W-9 name, staged) + Tax ID check (regex-first) + sanctions screen |
 | `invoice` | invoice only | sanctions screen only |
 
 **Current state:**
 
-- 110 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently.
+- 128 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently.
+- Entity-match and Tax ID extraction are staged, not always-LLM: a calibrated string-similarity pre-filter resolves clear entity matches/mismatches without a call, and Tax ID resolves via regex when the EIN pattern is unambiguous in the source text — both fall through to the LLM only when genuinely ambiguous, never guess. See "Why this shape" above and `CONTEXT.md` for the research and calibration behind the thresholds.
 - `mix dialyzer` clean except 4 known, pre-existing errors — 2 `Mix.Task` callback-info warnings in `lib/mix/tasks/eval.run.ex`, 2 `guard_fail`s on a defensive `|| %{}` fallback that Reactor's own types prove unreachable — deliberately not wired into CI yet (see `CLAUDE.md`'s Pre-commit section).
-- Every LLM call (both extractions, entity-match, explanation-drafting, and the eval judge) is dependency-injected and overridable via `Application.get_env(:document_compliance_engine, :agent_*)`. There's no `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` configured in this dev environment, so all of the above is verified against injected fakes plus the two *real* MCP servers and the *real* Postgres checkpointer — not a live model call. The eval harness's 20-fixture accuracy numbers stay a placeholder until someone runs `mix eval.run` with real keys.
+- Every LLM call (both extractions, entity-match, explanation-drafting, and the eval judge) is dependency-injected and overridable via `Application.get_env(:document_compliance_engine, :agent_*)`, so the ExUnit test suite (this project's correctness guarantee, run on every `mix precommit`) always uses injected fakes plus the two *real* MCP servers and the *real* Postgres checkpointer — never a live model call, by design, regardless of whether API keys happen to be configured locally. The eval harness is separate: `mix eval.run` has now been run for real, with both API keys and both MCP servers live — see the Evaluation section above for the results, and for the real bug that surfaced along the way.
 - The durable-pause guarantee (a paused review surviving a killed-and-restarted process, mid-review) and the resume-doesn't-re-extract guarantee have both been re-verified against the current, generalized reactor — not just inherited from the pre-generalization implementation.
 - Both document types were also verified against a real running server (not just the test suite): POSTed over real HTTP with a valid HMAC signature, correctly land on `document_jobs` with the right `document_type_slug`, and — with no `OPENAI_API_KEY` present — fail gracefully at extraction rather than hanging in `:processing`, for both document shapes.
+
+**Known limitation:** there is no real PDF/OCR text-extraction step. `Agent.Run.read_documents/2` reads a stored document's bytes with `File.read/1` and passes them straight into the extraction prompt as if they're already clean, plain text — every fixture and test in this project supplies literal text strings, never a real PDF. This isn't specific to the LLM call: the regex pre-filter for `tax_id` and the entity-match similarity staging above both inherit the same assumption. Closing it is real, separate, currently-unscoped work (at minimum a PDF-to-text step; a scanned/image source would need OCR on top), not a small addition — see `CONTEXT.md`'s "Open / not yet decided" section.
 
 Full dated build history and every architectural decision, with rationale, lives in `CONTEXT.md`.
 
@@ -139,7 +156,7 @@ specific app first; never run `mix` commands from the repo root** — see
 doesn't do what you'd expect here.
 
 * `cd apps/document_compliance_engine && mix setup` to install dependencies and run migrations (includes the agent pipeline's checkpoint table, in its own `agent_checkpoints` schema, and seeds both document types: `vendor_contract_w9`, `invoice`)
-* Set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (LLM judge) in your environment to run the real LLM calls (neither is required to run the test suite — it uses injected fakes)
+* Set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (LLM judge) to run the real LLM calls (neither is required to run the test suite — it uses injected fakes). Either export them in your shell, or `cp .env.example .env` and fill in real values — `.env` is gitignored and auto-loaded by `config/config.exs` (a real exported shell var always takes priority over it)
 * Start Phoenix with `mix phx.server` or inside IEx with `iex -S mix phx.server` (from `apps/document_compliance_engine`)
 * Visit [`localhost:4000`](http://localhost:4000)
 * Webhook requests must be HMAC-SHA256 signed (`x-webhook-signature: sha256=<hex>` over the raw body) and carry a `document_type_slug` plus a `documents` map keyed by the roles that type's `extraction_schema` expects. Dev uses the fixed secret in `apps/document_compliance_engine/config/dev.exs`; sign a local curl request with:

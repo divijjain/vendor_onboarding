@@ -117,8 +117,24 @@ defmodule DocumentComplianceEngine.Agent.Evals.Judge do
     end
   end
 
-  defp extract_text(%{"content" => [%{"text" => text} | _]}), do: {:ok, text}
-  defp extract_text(other), do: {:error, {:unexpected_judge_response, other}}
+  @doc """
+  Finds the actual answer in an Anthropic Messages API response body. Not
+  just the head of the `content` list: extended-thinking responses put a
+  `type: "thinking"` block ahead of the `type: "text"` block, so the
+  answer isn't reliably the first element — a real bug caught live by
+  `Evals.Run.judge_scores/1` surfacing a judge failure instead of silently
+  dropping it (see `CONTEXT.md`'s dated entry). Public so this parsing
+  logic is directly testable without a live API call.
+  """
+  @spec extract_text(map()) :: {:ok, String.t()} | {:error, term()}
+  def extract_text(%{"content" => content}) when is_list(content) do
+    case Enum.find(content, &match?(%{"type" => "text"}, &1)) do
+      %{"text" => text} -> {:ok, text}
+      _ -> {:error, {:unexpected_judge_response, content}}
+    end
+  end
+
+  def extract_text(other), do: {:error, {:unexpected_judge_response, other}}
 
   defp decode_verdict(text) do
     with {:ok, json} <- extract_json(text),

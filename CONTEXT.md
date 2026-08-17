@@ -444,6 +444,111 @@ already applies elsewhere.
   still true: the halted-reactor-survives-`term_to_binary`/`binary_to_term`
   round trip, and resume not re-running a completed extraction step.
 
+## 2026-08-16 — staged (regex-first) entity-match and Tax ID extraction, backed by research
+
+Prompted by a cost/accuracy question, not a bug: every `entity_match` call and every
+`tax_id` extraction paid for a full LLM round trip even when the answer was obvious from
+the raw strings. Researched rather than guessed — findings and sources in the conversation
+transcript, summarized here:
+
+- A JAMIA Open study comparing regex vs. an LLM for a structurally similar extraction task
+  (BI-RADS scores from radiology reports) found regex tied the LLM on accuracy (89.20% vs
+  87.69%, not statistically significant) at 28,120× the speed — i.e. for a field with a
+  genuinely rigid format, regex isn't a cheaper-but-worse fallback, it's strictly better.
+- Entity-resolution research shows the reverse for free text: pure string similarity misses
+  semantic aliasing entirely (can't know "SBUX" means Starbucks), so the two fields chosen
+  here are the two where each method is actually the right tool — `tax_id` (rigid EIN
+  format) for regex, company-name comparison (free text, real aliasing) staged through a
+  cheap pre-filter with the LLM as the fallback for genuinely ambiguous cases, not replaced
+  outright.
+- Self-consistency (multiple LLM samples, checked for agreement) was considered and
+  deliberately **not** used as the confidence signal — a 2026 paper ("When LLMs Agree, Are
+  They Right?") found agreement can come from shared model bias rather than correctness.
+  `String.jaro_distance/2` on normalized names was used instead: deterministic, free, and
+  directly calibratable against this project's own fixtures.
+
+**`Checks.staged_match/2`** (`agent/checks.ex`): pure function, `String.jaro_distance/2` on
+normalized (downcased, trimmed, punctuation-stripped) names. Thresholds weren't guessed —
+computed against the eval harness's own 20 fixtures: the "formatting" bucket (same entity,
+cosmetic difference) scores 0.82–0.854; the "mismatch" bucket (genuinely different entities)
+scores 0.475–0.65. That's a real gap with margin on both sides, and the thresholds
+(`0.95`/`0.70`) sit inside it with room to spare rather than splitting it down the middle —
+a false auto-match/auto-mismatch on a compliance decision is worse than an extra LLM call,
+so the ambiguous band was left deliberately wide. `entity_match/2` tries `staged_match/2`
+first and only calls the configured LLM (real or test fake) for the ambiguous middle band —
+the staging wraps *around* the existing `agent_entity_match` override seam, so it applies
+uniformly whether the LLM is real or faked, and every existing test's outcome was checked
+against the calibration data before relying on it (the one true existing test fixture that
+used identical strings specifically to force the fake's answer — "entity_match rule fails
+and records a detail on mismatch" — had to be changed to a genuinely ambiguous pair, since
+identical strings now correctly short-circuit before the fake is ever reached).
+
+**`Extraction.maybe_regex_extract/2`** (`agent/extraction.ex`): resolves `tax_id` directly
+when `\d{2}-\d{7}` appears *exactly once* in the source text — zero or multiple matches is
+ambiguous and always falls through to the LLM, never guesses. Scoped deliberately to one
+field, not generalized to a per-field pattern config in `extraction_schema` yet — proving it
+on the one field with a genuinely unambiguous format before extending the config shape to
+support arbitrary patterns is the same "prove it before generalizing" discipline the
+document-type work itself followed. When `tax_id` resolves, it's removed from what's asked
+of the LLM (fewer fields requested, not just a discarded LLM value) and merged back into the
+result — for the `invoice`-style case where regex resolves *every* field in a role, the LLM
+call is skipped outright.
+
+**Verified**: `mix precommit` clean, 123 tests (110 prior + 13 new: `staged_match/2`'s three
+outcomes, `entity_match/2`'s staging-wraps-the-override-seam behavior via a `send`-based spy
+proving the fake genuinely isn't called for clear cases, and `maybe_regex_extract/2`'s four
+outcomes plus `extract/3`'s regex-then-fallback behavior). `mix dialyzer` unchanged — same 4
+pre-existing errors, none new.
+
+## 2026-08-16 — `mix eval.run` run for real; a silently-dropped judge failure turned out to be a real bug
+
+First real end-to-end run, both `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` configured (via a new
+local `.env`/`.envrc` loading mechanism — see below) and both mock MCP servers actually
+running. Result: 20/20 decision accuracy across all four buckets, entity-match judge tier
+1.00 (n=18). Not just repeated: the first run's groundedness score was `avg 1.00 (n=4)`, one
+short of the expected `n=5` (all 5 mismatch-bucket fixtures halt and draft an explanation),
+and that discrepancy was chased down rather than reported as-is.
+
+**Root cause, not assumed**: `Evals.Run.judge_scores/1` used a `for` comprehension with
+`{:ok, %{score: score}} <- [Judge.groundedness(...)]` as a *filter* — a failed judge call
+(`{:error, _}`) simply didn't match and silently vanished from the list, indistinguishable
+from "this fixture wasn't scorable." Fixed to `partition_judge_results/1`, which buckets
+every judge call into `:scores` or `:errors` explicitly — `judge_scores/1`'s return shape
+changed from `%{entity_match: [float()], groundedness: [float()]}` to
+`%{entity_match: %{scores:, errors:}, groundedness: %{scores:, errors:}}`, and `mix eval.run`
+now prints a failure count and the actual error reason instead of a quietly-smaller `n`. The
+callback: an eval harness that hides its own failures the same way is exactly the failure
+mode this whole project exists to catch on the agent side — noted explicitly, not just fixed
+silently.
+
+**The dropped call was a real bug, not a flaky network error.** `Judge.extract_text/1`
+assumed the first element of the Anthropic response's `content` list was always the answer
+(`%{"content" => [%{"text" => text} | _]}`). Claude Sonnet 5's extended-thinking responses put
+a `type: "thinking"` block *ahead of* the `type: "text"` block, so that assumption was simply
+wrong under real conditions the test suite (all fakes) never exercised. Fixed to search the
+list for the block with `"type" => "text"` rather than assume position; made `extract_text/1`
+public specifically so this parsing logic has direct unit coverage (`judge_test.exs`, the
+first test file this module ever had) rather than only being reachable through a live API
+call. Re-run after the fix: groundedness correctly reports `avg 1.00 (n=5)`, no errors.
+
+**`.env`/`.envrc` loading added** (`config/config.exs`), since this surfaced while getting
+real keys configured locally: checks for either filename (existing `.env.example` convention
+vs. a user's own `.envrc`), strips surrounding quotes from values, and only sets a var if not
+already exported in the shell — a no-op in CI/prod where secrets come from the real
+environment. Both filenames were already gitignored (a user edit had swapped `/.env` for
+`/.envrc` in `.gitignore` rather than adding to it; both are now covered). One incidental
+finding while wiring this in: `dashboard_live_test.exs`'s system-health-panel test assumed
+the two mock MCP servers are never running during `mix test` — true in CI, false the moment
+someone actually has them running locally per the README's own instructions. Fixed to stub
+the health check the same way `system_health_test.exs` already does, and moved the whole
+module to `async: false` since `Application.put_env` is global state shared with that other
+test file — verified stable across repeated runs with both mock servers actually up.
+
+**Verified**: `mix precommit` clean, 128 tests (123 prior + 4 new `judge_test.exs` cases + 1
+new `judge_scores/1` failure-surfacing test). Real `mix eval.run` output — 20/20 decisions,
+both judge averages at 1.00 with the correct sample sizes — is in the README's Evaluation
+section, replacing the placeholder table.
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow
@@ -494,8 +599,9 @@ Two-tier, not "LLM-as-judge for everything":
 
 ## Open / not yet decided
 
-- Whether document storage in dev is local disk vs. real S3 from day one — plan is to build the storage interface so this is a config swap, defaulting to local disk for early development speed, and revisit before any deploy.
-- Exact encryption-at-rest mechanism for the Tax ID column (e.g. `Cloak.Ecto` custom Ecto type vs. Postgres-native column encryption) — needs a decision when the schema/migration is actually written.
+Both prior entries here are resolved and moved to "Decisions resolved" above (storage: `DocumentComplianceEngine.Storage` behaviour, `LocalDisk` adapter, config-swappable per the plan; Tax ID: `Cloak.Ecto` custom type on `agent_runs.tax_id`). This section had gone stale — neither reflected the project's actual current state. The real open item as of 2026-08-16:
+
+- **No real PDF/OCR text-extraction step exists.** `Agent.Run.read_documents/2` reads a stored document's bytes with `File.read/1` and feeds them straight into the extraction prompt as if they're already clean, plain text. Every fixture and test in this project supplies literal text strings, so this has never actually been exercised against a real PDF. Every extraction technique discussed or built so far — the LLM call itself, the regex pre-filter for `tax_id`, the entity-match similarity staging, and the layout-aware/NER/OCR options researched but not built (see the 2026-08-16 staged-extraction entry above) — all assume this gap is already closed. It isn't. Closing it means a real text-extraction step (at minimum a PDF-to-text conversion; a scanned/image PDF would need OCR on top of that) ahead of everything else in `Extraction`, and it's real, separate, currently-unscoped work, not a small addition to the existing pipeline.
 
 ## Suggested build order
 

@@ -135,8 +135,19 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
     end)
   end
 
-  @doc "Runs the judge tier over completed fixtures with a known expectation."
-  @spec judge_scores([%Result{}]) :: %{entity_match: [float()], groundedness: [float()]}
+  @doc """
+  Runs the judge tier over completed fixtures with a known expectation.
+
+  A failed judge call (rate limit, transient network error, a malformed
+  response that fails `Judge`'s strict JSON parsing) is recorded in
+  `:errors`, not silently excluded from the average — an eval harness that
+  hides its own failures the same way it exists to catch the agent
+  hiding *its* failures would defeat the point.
+  """
+  @spec judge_scores([%Result{}]) :: %{
+          entity_match: %{scores: [float()], errors: [term()]},
+          groundedness: %{scores: [float()], errors: [term()]}
+        }
   def judge_scores(results) do
     scorable =
       Enum.filter(results, fn r ->
@@ -144,26 +155,34 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
           not is_nil(r.fixture.expected_entity_match)
       end)
 
-    entity_scores =
-      for r <- scorable,
-          {:ok, %{score: score}} <-
-            [
-              Judge.entity_match(
-                r.fixture.contract_text,
-                r.fixture.w9_text,
-                r.entity_match,
-                r.fixture.expected_entity_match
-              )
-            ],
-          do: score
+    entity_match =
+      scorable
+      |> Enum.map(fn r ->
+        Judge.entity_match(
+          r.fixture.contract_text,
+          r.fixture.w9_text,
+          r.entity_match,
+          r.fixture.expected_entity_match
+        )
+      end)
+      |> partition_judge_results()
 
-    groundedness_scores =
-      for r <- scorable,
-          not is_nil(r.explanation),
-          not is_nil(r.findings),
-          {:ok, %{score: score}} <- [Judge.groundedness(r.findings, r.explanation)],
-          do: score
+    groundedness =
+      scorable
+      |> Enum.filter(&(not is_nil(&1.explanation) and not is_nil(&1.findings)))
+      |> Enum.map(&Judge.groundedness(&1.findings, &1.explanation))
+      |> partition_judge_results()
 
-    %{entity_match: entity_scores, groundedness: groundedness_scores}
+    %{entity_match: entity_match, groundedness: groundedness}
+  end
+
+  defp partition_judge_results(judge_results) do
+    {scores, errors} =
+      Enum.reduce(judge_results, {[], []}, fn
+        {:ok, %{score: score}}, {scores, errors} -> {[score | scores], errors}
+        {:error, reason}, {scores, errors} -> {scores, [reason | errors]}
+      end)
+
+    %{scores: Enum.reverse(scores), errors: Enum.reverse(errors)}
   end
 end

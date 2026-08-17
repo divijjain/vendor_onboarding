@@ -48,4 +48,83 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
     assert {:error, :boom} =
              Extraction.extract_all(%{"contract" => "c", "w9" => "w"}, @extraction_schema)
   end
+
+  describe "maybe_regex_extract/2" do
+    @field_types %{"company_name" => "string", "tax_id" => "string"}
+
+    test "resolves tax_id and removes it from the remaining fields when it appears exactly once" do
+      text = "FORM W-9\n1. Name of entity: Acme Corp\n2. EIN: 12-3456789\n"
+
+      assert {:resolved, :tax_id, "12-3456789", remaining} =
+               Extraction.maybe_regex_extract(@field_types, text)
+
+      assert remaining == %{"company_name" => "string"}
+    end
+
+    test "is unresolved when the pattern doesn't appear" do
+      assert :unresolved = Extraction.maybe_regex_extract(@field_types, "no ein here")
+    end
+
+    test "is unresolved (never guesses) when the pattern appears more than once" do
+      text = "EIN: 12-3456789, also possibly 98-7654321"
+      assert :unresolved = Extraction.maybe_regex_extract(@field_types, text)
+    end
+
+    test "is unresolved when the schema has no tax_id field at all" do
+      assert :unresolved =
+               Extraction.maybe_regex_extract(%{"company_name" => "string"}, "EIN: 12-3456789")
+    end
+  end
+
+  describe "extract/3 regex-first behavior for tax_id" do
+    test "resolves tax_id via regex and only asks the LLM for the remaining fields" do
+      test_pid = self()
+      text = "FORM W-9\n1. Name of entity: Acme Corp\n2. EIN: 12-3456789\n"
+
+      stub_defaults(
+        extract: fn role, response_model, _text ->
+          send(test_pid, {:called, role, response_model})
+          {:ok, Map.new(response_model, fn {field, _type} -> {field, "fake-#{field}"} end)}
+        end
+      )
+
+      assert {:ok, fields} = Extraction.extract("w9", @field_types, text)
+
+      # tax_id came from the regex match, verbatim — not the fake's canned value.
+      assert fields.tax_id == "12-3456789"
+      assert fields.company_name == "fake-company_name"
+
+      # The LLM (fake) was only ever asked for company_name.
+      assert_received {:called, "w9", response_model}
+      refute Map.has_key?(response_model, :tax_id)
+    end
+
+    test "skips the LLM call entirely when regex resolves every field in the role" do
+      test_pid = self()
+      text = "EIN: 12-3456789"
+
+      stub_defaults(extract: fn role, _schema, _text -> send(test_pid, {:called, role}) end)
+
+      assert {:ok, %{tax_id: "12-3456789"}} =
+               Extraction.extract("w9", %{"tax_id" => "string"}, text)
+
+      refute_received {:called, "w9"}
+    end
+
+    test "falls through to the normal full extraction when the EIN pattern isn't present" do
+      test_pid = self()
+
+      stub_defaults(
+        extract: fn role, response_model, _text ->
+          send(test_pid, {:called, role, response_model})
+          {:ok, Map.new(response_model, fn {field, _type} -> {field, "fake-#{field}"} end)}
+        end
+      )
+
+      assert {:ok, fields} = Extraction.extract("w9", @field_types, "no ein in this text")
+
+      assert fields.tax_id == "fake-tax_id"
+      assert_received {:called, "w9", %{company_name: :string, tax_id: :string}}
+    end
+  end
 end

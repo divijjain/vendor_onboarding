@@ -1,5 +1,7 @@
 defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
-  use DocumentComplianceEngineWeb.ConnCase, async: true
+  # async: false — one test stubs :system_health_mcp_check_fun, shared
+  # Application env also touched by SystemHealthTest.
+  use DocumentComplianceEngineWeb.ConnCase, async: false
 
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.DocumentJobs
@@ -64,13 +66,23 @@ defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
   end
 
   test "renders the system health panel", %{conn: conn} do
+    # Stubbed rather than relying on the MCP servers being absent — on a
+    # dev machine that's actually running them (per the README's local-dev
+    # steps), this test would otherwise depend on ambient system state
+    # instead of being hermetic.
+    Application.put_env(:document_compliance_engine, :system_health_mcp_check_fun, fn _url ->
+      {:error, :econnrefused}
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:document_compliance_engine, :system_health_mcp_check_fun)
+    end)
+
     {:ok, _view, html} = live(conn, ~p"/document_jobs")
 
     assert html =~ "BEAM processes"
     assert html =~ "Oban queue depth"
     assert html =~ "Active agent runs"
-    # Neither MCP server runs during the test suite (they're separate OTP
-    # apps started manually per README), so both reliably show down.
     assert html =~ "Tax API MCP"
     assert html =~ "Sanctions DB MCP"
     assert html =~ "down"

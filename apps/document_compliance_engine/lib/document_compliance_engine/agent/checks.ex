@@ -27,6 +27,20 @@ defmodule DocumentComplianceEngine.Agent.Checks do
   Name B: %{name_b}
   """
 
+  # Calibrated against this project's own eval fixtures (see
+  # test/document_compliance_engine/agent/checks_test.exs), not guessed: on
+  # the "formatting" bucket (same entity, cosmetic difference) normalized
+  # Jaro distance ranges 0.82-0.854; on the "mismatch" bucket (genuinely
+  # different entities) it ranges 0.475-0.65. There's a real gap between
+  # those two ranges, with margin on both sides, which is what these
+  # thresholds sit inside — the ambiguous band between them always goes to
+  # the LLM. Skipping the LLM call is a real cost/latency win (see
+  # CONTEXT.md's dated entry), but a false auto-match/auto-mismatch on a
+  # compliance decision is worse than an extra call, so both thresholds are
+  # deliberately conservative rather than tuned to maximize skips.
+  @clear_match_threshold 0.95
+  @clear_mismatch_threshold 0.70
+
   @explanation_prompt """
   Draft a brief, concrete explanation of the discrepancy found while validating \
   this document job, grounded only in the facts below. Do not invent details.
@@ -96,8 +110,58 @@ defmodule DocumentComplianceEngine.Agent.Checks do
     |> Map.fetch!(String.to_existing_atom(name))
   end
 
+  @doc """
+  Entity match with a cheap string-similarity pre-filter in front of the
+  LLM call: names that are clearly the same or clearly different (per
+  `staged_match/2`) skip the LLM entirely; only the genuinely ambiguous
+  middle band pays for a real call.
+  """
   @spec entity_match(String.t(), String.t()) :: {:ok, EntityMatchResult.t()} | {:error, term()}
   def entity_match(name_a, name_b) do
+    case staged_match(name_a, name_b) do
+      {:ok, _result} = staged -> staged
+      :ambiguous -> llm_entity_match(name_a, name_b)
+    end
+  end
+
+  @doc """
+  Pure, deterministic pre-filter: `String.jaro_distance/2` on normalized
+  (downcased, trimmed, punctuation-stripped) names. Returns `:ambiguous`
+  for anything not clearly on one side, which is the safe default — see
+  the threshold calibration comment above.
+  """
+  @spec staged_match(String.t(), String.t()) ::
+          {:ok, EntityMatchResult.t()} | :ambiguous
+  def staged_match(name_a, name_b) do
+    similarity = String.jaro_distance(normalize_name(name_a), normalize_name(name_b))
+
+    cond do
+      similarity >= @clear_match_threshold ->
+        {:ok,
+         %EntityMatchResult{
+           match: true,
+           explanation:
+             "Normalized names match closely (similarity #{Float.round(similarity, 2)}) — skipped LLM call"
+         }}
+
+      similarity <= @clear_mismatch_threshold ->
+        {:ok,
+         %EntityMatchResult{
+           match: false,
+           explanation:
+             "Normalized names are clearly different (similarity #{Float.round(similarity, 2)}) — skipped LLM call"
+         }}
+
+      true ->
+        :ambiguous
+    end
+  end
+
+  defp normalize_name(name) do
+    name |> String.downcase() |> String.trim() |> String.replace(~r/[^\w\s]/, "")
+  end
+
+  defp llm_entity_match(name_a, name_b) do
     case Application.get_env(:document_compliance_engine, :agent_entity_match) do
       nil ->
         content =

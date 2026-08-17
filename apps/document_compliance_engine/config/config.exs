@@ -7,6 +7,31 @@
 # General application configuration
 import Config
 
+# Loads apps/document_compliance_engine/.env or .envrc (whichever exists;
+# .env checked first) into the process environment for local dev — see
+# .env.example. Real API keys never get checked in; both filenames are
+# gitignored. A var already exported in the shell always wins, so this is
+# a no-op in CI/prod where secrets come from the real environment. Must
+# run before anything below reads System.get_env/1 (the OPENAI_API_KEY
+# config a few lines down), so it's here, not in runtime.exs.
+env_file =
+  Enum.find(["../.env", "../.envrc"], &File.exists?(Path.expand(&1, __DIR__)))
+
+if env_file do
+  Path.expand(env_file, __DIR__)
+  |> File.read!()
+  |> String.split("\n", trim: true)
+  |> Enum.reject(&String.starts_with?(&1, "#"))
+  |> Enum.each(fn line ->
+    with [key, value] <- String.split(line, "=", parts: 2),
+         key = String.trim(key),
+         value = value |> String.trim() |> String.trim("\"") |> String.trim("'"),
+         nil <- System.get_env(key) do
+      System.put_env(key, value)
+    end
+  end)
+end
+
 config :document_compliance_engine,
   ecto_repos: [DocumentComplianceEngine.Repo],
   generators: [timestamp_type: :utc_datetime]

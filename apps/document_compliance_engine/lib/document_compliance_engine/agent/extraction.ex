@@ -12,7 +12,18 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   the response shape can be built at runtime from `document_types` config.
 
   Overridable via application config so tests never need a real OpenAI key.
+
+  `tax_id` gets a regex pre-filter ahead of the LLM call (see
+  `maybe_regex_extract/2`): an EIN has a genuinely rigid, unambiguous format
+  (`\\d{2}-\\d{7}`), so when it appears exactly once in the source text
+  there's no real accuracy tradeoff to skipping the LLM for that one field —
+  see `CONTEXT.md`'s dated entry for the research this is based on. Proven
+  narrowly on `tax_id` first rather than generalized to every field, the
+  same "prove it on one real case before building the abstraction" approach
+  used for the document-type generalization itself.
   """
+
+  @tax_id_pattern ~r/\b\d{2}-\d{7}\b/
 
   @spec extract_all(%{String.t() => String.t()}, %{String.t() => %{String.t() => String.t()}}) ::
           {:ok, %{String.t() => map()}} | {:error, term()}
@@ -36,6 +47,40 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   @spec extract(String.t(), %{String.t() => String.t()}, String.t()) ::
           {:ok, map()} | {:error, term()}
   def extract(role, field_types, text) do
+    case maybe_regex_extract(field_types, text) do
+      {:resolved, field, value, remaining} when map_size(remaining) == 0 ->
+        {:ok, %{field => value}}
+
+      {:resolved, field, value, remaining} ->
+        with {:ok, llm_fields} <- complete_or_fake(role, remaining, text) do
+          {:ok, Map.put(llm_fields, field, value)}
+        end
+
+      :unresolved ->
+        complete_or_fake(role, field_types, text)
+    end
+  end
+
+  @doc """
+  Pure, deterministic pre-filter for `tax_id`: resolves it directly when
+  the EIN pattern appears exactly once in the source text (zero or
+  multiple matches is ambiguous — never guess, fall through to the LLM
+  for the whole field).
+  """
+  @spec maybe_regex_extract(%{String.t() => String.t()}, String.t()) ::
+          {:resolved, atom(), String.t(), %{String.t() => String.t()}} | :unresolved
+  def maybe_regex_extract(field_types, text) do
+    if Map.has_key?(field_types, "tax_id") do
+      case Regex.scan(@tax_id_pattern, text) do
+        [[match]] -> {:resolved, :tax_id, match, Map.delete(field_types, "tax_id")}
+        _ -> :unresolved
+      end
+    else
+      :unresolved
+    end
+  end
+
+  defp complete_or_fake(role, field_types, text) do
     response_model = to_response_model(field_types)
 
     case Application.get_env(:document_compliance_engine, :agent_extract) do
