@@ -6,7 +6,12 @@ defmodule DocumentComplianceEngine.DocumentJobs do
   agent's extracted/validated output.
   """
 
-  alias DocumentComplianceEngine.DocumentJobs.Actions.{IngestWebhook, ListWithLatestRun}
+  alias DocumentComplianceEngine.DocumentJobs.Actions.{
+    IngestWebhook,
+    ListWithLatestRun,
+    ReadDocuments
+  }
+
   alias DocumentComplianceEngine.DocumentJobs.Repository
 
   defdelegate get_document_job(id), to: Repository, as: :get
@@ -16,4 +21,5 @@ defmodule DocumentComplianceEngine.DocumentJobs do
   defdelegate reload_document_job_row(id), to: ListWithLatestRun, as: :reload
   defdelegate update_status(id, status), to: Repository
   defdelegate ingest_webhook(raw_payload), to: IngestWebhook, as: :call
+  defdelegate read_documents(document_job), to: ReadDocuments, as: :call
 end

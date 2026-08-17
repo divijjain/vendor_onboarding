@@ -28,16 +28,25 @@ defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
     document_job
   end
 
-  test "lists document_jobs with a status badge and a review link only when needs_review",
+  test "lists document_jobs with a status badge, and every row links out (labeled by status)",
        %{conn: conn} do
     received = insert_document_job("dash-received")
     needs_review = "dash-needs-review" |> insert_document_job() |> mark_needs_review()
 
-    {:ok, _view, html} = live(conn, ~p"/document_jobs")
+    {:ok, view, html} = live(conn, ~p"/document_jobs")
 
-    assert html =~ "needs_review"
+    # Scoped to this row, not a bare `=~ "Needs review"` — the summary
+    # stats panel always has a "Needs review" stat-title label regardless
+    # of any row's actual status.
+    assert has_element?(view, "#document_jobs-#{needs_review.id} .badge-warning")
     assert html =~ ~p"/document_jobs/#{needs_review.id}"
-    refute html =~ ~p"/document_jobs/#{received.id}"
+    assert has_element?(view, "#document_jobs-#{needs_review.id} a", "Review")
+
+    # Every row links out — not just needs_review — since the review page
+    # now also shows the original stored documents, useful regardless of
+    # whether this document_job is still awaiting a decision.
+    assert html =~ ~p"/document_jobs/#{received.id}"
+    assert has_element?(view, "#document_jobs-#{received.id} a", "View")
   end
 
   test "filters the list by document type", %{conn: conn} do
@@ -91,9 +100,15 @@ defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
   test "reacts to a PubSub status update by reloading just that row", %{conn: conn} do
     document_job = insert_document_job("dash-pubsub")
 
+    row = "#document_jobs-#{document_job.id}"
+
     {:ok, view, html} = live(conn, ~p"/document_jobs")
-    assert html =~ "received"
-    refute render(view) =~ "approved"
+    assert html =~ "Received"
+    # Scoped to this row, not a bare `render(view) =~ "Approved"` — the
+    # summary stats panel always has an "Approved" stat-title label
+    # regardless of any row's actual status, and a shared-sandbox test run
+    # can have other rows present too.
+    refute has_element?(view, "#{row} .badge-success")
 
     {:ok, _updated} = DocumentJobs.update_status(document_job.id, :approved)
 
@@ -103,6 +118,44 @@ defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
       {:status_updated, document_job.id}
     )
 
-    assert render(view) =~ "approved"
+    assert has_element?(view, "#{row} .badge-success")
+  end
+
+  test "submitting the manual upload form ingests a document_job the same way a webhook does",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/document_jobs")
+
+    view
+    |> form("#manual-upload-form", %{document_type_slug: "invoice"})
+    |> render_change()
+
+    avatar =
+      file_input(view, "#manual-upload-form", :invoice, [
+        %{name: "invoice.txt", content: "INVOICE #1234, vendor Acme Corp", type: "text/plain"}
+      ])
+
+    assert render_upload(avatar, "invoice.txt") =~ "invoice.txt"
+
+    html =
+      view
+      |> form("#manual-upload-form", %{document_type_slug: "invoice"})
+      |> render_submit()
+
+    assert html =~ "submitted"
+
+    assert [%{document_type_slug: "invoice"}] =
+             DocumentJobs.list_document_jobs(document_type_slug: "invoice")
+  end
+
+  test "submitting the manual upload form without every required file shows an error",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/document_jobs")
+
+    html =
+      view
+      |> form("#manual-upload-form", %{document_type_slug: "vendor_contract_w9"})
+      |> render_submit()
+
+    assert html =~ "Select a document type and a file for every required document"
   end
 end

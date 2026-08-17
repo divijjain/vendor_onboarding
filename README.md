@@ -177,6 +177,10 @@ doesn't do what you'd expect here.
     -H "content-type: application/json" -H "x-webhook-signature: sha256=$SIG" -d "$BODY"
   ```
 
+  Two lighter-weight alternatives to hand-signing curl requests:
+  - `mix webhook.send <fixture_id>` (e.g. `mix webhook.send clean-01`) signs and posts one of the eval harness's 20 fixtures against a running `mix phx.server`
+  - The dashboard itself (`/document_jobs`) has a "Submit a document" form — plain-text file upload, calls the same `DocumentJobs.ingest_webhook/1` the real webhook hits (just without the HMAC step, since it's a trusted in-process LiveView action, not an untrusted network caller). `.txt` only: the pipeline reads stored bytes as plain text, so a real PDF would silently produce garbage rather than being parsed.
+
 The two mock MCP tool servers are still separate OTP applications — genuinely external tools, not part of the agent pipeline — and run alongside Phoenix during local development:
 
 * `cd apps/tax_api && mix deps.get && iex -S mix` — mock Tax API MCP server, port 8010

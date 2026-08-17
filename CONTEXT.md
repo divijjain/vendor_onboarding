@@ -549,6 +549,185 @@ new `judge_scores/1` failure-surfacing test). Real `mix eval.run` output — 20/
 both judge averages at 1.00 with the correct sample sizes — is in the README's Evaluation
 section, replacing the placeholder table.
 
+## 2026-08-17 — two ways to manually test a document without hand-signing curl
+
+The dashboard had no way to push a document through the pipeline by hand — the only path in
+was the HMAC-signed webhook, and exercising it meant hand-computing an HMAC-SHA256 signature
+over a JSON body every time. Added two lighter paths, both reusing the exact same ingestion
+code (`DocumentJobs.ingest_webhook/1`), not a parallel one:
+
+**`mix webhook.send <fixture_id>`** (`lib/mix/tasks/webhook.send.ex`) — signs and POSTs one of
+`Evals.Fixtures`' 20 fixtures against a running `mix phx.server`. Only `vendor_contract_w9`
+fixtures exist to send (`Fixtures` has no `invoice` cases). Verified against a real running
+server: `mix webhook.send clean-01` → `201`, job landed `approved` on the dashboard. Adds the
+same dialyzer noise `eval.run.ex` already has (`callback_info_missing` +
+`Mix.raise/1 does not exist` — dialyzer doesn't have PLT info for the `Mix.Task` behaviour or
+`Mix.raise/1`; pre-existing false-positive pattern, not a new class of error) — total dialyzer
+errors went from 4 to 7, all the same kind.
+
+**A "Submit a test document" form directly on `DashboardLive`** — the more interesting one,
+since the dashboard was previously view/act-only by design (ingestion is supposed to model an
+external system pushing documents in, not a human uploading files). Built it anyway as an
+explicitly-labeled manual-test affordance, not a redesign of the ingestion model. It calls
+`DocumentJobs.ingest_webhook/1` directly with an unsigned payload — legitimate here because the
+caller is a trusted in-process LiveView action, not an untrusted network origin; the whole
+point of HMAC verification is to authenticate an external caller, which doesn't apply to a
+button on the app's own admin dashboard.
+
+Design decisions:
+- **`.txt` only, not `.pdf`** — the pipeline reads stored bytes as plain text
+  (`Agent.Run.read_documents/2`), a documented gap (`Open / not yet decided`, below). Accepting
+  PDFs in the upload form would silently feed the agent binary garbage instead of surfacing
+  that gap; `.txt`-only keeps the manual-test tool honest about what the pipeline actually does.
+- **Upload roles are hardcoded**, not derived generically from `DocumentTypes.extraction_schema`
+  — a small `@upload_roles` list mapping `{ref, document_type_slug, label}` for the two roles
+  that exist today (`contract`/`w9` for `vendor_contract_w9`, `invoice` for `invoice`). Mirrors
+  the same tradeoff `Agent.Run.@known_roles` already makes elsewhere: proving genericity in the
+  pipeline itself was worth it (see the 2026-08-16 entry), but a fully dynamic multi-file
+  upload UI (dynamic `allow_upload` refs per arbitrary role, one file-role-picker per staged
+  entry) would be over-engineering a manual-test convenience tool for two known types.
+- **No separate ingestion path.** The form builds the identical
+  `{"document_type_slug":, "documents": {role => base64}}` JSON payload the real webhook
+  controller decodes and calls `DocumentJobs.ingest_webhook/1` — same idempotency check, same
+  validation, same `AgentRuns.enqueue_trigger/1` at the end. Nothing about the ingestion
+  contract changed; only a second, unsigned caller was added.
+
+Tested with real `Phoenix.LiveViewTest.file_input/4` + `render_upload/2` (not just a browser
+eyeball) — `dashboard_live_test.exs` gained a test that uploads a real in-memory `.txt` file
+for the `invoice` type through the form, submits, and asserts a new `document_job` row exists;
+and a second test asserting the "select a type and a file for every required document" error
+path when submitting without one. **Verified**: `mix precommit` clean, 130 tests (128 prior +
+2 new). `mix dialyzer`: 7 errors total (4 pre-existing + 3 new from `webhook.send.ex`, same
+false-positive `Mix.Task`/`Mix.raise` pattern as `eval.run.ex`, not a new error class).
+
+## 2026-08-17 — dashboard redesign: presentable-by-default, engineering telemetry demoted not deleted
+
+The dashboard had grown organically feature-by-feature (status table, then a system-health
+panel, then the manual-upload form) with no pass for "what does a customer actually want to
+see first." Reworked `DashboardLive`'s layout and `Layouts.app`'s content width without
+touching any business logic — pure presentation pass.
+
+**What changed:**
+- `Layouts.app`'s `<main>` container went from `max-w-2xl` to `max-w-5xl` — the old width was
+  cramping the document table and (on `ReviewLive`) the side-by-side contract/W-9 diff grid;
+  benefits both pages.
+- Added a summary stats row (Total / Needs review / Approved / Needs attention) computed from
+  the already-fetched `@document_jobs` list (`Enum.frequencies_by/2` in a new private
+  `status_counts/1` — no new query, no new context function; deliberately a view-layer
+  aggregation of data already in hand, not a new business capability).
+- `core_components.status_badge/1` now humanizes the status atom (`:needs_review` → "Needs
+  review") instead of rendering the raw atom — applies everywhere it's used, including
+  `ReviewLive`.
+- The system-health panel (BEAM process count, Oban queue depth, MCP up/down) — real
+  engineering signal, but not something a compliance-review user needs staring at them —
+  moved into a closed-by-default `<details class="collapse">` at the bottom of the page.
+  **Demoted, not deleted**: still real data, still one click away, still exercised by the
+  existing `system_health_test.exs`/`dashboard_live_test.exs` coverage (a `<details>`
+  element's content is present in the server-rendered HTML regardless of open/closed state,
+  so no test needed to change to keep covering it).
+- The manual-upload card's copy was reworded to drop internal jargon ("manual smoke test",
+  "unsigned, internal ingestion") — same underlying mechanism (documented in the entry above),
+  framed as the dashboard's primary action instead of a caveat.
+- Table columns reordered (Company first, not `ID`) and the id demoted to a small `Ref`
+  column; added an empty state ("No documents yet — submit one above").
+
+**Two real test-fragility bugs found and fixed while doing this, not just cosmetic:**
+1. Humanizing `status_badge` broke three existing substring assertions that had been relying
+   on exact atom text — `"needs_review"`, `"received"`, `"approved"` no longer appear verbatim.
+   Worse, `review_live_test.exs`'s `refute html =~ "Approve"` started failing for a subtler
+   reason: the humanized "Approved" badge text *contains* "Approve" as a substring, so the
+   refute now false-failed even though the Approve *button* was correctly absent. Fixed by
+   asserting on `phx-click="approve"` instead of the button's visible text.
+2. The new stats panel's static labels ("Needs review", "Approved") made the equivalent
+   dashboard assertions vacuously true regardless of any row's real status — a bare
+   `html =~ "Approved"` now matches the stat-title even with zero approved rows. Fixed by
+   scoping assertions to a specific row's badge class via `has_element?(view, "#document_jobs-N
+   .badge-success")` rather than whole-page substring matching. This also incidentally hardened
+   the tests against a known, pre-existing Ecto Sandbox `shared: true` (`async: false`) sharp
+   edge: `mix test` occasionally showed a leaked row from a concurrently-running `async: true`
+   test when the assertion was a bare page-wide substring match — scoping to the actual test's
+   own row by DOM id removes that class of flake regardless of cause.
+
+**Verified**: `mix compile --warnings-as-errors` clean; real browser-equivalent check via curl
+against a running `mix phx.server` (stat cards, "Submit a document" card, reordered table,
+`Ref` column, and the collapsed `system status` `<details>` all present in the rendered HTML);
+`mix precommit` clean, 130 tests, run 3x back-to-back with no flake recurrence.
+
+## 2026-08-17 — `ReviewLive` now shows the original documents, not just extracted fields
+
+Real gap in the human-in-the-loop review flow, not cosmetic: a reviewer approving/rejecting a
+document_job could previously only see the agent's *extracted* fields and drafted explanation
+— never the actual source text the agent extracted them from. There was no way to catch the
+agent misreading the source, only to trust its output at face value, which undermines the
+entire point of a human checkpoint.
+
+**`Storage` gained a `read/1` callback** alongside the existing `store/2` (`LocalDisk.read/1`
+is `File.read/1` — `store/2` already returns an absolute path, so no dir-joining needed on
+read, mirroring how a future S3 adapter would round-trip the same key/URI it handed back from
+`store/2`). New `DocumentJobs.Actions.ReadDocuments` (`DocumentJobs.read_documents/1`) reads a
+document_job's stored files back through `Storage`, sorted by role; best-effort — a role whose
+file can't be read (moved, deleted, or a test fixture inserted with `document_paths: %{}`) is
+silently skipped rather than failing the whole read, since this is supplementary display for a
+human, not the pipeline's source of truth (`Agent.Run.read_documents/2` — a different,
+pre-existing function with the same name in a different module — still reads `document_paths`
+directly for the pipeline itself; not touched, not unified with this one, deliberately, since
+that's a separate refactor with its own tradeoffs, out of scope here).
+
+`ReviewLive` renders each stored document as its own card (`<pre>`, plain text — matches what's
+actually stored, no PDF rendering) above the extracted-fields comparison, so the reading order
+is source-document-first, extraction-second, which is the order a human actually verifies in.
+
+**Verified**: real end-to-end check against a running `mix phx.server` — `mix webhook.send
+clean-03` then `curl`'d `/document_jobs/6`, confirmed both the `contract` and `w9` cards render
+their real stored text (`VENDOR SERVICES AGREEMENT`, `FORM W-9`), not just a placeholder.
+`mix precommit` clean, 136 tests (130 prior + 6 new: 3 for `ReadDocuments`, 2 for
+`Storage.read/1`, 1 for `ReviewLive` rendering real stored documents). `mix dialyzer`: still 7
+errors, all pre-existing, none new from this change.
+
+## 2026-08-17 — dashboard rows now always link out, not just needs_review ones
+
+Follow-on gap from the "original documents" addition above: the dashboard's table only showed
+a "Review" link when a row's status was `:needs_review` — for every other status
+(`:received`, `:processing`, `:approved`, `:rejected`, `:failed`) there was simply no way to
+navigate into that row at all. That was fine when `ReviewLive` only showed approve/reject
+controls (nothing to do once a decision's made), but once it started showing the original
+stored documents too, that page became useful for *any* status, not just an awaiting-review
+one — and the dashboard's navigation didn't catch up. Fixed: every row now links to
+`/document_jobs/:id`, labeled "Review" when `:needs_review`, "View" otherwise.
+
+**Verified**: `mix precommit` clean, 136 tests — updated the existing dashboard test (which had
+explicitly asserted the *absence* of a link for non-`needs_review` rows) to assert the new
+labeled-link-on-every-row behavior instead of just deleting the coverage.
+
+## 2026-08-17 — Retry button on `ReviewLive` for a `:failed` document_job
+
+Prompted by a real failed row (`document_job #1`) surfacing in the dashboard, traced to
+`Instructor.Adapters.OpenAI.api_key/1` hitting a `case_clause: nil` — `OPENAI_API_KEY` wasn't
+configured yet at the time that job originally ran. Confirmed the pipeline itself was fine (a
+fresh `mix webhook.send` submission against the same running server came back `Approved`
+cleanly); the stale `Failed` row just had no way to be un-stuck, since `Agent.Run` always
+reports `:ok` even on failure — by design, to avoid an Oban retry replaying the whole pipeline
+and colliding with the checkpoint's unique `thread_id` constraint on a halt (see CLAUDE.md's
+"Agent-brain gotchas") — so nothing auto-retries a failure.
+
+**No new context logic needed.** A retry is just calling `AgentRuns.enqueue_trigger/1` again —
+the exact function `IngestWebhook.call/1` already calls for the original ingest. The
+document_job's `document_paths` and `document_type_slug` are still on the row and the files
+are still on disk, so re-triggering re-runs the full pipeline against the same stored
+documents; no re-upload, no new ingestion. `ReviewLive` gained a `"retry"` `handle_event` (one
+call to `AgentRuns.enqueue_trigger/1`, same shape as the existing `submit_decision/2` for
+approve/reject) and a `Retry` button shown only when `@document_job.status == :failed`; the
+generic "no longer awaiting review" message now excludes `:failed` too, since a failed row does
+have an available action.
+
+**Verified for real, not just via tests**: on the actual running dev server, the Retry button
+was confirmed present on `document_job #1`'s real page (`phx-click="retry"` in the rendered
+HTML), then the same `enqueue_trigger/1` call the button makes was run directly against it —
+job #1 went from `Failed` to `Approved` for real, now that `OPENAI_API_KEY` is correctly
+configured. `mix precommit` clean, 137 tests (136 prior + 1 new, covering both the button's
+conditional visibility and that clicking it enqueues `TriggerAgentRunWorker` via
+`assert_enqueued`).
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow

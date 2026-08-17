@@ -5,9 +5,13 @@ defmodule DocumentComplianceEngine.Storage do
   """
 
   @callback store(path :: String.t(), content :: binary()) :: {:ok, String.t()} | {:error, term()}
+  @callback read(path :: String.t()) :: {:ok, binary()} | {:error, term()}
 
   @spec store(String.t(), binary()) :: {:ok, String.t()} | {:error, term()}
   def store(path, content), do: adapter().store(path, content)
+
+  @spec read(String.t()) :: {:ok, binary()} | {:error, term()}
+  def read(path), do: adapter().read(path)
 
   defp adapter do
     Application.get_env(

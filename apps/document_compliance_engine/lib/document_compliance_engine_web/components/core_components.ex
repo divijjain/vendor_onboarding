@@ -463,7 +463,7 @@ defmodule DocumentComplianceEngineWeb.CoreComponents do
 
   def status_badge(assigns) do
     ~H"""
-    <span class={["badge", status_badge_class(@status)]}>{@status}</span>
+    <span class={["badge", status_badge_class(@status)]}>{humanize_status(@status)}</span>
     """
   end
 
@@ -472,6 +472,10 @@ defmodule DocumentComplianceEngineWeb.CoreComponents do
   defp status_badge_class(:rejected), do: "badge-error"
   defp status_badge_class(:failed), do: "badge-error"
   defp status_badge_class(_status), do: "badge-neutral"
+
+  defp humanize_status(status) do
+    status |> Atom.to_string() |> String.replace("_", " ") |> String.capitalize()
+  end
 
   @doc """
   Renders an MCP server's health-check result (`:up`/`:down`) as a colored badge.

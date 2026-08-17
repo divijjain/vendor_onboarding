@@ -22,7 +22,11 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
         {:error, :not_found} -> nil
       end
 
-    assign(socket, document_job: document_job, agent_run: agent_run)
+    assign(socket,
+      document_job: document_job,
+      agent_run: agent_run,
+      documents: DocumentJobs.read_documents(document_job)
+    )
   end
 
   @impl true
@@ -43,6 +47,21 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
 
   @impl true
   def handle_event("reject", _params, socket), do: submit_decision(socket, :rejected)
+
+  @impl true
+  def handle_event("retry", _params, socket) do
+    # Same `enqueue_trigger/1` the original webhook ingest uses — the
+    # stored documents and document_type_slug are already on the
+    # document_job row, so a retry is just running the pipeline again
+    # against them, not a new ingestion.
+    case AgentRuns.enqueue_trigger(socket.assigns.document_job.id) do
+      {:ok, _job} ->
+        {:noreply, put_flash(socket, :info, "Retry queued — the agent will run again shortly.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not queue retry: #{inspect(reason)}")}
+    end
+  end
 
   defp submit_decision(socket, decision) do
     document_job_id = socket.assigns.document_job.id
@@ -67,6 +86,15 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
           <.status_badge status={@document_job.status} />
         </:subtitle>
       </.header>
+
+      <div :if={@documents != []} class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div :for={{role, text} <- @documents} class="card bg-base-200 shadow">
+          <div class="card-body">
+            <h2 class="card-title capitalize">{role}</h2>
+            <pre class="whitespace-pre-wrap text-sm font-mono">{text}</pre>
+          </div>
+        </div>
+      </div>
 
       <div
         :if={@agent_run && (@agent_run.company_name || @agent_run.w9_company_name)}
@@ -100,7 +128,14 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
         <.button phx-click="reject">Reject</.button>
       </div>
 
-      <p :if={@document_job.status != :needs_review} class="text-sm text-base-content/70">
+      <div :if={@document_job.status == :failed} class="flex gap-2">
+        <.button phx-click="retry" variant="primary">Retry</.button>
+      </div>
+
+      <p
+        :if={@document_job.status not in [:needs_review, :failed]}
+        class="text-sm text-base-content/70"
+      >
         This document job is no longer awaiting review.
       </p>
     </Layouts.app>
