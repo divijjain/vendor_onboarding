@@ -2,8 +2,10 @@ defmodule Mix.Tasks.Eval.Run do
   @shortdoc "Runs the two-tier eval harness against the agent pipeline"
 
   @moduledoc """
-  Runs all 20 synthetic fixtures through the agent pipeline and prints a
-  per-fixture table plus per-bucket decision accuracy.
+  Runs every synthetic fixture across every document type
+  (`vendor_contract_w9` and `invoice` — see `Evals.Fixtures`) through the
+  agent pipeline and prints a per-fixture table plus per-document-type,
+  per-bucket decision accuracy.
 
   Needs OPENAI_API_KEY for the agents. The LLM-judge tier additionally
   needs ANTHROPIC_API_KEY and is skipped without it.
@@ -44,22 +46,26 @@ defmodule Mix.Tasks.Eval.Run do
 
   defp print_table(results) do
     IO.puts(
-      String.pad_trailing("fixture", 16) <>
-        String.pad_trailing("bucket", 12) <>
+      String.pad_trailing("fixture", 22) <>
+        String.pad_trailing("type", 22) <>
+        String.pad_trailing("bucket", 24) <>
         String.pad_trailing("decision", 14) <>
         String.pad_trailing("expected", 14) <>
         String.pad_trailing("entity_match", 14) <>
-        String.pad_trailing("tax_id_ok", 11) <> "error"
+        String.pad_trailing("tax_id_ok", 11) <>
+        String.pad_trailing("grounded", 10) <> "error"
     )
 
     Enum.each(results, fn r ->
       IO.puts(
-        String.pad_trailing(r.fixture.id, 16) <>
-          String.pad_trailing(r.fixture.bucket, 12) <>
+        String.pad_trailing(r.fixture.id, 22) <>
+          String.pad_trailing(r.fixture.document_type_slug, 22) <>
+          String.pad_trailing(r.fixture.bucket, 24) <>
           String.pad_trailing(to_string(r.decision), 14) <>
           String.pad_trailing(r.fixture.expected_decision, 14) <>
           String.pad_trailing(inspect(r.entity_match), 14) <>
-          String.pad_trailing(inspect(r.tax_id_verbatim_ok), 11) <> truncate(r.error)
+          String.pad_trailing(inspect(r.tax_id_verbatim_ok), 11) <>
+          String.pad_trailing(inspect(r.fields_grounded), 10) <> truncate(r.error)
       )
     end)
   end
@@ -79,8 +85,9 @@ defmodule Mix.Tasks.Eval.Run do
 
     results
     |> Run.bucket_accuracy()
-    |> Enum.each(fn {bucket, %{total: total, correct: correct}} ->
-      IO.puts("#{bucket}: decision correct #{correct}/#{total}")
+    |> Enum.sort()
+    |> Enum.each(fn {{slug, bucket}, %{total: total, correct: correct}} ->
+      IO.puts("#{slug}/#{bucket}: decision correct #{correct}/#{total}")
     end)
   end
 

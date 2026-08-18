@@ -1,41 +1,83 @@
 defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
   @moduledoc """
-  55 synthetic vendor-document_job document pairs, deliberately structured
-  into four buckets (not randomly generated) so the eval's bucket counts
-  are auditable — see CONTEXT.md's evaluation design. Grown from an
-  original 20 (10/5/3/2) specifically to give the two thinnest buckets —
-  formatting and malformed — enough cases that a single failure doesn't
-  swing that bucket's accuracy by 33-50 points; still not a rigorous
-  benchmark-scale set, just past the point where the numbers were mostly
-  noise (see CONTEXT.md's dated entry on the expansion).
+  Synthetic document_job fixtures, deliberately structured into buckets
+  (not randomly generated) so the eval's bucket counts are auditable — see
+  CONTEXT.md's evaluation design. Spans two document types, proven
+  document-type-generic the same way the pipeline itself was: `all/0` is
+  every fixture across both, but `vendor_contract_w9/0` and `invoice/0`
+  are each independently meaningful (and independently run — see
+  `Evals.Run`).
+
+  **`vendor_contract_w9`** — 55 fixtures, grown from an original 20
+  (10/5/3/2) specifically to give the two thinnest buckets — formatting
+  and malformed — enough cases that a single failure doesn't swing that
+  bucket's accuracy by 33-50 points; still not a rigorous benchmark-scale
+  set, just past the point where the numbers were mostly noise (see
+  CONTEXT.md's dated entry on the expansion).
 
     20 clean               -> should auto-approve
     15 genuine mismatch    -> should flag (true positives)
     12 formatting-only     -> NOT a real mismatch (tests false-positive rate)
      8 missing/malformed   -> tests graceful degradation
+
+  **`invoice`** — 14 fixtures, sized to what the type's actual rule
+  surface can meaningfully exercise (one business rule — `screen_vendor`
+  — plus the two automatic checks every document type gets for free:
+  `Checks.grounded_extraction_checks/3` and
+  `Checks.extraction_completeness_checks/1`, see CONTEXT.md's dated entry
+  on why those exist):
+
+     6 clean               -> should auto-approve
+     2 sanctions hit        -> should flag (the two names the mock
+                               `sanctions_db` server actually watchlists —
+                               see `SanctionsDb.Server`'s `@sanctioned_names`,
+                               not invented, so a real eval run's result is
+                               a genuine pass/fail against that mock, not a
+                               coin flip)
+     3 malformed            -> vendor name present and grounded, but most
+                               other fields genuinely absent from the
+                               source — tests `extraction_completeness`
+     3 wrong document type  -> not an invoice at all (résumé/cover-letter
+                               shaped text) — tests the shape gate
+                               (`Extraction.shape_matches?/2`) catches it
+                               *before* any extraction call, zero LLM cost.
+                               This bucket exists because of a real
+                               incident, not a hypothetical: an uploaded
+                               résumé was extracted into a fully fabricated
+                               invoice before this check existed — see
+                               CONTEXT.md's dated entry.
   """
 
   defmodule Fixture do
     @moduledoc false
-    @enforce_keys [:id, :bucket, :contract_text, :w9_text, :expected_decision]
+    @enforce_keys [:id, :bucket, :document_type_slug, :documents, :expected_decision]
     defstruct [
       :id,
       :bucket,
-      :contract_text,
-      :w9_text,
+      :document_type_slug,
+      :documents,
       :expected_decision,
-      # nil where the check doesn't meaningfully apply (e.g. malformed docs).
+      # nil where the check doesn't meaningfully apply (malformed w9 docs,
+      # or any invoice fixture — invoice has no entity-match concept).
       :expected_entity_match
     ]
 
     @type t :: %__MODULE__{
             id: String.t(),
             bucket: String.t(),
-            contract_text: String.t(),
-            w9_text: String.t(),
+            document_type_slug: String.t(),
+            documents: %{String.t() => String.t()},
             expected_decision: String.t(),
             expected_entity_match: boolean() | nil
           }
+  end
+
+  @spec all() :: [Fixture.t()]
+  def all, do: vendor_contract_w9() ++ invoice()
+
+  @spec vendor_contract_w9() :: [Fixture.t()]
+  def vendor_contract_w9 do
+    w9_clean() ++ w9_mismatch() ++ w9_formatting() ++ w9_malformed()
   end
 
   # --- 20 clean: contract and W-9 name match exactly, EIN well-formed ---
@@ -119,47 +161,49 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
     {"Ashgrove Print Shop", "", ""}
   ]
 
-  @spec all() :: [Fixture.t()]
-  def all do
-    clean() ++ mismatch() ++ formatting() ++ malformed()
-  end
-
-  defp clean do
+  defp w9_clean do
     @clean
     |> Enum.with_index(1)
     |> Enum.map(fn {{name, tax_id, terms, liability}, i} ->
       %Fixture{
         id: "clean-#{pad(i)}",
         bucket: "clean",
-        contract_text: contract_text(name, terms, liability),
-        w9_text: w9_text(name, tax_id),
+        document_type_slug: "vendor_contract_w9",
+        documents: %{
+          "contract" => contract_text(name, terms, liability),
+          "w9" => w9_text(name, tax_id)
+        },
         expected_entity_match: true,
         expected_decision: "approved"
       }
     end)
   end
 
-  defp mismatch do
-    build_pairs(@mismatch, "mismatch", expected_entity_match: false, decision: "needs_review")
+  defp w9_mismatch do
+    w9_pairs(@mismatch, "mismatch", expected_entity_match: false, decision: "needs_review")
   end
 
-  defp formatting do
-    build_pairs(@formatting, "formatting", expected_entity_match: true, decision: "approved")
+  defp w9_formatting do
+    w9_pairs(@formatting, "formatting", expected_entity_match: true, decision: "approved")
   end
 
-  defp malformed do
-    build_pairs(@malformed, "malformed", expected_entity_match: nil, decision: "needs_review")
+  defp w9_malformed do
+    w9_pairs(@malformed, "malformed", expected_entity_match: nil, decision: "needs_review")
   end
 
-  defp build_pairs(rows, bucket, opts) do
+  defp w9_pairs(rows, bucket, opts) do
     rows
     |> Enum.with_index(1)
     |> Enum.map(fn {{contract_name, w9_name, tax_id}, i} ->
       %Fixture{
         id: "#{bucket}-#{pad(i)}",
         bucket: bucket,
-        contract_text: contract_text(contract_name, "Net 30", "Standard indemnification clause."),
-        w9_text: w9_text(w9_name, tax_id),
+        document_type_slug: "vendor_contract_w9",
+        documents: %{
+          "contract" =>
+            contract_text(contract_name, "Net 30", "Standard indemnification clause."),
+          "w9" => w9_text(w9_name, tax_id)
+        },
         expected_entity_match: opts[:expected_entity_match],
         expected_decision: opts[:decision]
       }
@@ -186,6 +230,143 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
 
     1. Name of entity: #{company_name}
     2. Taxpayer Identification Number (EIN): #{tax_id}
+    """
+  end
+
+  @spec invoice() :: [Fixture.t()]
+  def invoice do
+    invoice_clean() ++ invoice_sanctions_hit() ++ invoice_malformed() ++ invoice_wrong_type()
+  end
+
+  @invoice_clean [
+    {"Acme Corp", "INV-1001", "1,000.00", "2026-09-01"},
+    {"Blue Ridge Logistics Inc.", "INV-1002", "2,450.50", "2026-09-15"},
+    {"Summit Peak Freight LLC", "INV-1003", "875.00", "2026-10-01"},
+    {"Golden Gate Supplies Co.", "INV-1004", "12,300.00", "2026-08-30"},
+    {"Northwind Traders Ltd.", "INV-1005", "540.25", "2026-09-20"},
+    {"Pioneer Manufacturing Inc.", "INV-1006", "3,200.00", "2026-10-05"}
+  ]
+
+  # The exact two names `SanctionsDb.Server`'s mock watchlist flags
+  # (case-insensitive, trimmed exact match — not fuzzy, so these have to
+  # be the real values, not invented ones a real eval run would just
+  # happen to pass).
+  @invoice_sanctioned ["Rogue Exports LLC", "North Star Trading Co"]
+
+  defp invoice_clean do
+    @invoice_clean
+    |> Enum.with_index(1)
+    |> Enum.map(fn {{vendor, invoice_number, amount, due_date}, i} ->
+      %Fixture{
+        id: "invoice-clean-#{pad(i)}",
+        bucket: "invoice_clean",
+        document_type_slug: "invoice",
+        documents: %{"invoice" => invoice_text(vendor, invoice_number, amount, due_date)},
+        expected_decision: "approved"
+      }
+    end)
+  end
+
+  defp invoice_sanctions_hit do
+    @invoice_sanctioned
+    |> Enum.with_index(1)
+    |> Enum.map(fn {vendor, i} ->
+      %Fixture{
+        id: "invoice-sanctions-#{pad(i)}",
+        bucket: "invoice_sanctions_hit",
+        document_type_slug: "invoice",
+        documents: %{
+          "invoice" => invoice_text(vendor, "INV-20#{i}0", "999.99", "2026-09-30")
+        },
+        expected_decision: "needs_review"
+      }
+    end)
+  end
+
+  @invoice_malformed ["Fairview Trading Co.", "Redstone Analytics Inc.", "Coldwater Freight LLC"]
+
+  defp invoice_malformed do
+    @invoice_malformed
+    |> Enum.with_index(1)
+    |> Enum.map(fn {vendor, i} ->
+      %Fixture{
+        id: "invoice-malformed-#{pad(i)}",
+        bucket: "invoice_malformed",
+        document_type_slug: "invoice",
+        documents: %{
+          "invoice" => """
+          INVOICE
+
+          Vendor: #{vendor}
+
+          (Remaining invoice details are illegible in the scanned copy.)
+          """
+        },
+        expected_decision: "needs_review"
+      }
+    end)
+  end
+
+  # Real, unrelated document text (a cover letter, a résumé excerpt, an
+  # email) — deliberately not invoice-shaped at all, mirroring the actual
+  # incident (see moduledoc). None of these mention "invoice", "bill to",
+  # or "amount due" more than once, so all three sit well under
+  # `invoice`'s seeded `shape_signals` threshold of 2.
+  @invoice_wrong_type [
+    """
+    Dear Hiring Manager,
+
+    I am writing to express my enthusiasm for the Software Engineer
+    position. As a developer who values discipline, accountability, and
+    continuous improvement, I believe I would be a strong addition to
+    your team.
+
+    Sincerely,
+    A Candidate
+    """,
+    """
+    Senior Software Engineer | Example Corp, Remote
+
+    - Developed a fintech payment application driving a total daily
+      volume of $50M - $100M integrated across the company's ecosystem.
+    - Led cross-functional engineering teams to deliver full-stack
+      products and high-volume financial applications.
+    """,
+    """
+    Hi team,
+
+    Quick update on this week's sprint: we shipped the new dashboard
+    and fixed the flaky CI job. Vendor onboarding for the analytics
+    integration is still pending legal review.
+
+    Thanks,
+    Project Lead
+    """
+  ]
+
+  defp invoice_wrong_type do
+    @invoice_wrong_type
+    |> Enum.with_index(1)
+    |> Enum.map(fn {text, i} ->
+      %Fixture{
+        id: "invoice-wrong-type-#{pad(i)}",
+        bucket: "invoice_wrong_type",
+        document_type_slug: "invoice",
+        documents: %{"invoice" => text},
+        expected_decision: "needs_review"
+      }
+    end)
+  end
+
+  defp invoice_text(vendor, invoice_number, amount, due_date) do
+    """
+    INVOICE
+
+    Bill To: Buyer Inc.
+    Vendor: #{vendor}
+    Invoice Number: #{invoice_number}
+    Amount Due: #{amount}
+    Due Date: #{due_date}
     """
   end
 end

@@ -25,7 +25,8 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
     assign(socket,
       document_job: document_job,
       agent_run: agent_run,
-      documents: DocumentJobs.read_documents(document_job)
+      documents: DocumentJobs.read_documents(document_job),
+      review_decisions: AgentRuns.list_review_decisions(id)
     )
   end
 
@@ -43,10 +44,13 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
   end
 
   @impl true
-  def handle_event("approve", _params, socket), do: submit_decision(socket, :approved)
-
-  @impl true
-  def handle_event("reject", _params, socket), do: submit_decision(socket, :rejected)
+  def handle_event(
+        "submit_decision",
+        %{"decision" => decision, "reviewer" => reviewer, "rationale" => rationale},
+        socket
+      ) do
+    submit_decision(socket, String.to_existing_atom(decision), reviewer, rationale)
+  end
 
   @impl true
   def handle_event("retry", _params, socket) do
@@ -63,13 +67,34 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
     end
   end
 
-  defp submit_decision(socket, decision) do
+  # Flattens `extraction_metadata` into displayable rows, dropping fields
+  # with nothing to show (a shape-gate-skipped field has both confidence
+  # and source_quote nil — genuinely not attempted, not worth a row).
+  defp extraction_rows(extraction_metadata) do
+    for {role, fields} <- extraction_metadata,
+        {field, %{"confidence" => confidence, "source_quote" => source_quote}} <- fields,
+        not is_nil(confidence) or source_quote not in [nil, ""] do
+      %{role: role, field: field, confidence: confidence, source_quote: source_quote}
+    end
+  end
+
+  defp format_confidence(nil), do: "confidence n/a"
+  defp format_confidence(confidence), do: "#{round(confidence * 100)}% confidence"
+
+  defp confidence_class(confidence) when is_number(confidence) and confidence < 0.7,
+    do: "text-error font-semibold"
+
+  defp confidence_class(_confidence), do: "text-success"
+
+  defp submit_decision(socket, decision, reviewer, rationale) do
     document_job_id = socket.assigns.document_job.id
 
-    case AgentRuns.resume_review(document_job_id, decision) do
+    case AgentRuns.resume_review(document_job_id, decision, reviewer, rationale) do
       {:ok, _document_job} ->
         {:noreply,
-         put_flash(socket, :info, "Decision submitted — waiting for the agent to resume.")}
+         socket
+         |> assign(review_decisions: AgentRuns.list_review_decisions(document_job_id))
+         |> put_flash(:info, "Decision submitted — waiting for the agent to resume.")}
 
       {:error, reason} ->
         {:noreply, put_flash(socket, :error, "Could not submit decision: #{inspect(reason)}")}
@@ -119,14 +144,51 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
         </.list>
       </div>
 
+      <div :if={@agent_run} class="mt-2">
+        <% rows = extraction_rows(@agent_run.extraction_metadata) %>
+        <div :if={rows != []}>
+          <h2 class="text-lg font-semibold mb-2">Extraction confidence &amp; source grounding</h2>
+          <div :for={row <- rows} class="text-sm mb-2">
+            <span class="font-semibold capitalize">{row.role} — {row.field}:</span>
+            <span class={confidence_class(row.confidence)}>{format_confidence(row.confidence)}</span>
+            <p :if={row.source_quote && row.source_quote != ""} class="text-xs opacity-70 italic ml-2">
+              "{row.source_quote}"
+            </p>
+          </div>
+        </div>
+      </div>
+
       <.list>
         <:item title="Agent's explanation">{@agent_run && @agent_run.explanation}</:item>
       </.list>
 
-      <div :if={@document_job.status == :needs_review} class="flex gap-2">
-        <.button phx-click="approve" variant="primary">Approve</.button>
-        <.button phx-click="reject">Reject</.button>
-      </div>
+      <form
+        :if={@document_job.status == :needs_review}
+        id="review-decision-form"
+        phx-submit="submit_decision"
+        class="flex flex-col gap-2 max-w-md"
+      >
+        <.input
+          type="text"
+          name="reviewer"
+          value=""
+          label="Reviewer"
+          placeholder="Your name"
+          required
+        />
+        <.input
+          type="textarea"
+          name="rationale"
+          value=""
+          label="Rationale"
+          placeholder="Why are you approving or rejecting this?"
+          required
+        />
+        <div class="flex gap-2">
+          <.button name="decision" value="approved" variant="primary">Approve</.button>
+          <.button name="decision" value="rejected">Reject</.button>
+        </div>
+      </form>
 
       <div :if={@document_job.status == :failed} class="flex gap-2">
         <.button phx-click="retry" variant="primary">Retry</.button>
@@ -138,6 +200,23 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
       >
         This document job is no longer awaiting review.
       </p>
+
+      <div :if={@review_decisions != []} class="mt-6">
+        <h2 class="text-lg font-semibold mb-2">Review history</h2>
+        <div :for={decision <- @review_decisions} class="card bg-base-200 shadow mb-2">
+          <div class="card-body py-3">
+            <div class="flex items-center gap-2 text-sm">
+              <span class="font-semibold capitalize">{decision.decision}</span>
+              <span class="opacity-70">by {decision.reviewer}</span>
+              <span class="opacity-50 text-xs">{decision.inserted_at}</span>
+            </div>
+            <p class="text-sm"><span class="font-semibold">Rationale:</span> {decision.rationale}</p>
+            <p :if={decision.evidence} class="text-sm opacity-70">
+              <span class="font-semibold">Evidence at the time:</span> {decision.evidence}
+            </p>
+          </div>
+        </div>
+      </div>
     </Layouts.app>
     """
   end

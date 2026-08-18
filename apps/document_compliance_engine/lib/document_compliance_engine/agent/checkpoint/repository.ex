@@ -16,6 +16,16 @@ defmodule DocumentComplianceEngine.Agent.Checkpoint.Repository do
     |> Repo.insert()
   end
 
+  @doc "Removes any existing checkpoint for a thread_id, if one exists."
+  @spec delete_by_thread_id(String.t()) :: :ok
+  def delete_by_thread_id(thread_id) do
+    RunCheckpoint
+    |> where([c], c.thread_id == ^thread_id)
+    |> Repo.delete_all()
+
+    :ok
+  end
+
   @spec get_by_thread_id(String.t()) :: {:ok, RunCheckpoint.t()} | {:error, :not_found}
   def get_by_thread_id(thread_id) do
     RunCheckpoint

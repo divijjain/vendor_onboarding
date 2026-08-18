@@ -26,6 +26,11 @@ defmodule DocumentComplianceEngine.AgentRuns.Schema.AgentRun do
     # columns above (e.g. `invoice`), keyed by role: %{"invoice" => %{...}}.
     # Never a home for PII — Tax ID stays on its own encrypted column only.
     field :extracted_fields, :map, default: %{}
+    # Per-field confidence + source-location grounding, keyed the same way
+    # as `extracted_fields`: %{role => %{field => %{"confidence" => f,
+    # "source_quote" => s}}}. Tax ID is excluded here too, for the same
+    # reason — see `Agent.Run.stringify_metadata/1`.
+    field :extraction_metadata, :map, default: %{}
 
     timestamps(type: :utc_datetime)
   end
@@ -42,6 +47,7 @@ defmodule DocumentComplianceEngine.AgentRuns.Schema.AgentRun do
           liability_clauses: String.t() | nil,
           explanation: String.t() | nil,
           extracted_fields: %{optional(String.t()) => map()},
+          extraction_metadata: %{optional(String.t()) => map()},
           inserted_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil
         }
@@ -65,7 +71,8 @@ defmodule DocumentComplianceEngine.AgentRuns.Schema.AgentRun do
       :payment_terms,
       :liability_clauses,
       :explanation,
-      :extracted_fields
+      :extracted_fields,
+      :extraction_metadata
     ])
     |> validate_required([:status])
   end

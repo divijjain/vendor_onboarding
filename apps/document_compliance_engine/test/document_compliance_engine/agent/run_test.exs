@@ -22,13 +22,19 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     :ok
   end
 
+  # Matches `AgentFakes.contract/1`/`w9/1`'s fake extracted values verbatim
+  # — required now that the reactor's groundedness check (see checks.ex)
+  # halts any run whose extracted fields don't appear in these documents.
+  @contract_text "Contract with Acme Corp. Payment Terms: Net 30. Liability: Standard."
+  @w9_text "Form W-9. Name of entity: Acme Corp. EIN: 12-3456789."
+
   defp write_documents(context) do
     dir = System.tmp_dir!() |> Path.join("agent_run_test_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     contract_path = Path.join(dir, "contract.pdf")
     w9_path = Path.join(dir, "w9.pdf")
-    File.write!(contract_path, "contract text")
-    File.write!(w9_path, "w9 text")
+    File.write!(contract_path, @contract_text)
+    File.write!(w9_path, @w9_text)
     on_exit(fn -> File.rm_rf!(dir) end)
 
     Map.put(context, :document_paths, %{"contract" => contract_path, "w9" => w9_path})
@@ -51,6 +57,48 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     assert payload["tax_id"] == "12-3456789"
   end
 
+  test "reports confidence + source_quote for non-PII fields, but never for Tax ID", %{
+    document_paths: paths
+  } do
+    stub_defaults(
+      extract: fn
+        "contract", _schema, _text ->
+          {:ok, contract(), %{company_name: %{confidence: 0.9, source_quote: "Acme Corp"}}}
+
+        "w9", _schema, _text ->
+          # The fake deliberately DOES supply tax_id metadata here — with a
+          # real source_quote containing the raw Tax ID — so this test
+          # proves the exclusion actively strips it, not that it merely
+          # happens to be absent.
+          {:ok, w9(),
+           %{
+             company_name: %{confidence: 0.85, source_quote: "Acme Corp"},
+             tax_id: %{confidence: 1.0, source_quote: "12-3456789"}
+           }}
+      end
+    )
+
+    trigger(20, paths)
+
+    assert_received {:callback, payload}
+    assert payload["status"] == "approved"
+
+    assert payload["extraction_metadata"]["contract"]["company_name"] == %{
+             "confidence" => 0.9,
+             "source_quote" => "Acme Corp"
+           }
+
+    assert payload["extraction_metadata"]["w9"]["company_name"] == %{
+             "confidence" => 0.85,
+             "source_quote" => "Acme Corp"
+           }
+
+    # The Tax ID's own confidence/source_quote must never reach this
+    # (unencrypted) column — see `Agent.Run.stringify_metadata/1`.
+    refute Map.has_key?(payload["extraction_metadata"]["w9"], "tax_id")
+    refute inspect(payload["extraction_metadata"]) =~ "12-3456789"
+  end
+
   test "routes a %PDF- prefixed document through pdf_to_text before extraction", %{
     document_paths: paths
   } do
@@ -62,8 +110,8 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     stub_defaults(
       pdf_to_text_fun: fn bytes ->
         if bytes == contract_pdf_bytes,
-          do: {:ok, "text pdftotext extracted"},
-          else: {:ok, "w9 text"}
+          do: {:ok, "pdftotext output: " <> @contract_text},
+          else: {:ok, @w9_text}
       end,
       extract: fn
         "contract", _schema, text ->
@@ -79,7 +127,7 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
 
     trigger(19, paths)
 
-    assert_received {:contract_text_seen, "text pdftotext extracted"}
+    assert_received {:contract_text_seen, "pdftotext output: " <> _}
     assert_received {:callback, payload}
     assert payload["status"] == "approved"
   end
@@ -105,7 +153,61 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     assert {:ok, checkpoint} = Repository.get_by_thread_id("document_job-9")
     assert checkpoint.document_job_id == 9
     assert checkpoint.status == :awaiting_review
-    assert checkpoint.inputs["documents"]["contract"] == "contract text"
+    assert checkpoint.inputs["documents"]["contract"] == @contract_text
+  end
+
+  test "truncates a long halt explanation so it fits agent_runs.explanation's varchar(255)", %{
+    document_paths: paths
+  } do
+    long_explanation =
+      "The validation of the document job revealed " <> String.duplicate("x", 300)
+
+    stub_defaults(
+      extract: fn
+        "w9", _schema, _text -> {:ok, w9(%{company_name: "Totally Different LLC"})}
+        role, schema, text -> extract(role, schema, text)
+      end,
+      draft_explanation: fn _findings -> long_explanation end
+    )
+
+    trigger(21, paths)
+
+    assert_received {:callback, payload}
+    assert payload["status"] == "needs_review"
+    assert byte_size(payload["explanation"]) <= 255
+
+    # The full, untruncated explanation is still what gets checkpointed —
+    # only the copy written to agent_runs' varchar(255) column is trimmed.
+    assert {:ok, checkpoint} = Repository.get_by_thread_id("document_job-21")
+    assert checkpoint.explanation == long_explanation
+  end
+
+  test "a second halt for the same document_job supersedes a stale, unresolved checkpoint", %{
+    document_paths: paths
+  } do
+    stub_defaults(
+      extract: fn
+        "w9", _schema, _text -> {:ok, w9(%{company_name: "Totally Different LLC"})}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
+
+    # Simulates an earlier attempt that halted and checkpointed but was
+    # never resumed (e.g. the process was killed before review happened) —
+    # thread_id is deterministic per document_job_id, so a fresh run for
+    # the same document_job reuses it.
+    trigger(22, paths)
+    assert_received {:callback, _first_halt}
+    assert {:ok, stale_checkpoint} = Repository.get_by_thread_id("document_job-22")
+
+    trigger(22, paths)
+
+    assert_received {:callback, payload}
+    assert payload["status"] == "needs_review"
+    assert payload["thread_id"] == "document_job-22"
+
+    assert {:ok, fresh_checkpoint} = Repository.get_by_thread_id("document_job-22")
+    assert fresh_checkpoint.id != stale_checkpoint.id
   end
 
   test "resumes a persisted checkpoint with the human's decision", %{document_paths: paths} do

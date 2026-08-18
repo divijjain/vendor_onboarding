@@ -2,18 +2,26 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   @moduledoc """
   Eval harness — drives the reactor directly, bypassing Phoenix, so
   agent-quality eval is isolated from integration latency/correctness
-  (CONTEXT.md's evaluation-design decision). Still reads the real
-  `vendor_contract_w9` `DocumentType` row (extraction schema + validation
-  rules) via `DocumentTypes`, rather than duplicating that config here, so
-  the harness can't silently drift from what production actually runs.
+  (CONTEXT.md's evaluation-design decision). Reads each fixture's own real
+  `DocumentType` row (extraction schema + validation rules + shape
+  signals) via `DocumentTypes`, rather than duplicating that config here,
+  so the harness can't silently drift from what production actually runs
+  — genuinely document-type-generic, not hardcoded to one slug: a fixture
+  carries its own `document_type_slug`, so `run_all/2` can be handed a mix
+  of `vendor_contract_w9` and `invoice` fixtures (or any future type) in
+  one pass.
 
   Two tiers:
     - Deterministic (always runs, no judge key needed): Tax ID
-      verbatim-in-source, and whether the run completed at all (graceful
-      degradation on the malformed bucket).
+      verbatim-in-source (`vendor_contract_w9` only), whether *every*
+      extracted field across every role is grounded in its source
+      document (any type — reuses `Agent.Checks.grounded_extraction_checks/3`,
+      the same check that gates the live pipeline), and whether the run
+      completed at all (graceful degradation on the malformed buckets).
     - LLM-judge (Claude Sonnet, only if ANTHROPIC_API_KEY is set):
-      entity-mapping correctness under formatting variation, and
-      groundedness of drafted mismatch explanations.
+      entity-mapping correctness under formatting variation
+      (`vendor_contract_w9` only — invoice has no entity-match concept),
+      and groundedness of drafted mismatch explanations (any type).
 
   The agents themselves need OPENAI_API_KEY regardless of the judge tier.
 
@@ -24,8 +32,6 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   alias DocumentComplianceEngine.Agent.{Checks, DocumentReactor}
   alias DocumentComplianceEngine.DocumentTypes
 
-  @document_type_slug "vendor_contract_w9"
-
   defmodule Result do
     @moduledoc false
     defstruct [
@@ -33,6 +39,7 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       :decision,
       :entity_match,
       :tax_id_verbatim_ok,
+      :fields_grounded,
       :explanation,
       :findings,
       :error
@@ -44,58 +51,61 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   @spec run_all([Fixtures.Fixture.t()], keyword()) :: [%Result{}]
   def run_all(fixtures \\ Fixtures.all(), opts \\ []) do
     reactor = Keyword.get(opts, :reactor, DocumentReactor)
-    document_type = Keyword.get_lazy(opts, :document_type, &fetch_document_type!/0)
 
     fixtures
-    # Bounded, not unbounded — 20 fixtures fired at once against a real
+    # Bounded, not unbounded — firing every fixture at once against a real
     # account risks tripping rate limits for no benefit.
-    |> Task.async_stream(&run_fixture(&1, reactor, document_type),
+    |> Task.async_stream(&run_fixture(&1, reactor),
       max_concurrency: Keyword.get(opts, :concurrency, @concurrency),
       timeout: :infinity
     )
     |> Enum.map(fn {:ok, result} -> result end)
   end
 
-  defp fetch_document_type! do
-    DocumentTypes.get_document_type_by_slug(@document_type_slug) ||
-      raise "document type #{@document_type_slug} is not seeded"
+  defp fetch_document_type!(slug) do
+    DocumentTypes.get_document_type_by_slug(slug) || raise "document type #{slug} is not seeded"
   end
 
   @spec run_fixture(Fixtures.Fixture.t(), module(), DocumentTypes.Schema.DocumentType.t() | nil) ::
           %Result{}
   def run_fixture(fixture, reactor \\ DocumentReactor, document_type \\ nil) do
-    document_type = document_type || fetch_document_type!()
+    document_type = document_type || fetch_document_type!(fixture.document_type_slug)
 
     inputs = %{
-      document_type_slug: document_type.slug,
-      documents: %{"contract" => fixture.contract_text, "w9" => fixture.w9_text},
+      document_type_slug: fixture.document_type_slug,
+      documents: fixture.documents,
       extraction_schema: document_type.extraction_schema,
       validation_rules: document_type.validation_rules,
+      shape_signals: document_type.shape_signals,
       human_decision: nil
     }
 
     reactor
     |> Reactor.run(inputs)
-    |> to_result(fixture)
+    |> to_result(fixture, document_type)
   end
 
-  defp to_result({:ok, final}, fixture) do
+  defp to_result({:ok, final}, fixture, document_type) do
     tax_id = get_in(final.extracted, ["w9", :tax_id])
 
     %Result{
       fixture: fixture,
       decision: "approved",
-      # Approval requires the entity check to have passed, so it's known
-      # true here without re-reading the (completed) validation step.
-      entity_match: true,
-      tax_id_verbatim_ok: Deterministic.tax_id_verbatim?(tax_id, fixture.w9_text)
+      # Approval requires every configured rule to have passed, so an
+      # entity_match rule (when this type has one) is known true here
+      # without re-reading the (completed) validation step.
+      entity_match: if(fixture.expected_entity_match != nil, do: true),
+      tax_id_verbatim_ok: tax_id_verbatim_ok(fixture, tax_id),
+      fields_grounded: fields_grounded?(final.extracted, fixture, document_type)
     }
   end
 
-  defp to_result({:halted, reactor}, fixture) do
+  defp to_result({:halted, reactor}, fixture, document_type) do
     results = reactor.intermediate_results || %{}
     validation = results[:validate]
-    tax_id = get_in(results[:extract] || %{}, ["w9", :tax_id])
+    extract_result = results[:extract] || %{}
+    extracted = extract_result[:fields] || %{}
+    tax_id = get_in(extracted, ["w9", :tax_id])
 
     explanation =
       case results[:gate] do
@@ -110,28 +120,40 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       fixture: fixture,
       decision: "needs_review",
       entity_match: entity_match_check && entity_match_check.passed,
-      tax_id_verbatim_ok: tax_id && Deterministic.tax_id_verbatim?(tax_id, fixture.w9_text),
+      tax_id_verbatim_ok: tax_id_verbatim_ok(fixture, tax_id),
+      fields_grounded: fields_grounded?(extracted, fixture, document_type),
       explanation: explanation,
       findings: validation && Checks.describe_findings(validation)
     }
   end
 
-  defp to_result({:error, reason}, fixture) do
+  defp to_result({:error, reason}, fixture, _document_type) do
     # Graceful degradation is itself a measured outcome, not a harness
-    # crash — exactly what the malformed bucket tests for.
+    # crash — exactly what the malformed buckets test for.
     %Result{fixture: fixture, error: inspect(reason)}
   end
 
-  @doc "Per-bucket decision accuracy."
+  defp tax_id_verbatim_ok(fixture, tax_id) do
+    case Map.get(fixture.documents, "w9") do
+      nil -> nil
+      w9_text -> Deterministic.tax_id_verbatim?(tax_id, w9_text)
+    end
+  end
+
+  defp fields_grounded?(extracted, fixture, document_type) do
+    Deterministic.fields_grounded?(extracted, fixture.documents, document_type.shape_signals)
+  end
+
+  @doc "Per document-type, per-bucket decision accuracy."
   @spec bucket_accuracy([%Result{}]) :: %{
-          String.t() => %{total: pos_integer(), correct: non_neg_integer()}
+          {String.t(), String.t()} => %{total: pos_integer(), correct: non_neg_integer()}
         }
   def bucket_accuracy(results) do
     results
-    |> Enum.group_by(& &1.fixture.bucket)
-    |> Map.new(fn {bucket, bucket_results} ->
+    |> Enum.group_by(&{&1.fixture.document_type_slug, &1.fixture.bucket})
+    |> Map.new(fn {key, bucket_results} ->
       correct = Enum.count(bucket_results, &(&1.decision == &1.fixture.expected_decision))
-      {bucket, %{total: length(bucket_results), correct: correct}}
+      {key, %{total: length(bucket_results), correct: correct}}
     end)
   end
 
@@ -149,26 +171,31 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
           groundedness: %{scores: [float()], errors: [term()]}
         }
   def judge_scores(results) do
-    scorable =
-      Enum.filter(results, fn r ->
+    # Entity-match is only meaningful for fixtures with a known expected
+    # match/mismatch — today, only `vendor_contract_w9`. Invoice fixtures
+    # never set `expected_entity_match`, so this filter naturally excludes
+    # them without needing a document-type branch here.
+    entity_match =
+      results
+      |> Enum.filter(fn r ->
         is_nil(r.error) and not is_nil(r.entity_match) and
           not is_nil(r.fixture.expected_entity_match)
       end)
-
-    entity_match =
-      scorable
       |> Enum.map(fn r ->
         Judge.entity_match(
-          r.fixture.contract_text,
-          r.fixture.w9_text,
+          r.fixture.documents["contract"],
+          r.fixture.documents["w9"],
           r.entity_match,
           r.fixture.expected_entity_match
         )
       end)
       |> partition_judge_results()
 
+    # Groundedness of a drafted explanation is generic — any document
+    # type that halted with an explanation qualifies, not just
+    # `vendor_contract_w9`.
     groundedness =
-      scorable
+      results
       |> Enum.filter(&(not is_nil(&1.explanation) and not is_nil(&1.findings)))
       |> Enum.map(&Judge.groundedness(&1.findings, &1.explanation))
       |> partition_judge_results()

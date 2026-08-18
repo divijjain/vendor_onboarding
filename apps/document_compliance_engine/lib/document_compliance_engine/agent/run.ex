@@ -36,6 +36,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
         documents: documents,
         extraction_schema: document_type.extraction_schema,
         validation_rules: document_type.validation_rules,
+        shape_signals: document_type.shape_signals,
         human_decision: nil
       }
 
@@ -93,6 +94,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
       documents: checkpoint.inputs["documents"],
       extraction_schema: checkpoint.inputs["extraction_schema"],
       validation_rules: checkpoint.inputs["validation_rules"],
+      shape_signals: checkpoint.inputs["shape_signals"] || %{},
       human_decision: decision
     }
   end
@@ -101,36 +103,48 @@ defmodule DocumentComplianceEngine.Agent.Run do
     report(
       Map.merge(
         %{"document_job_id" => document_job_id, "status" => result.status},
-        extracted_payload(result.extracted)
+        extracted_payload(result.extracted, result.extraction_metadata)
       )
     )
   end
 
   defp handle_result({:halted, reactor}, document_job_id, inputs) do
-    {extracted, explanation} = halted_details(reactor)
+    {extracted, extraction_metadata, explanation} = halted_details(reactor)
+    thread_id = thread_id_for(document_job_id)
 
-    Repository.insert(%{
-      thread_id: thread_id_for(document_job_id),
-      document_job_id: document_job_id,
-      reactor_state: :erlang.term_to_binary(reactor),
-      inputs: %{
-        "document_type_slug" => inputs.document_type_slug,
-        "documents" => inputs.documents,
-        "extraction_schema" => inputs.extraction_schema,
-        "validation_rules" => inputs.validation_rules
-      },
-      explanation: explanation
-    })
+    # thread_id is deterministic per document_job_id, so a fresh halt always
+    # supersedes any prior, unresolved checkpoint for the same document_job
+    # (e.g. an earlier attempt that was interrupted before ever reaching
+    # review) — otherwise this insert hits `run_checkpoints`' unique
+    # `thread_id` constraint, and a discarded `{:error, changeset}` here
+    # would leave `agent_runs` pointing at that stale checkpoint instead of
+    # this run's actual state.
+    Repository.delete_by_thread_id(thread_id)
+
+    {:ok, _checkpoint} =
+      Repository.insert(%{
+        thread_id: thread_id,
+        document_job_id: document_job_id,
+        reactor_state: :erlang.term_to_binary(reactor),
+        inputs: %{
+          "document_type_slug" => inputs.document_type_slug,
+          "documents" => inputs.documents,
+          "extraction_schema" => inputs.extraction_schema,
+          "validation_rules" => inputs.validation_rules,
+          "shape_signals" => inputs.shape_signals
+        },
+        explanation: explanation
+      })
 
     report(
       Map.merge(
         %{
           "document_job_id" => document_job_id,
           "status" => "needs_review",
-          "thread_id" => thread_id_for(document_job_id),
-          "explanation" => explanation
+          "thread_id" => thread_id,
+          "explanation" => truncate(explanation)
         },
-        extracted_payload(extracted)
+        extracted_payload(extracted, extraction_metadata)
       )
     )
   end
@@ -141,6 +155,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
 
   defp halted_details(reactor) do
     results = reactor.intermediate_results || %{}
+    extract_result = results[:extract] || %{}
 
     explanation =
       case results[:gate] do
@@ -148,7 +163,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
         _ -> nil
       end
 
-    {results[:extract] || %{}, explanation}
+    {extract_result[:fields] || %{}, extract_result[:metadata] || %{}, explanation}
   end
 
   # Known roles (contract/w9) still populate AgentRun's fixed columns
@@ -158,7 +173,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
   # dedicated encrypted column, never swept into this generic (unencrypted)
   # map, so no future document type's extraction can land PII there by
   # accident.
-  defp extracted_payload(extracted) do
+  defp extracted_payload(extracted, extraction_metadata) do
     contract = extracted["contract"] || %{}
     w9 = extracted["w9"] || %{}
 
@@ -173,11 +188,29 @@ defmodule DocumentComplianceEngine.Agent.Run do
       "tax_id" => w9[:tax_id],
       "payment_terms" => contract[:payment_terms],
       "liability_clauses" => contract[:liability_clauses],
-      "extracted_fields" => extracted_fields
+      "extracted_fields" => extracted_fields,
+      "extraction_metadata" => stringify_metadata(extraction_metadata)
     }
   end
 
   defp stringify_keys(map), do: Map.new(map, fn {k, v} -> {Atom.to_string(k), v} end)
+
+  # Same PII exclusion as `extracted_payload/2`'s `extracted_fields`, and
+  # for the same reason: a regex-resolved `tax_id`'s synthesized
+  # `source_quote` *is* the raw Tax ID (see `Extraction.regex_metadata/1`),
+  # and this column isn't encrypted — Tax ID confidence/grounding data
+  # must never land here, by construction.
+  defp stringify_metadata(extraction_metadata) do
+    Map.new(extraction_metadata, fn {role, fields} ->
+      {role,
+       fields
+       |> Map.delete(:tax_id)
+       |> Map.new(fn {field, entry} ->
+         {Atom.to_string(field),
+          %{"confidence" => entry[:confidence], "source_quote" => entry[:source_quote]}}
+       end)}
+    end)
+  end
 
   @spec thread_id_for(pos_integer()) :: String.t()
   def thread_id_for(document_job_id), do: "document_job-#{document_job_id}"

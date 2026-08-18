@@ -82,6 +82,7 @@ defmodule DocumentComplianceEngine.MixProject do
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
+      {:hermes_mcp, "~> 0.14"},
       {:reactor, "~> 1.0"},
       {:instructor, "~> 0.1.0"},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}

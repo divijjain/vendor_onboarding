@@ -10,7 +10,7 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallback do
   alias DocumentComplianceEngine.AgentRuns.Repository
   alias DocumentComplianceEngine.DocumentJobs
 
-  @result_fields ~w(status thread_id company_name w9_company_name tax_id payment_terms liability_clauses explanation extracted_fields)
+  @result_fields ~w(status thread_id company_name w9_company_name tax_id payment_terms liability_clauses explanation extracted_fields extraction_metadata)
 
   @spec call(map()) ::
           {:ok, DocumentComplianceEngine.AgentRuns.Schema.AgentRun.t()}

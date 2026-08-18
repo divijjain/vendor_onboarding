@@ -56,13 +56,63 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     assert html =~ "Reject"
   end
 
-  test "approve calls resume_review and shows a flash", %{conn: conn} do
+  test "shows confidence and source-quote grounding per extracted field", %{conn: conn} do
+    {:ok, document_job} =
+      DocumentJobs.Repository.insert(%{
+        idempotency_key: "review-confidence-#{System.unique_integer([:positive])}",
+        document_paths: %{},
+        document_type_slug: "vendor_contract_w9"
+      })
+
+    {:ok, run} =
+      AgentRuns.Repository.insert(%{document_job_id: document_job.id, status: :processing})
+
+    {:ok, _run} =
+      AgentRuns.Repository.update_result(run, %{
+        status: :needs_review,
+        thread_id: "document_job-#{document_job.id}",
+        company_name: "Acme Corp",
+        explanation: "Names do not match.",
+        extraction_metadata: %{
+          "contract" => %{
+            "company_name" => %{"confidence" => 0.92, "source_quote" => "Acme Corp Inc."}
+          },
+          "w9" => %{
+            "company_name" => %{"confidence" => 0.4, "source_quote" => "Acme Corp"}
+          }
+        }
+      })
+
+    {:ok, document_job} = DocumentJobs.update_status(document_job.id, :needs_review)
+
+    {:ok, _view, html} = live(conn, ~p"/document_jobs/#{document_job.id}")
+
+    assert html =~ "Extraction confidence"
+    assert html =~ "92% confidence"
+    assert html =~ "Acme Corp Inc."
+    # Below the low-confidence threshold — rendered distinctly, not hidden.
+    assert html =~ "40% confidence"
+  end
+
+  test "approve calls resume_review, records an audit entry, and shows a flash", %{conn: conn} do
     {:ok, document_job} = needs_review_document_job()
 
     {:ok, view, _html} = live(conn, ~p"/document_jobs/#{document_job.id}")
 
-    html = view |> element("button", "Approve") |> render_click()
+    html =
+      view
+      |> form("#review-decision-form", %{reviewer: "Jane Reviewer", rationale: "Looks correct."})
+      |> render_submit(%{"decision" => "approved"})
+
     assert html =~ "waiting for the agent to resume"
+    assert html =~ "Jane Reviewer"
+    assert html =~ "Looks correct."
+
+    assert [decision] = AgentRuns.list_review_decisions(document_job.id)
+    assert decision.decision == :approved
+    assert decision.reviewer == "Jane Reviewer"
+    assert decision.rationale == "Looks correct."
+    assert decision.evidence == "Names do not match."
   end
 
   test "hides approve/reject once no longer awaiting review", %{conn: conn} do
@@ -77,9 +127,7 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
 
     {:ok, _view, html} = live(conn, ~p"/document_jobs/#{document_job.id}")
 
-    # Not a plain `refute html =~ "Approve"` — the (now humanized) "Approved"
-    # status badge legitimately contains "Approve" as a substring.
-    refute html =~ ~s(phx-click="approve")
+    refute html =~ ~s(id="review-decision-form")
     assert html =~ "no longer awaiting review"
   end
 

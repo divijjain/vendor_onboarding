@@ -24,13 +24,16 @@ defmodule DocumentComplianceEngine.InvoiceDocumentTypeTest do
     end)
   end
 
-  defp ingest_invoice do
-    unique = System.unique_integer([:positive])
-
+  # `invoice_text` is hashed against `AgentFakes`-style extract stubs below
+  # by `Checks.grounded_extraction_checks/2` — it must actually contain
+  # whatever the stub claims to have extracted, or the run halts for
+  # review instead of following the rule-based path each test means to
+  # exercise (see checks.ex).
+  defp ingest_invoice(invoice_text) do
     raw_payload =
       Jason.encode!(%{
         "document_type_slug" => "invoice",
-        "documents" => %{"invoice" => Base.encode64("invoice-bytes-#{unique}")}
+        "documents" => %{"invoice" => Base.encode64(invoice_text)}
       })
 
     {:ok, document_job} = DocumentJobs.ingest_webhook(raw_payload)
@@ -54,7 +57,14 @@ defmodule DocumentComplianceEngine.InvoiceDocumentTypeTest do
       agent_screen_vendor: fn _name -> {:ok, %{flagged: false, reason: nil}} end
     )
 
-    document_job = ingest_invoice()
+    document_job =
+      ingest_invoice("""
+      INVOICE
+      Vendor: Acme Corp
+      Invoice Number: INV-1001
+      Amount: 1000.00
+      Due Date: 2026-09-01
+      """)
 
     assert {:ok, agent_run} = AgentRuns.trigger_agent_run(document_job.id)
 
@@ -94,7 +104,14 @@ defmodule DocumentComplianceEngine.InvoiceDocumentTypeTest do
       agent_draft_explanation: fn findings -> "Explanation: #{findings}" end
     )
 
-    document_job = ingest_invoice()
+    document_job =
+      ingest_invoice("""
+      INVOICE
+      Vendor: Blocked Vendor LLC
+      Invoice Number: INV-2002
+      Amount: 500.00
+      Due Date: 2026-09-15
+      """)
 
     assert {:ok, _agent_run} = AgentRuns.trigger_agent_run(document_job.id)
 

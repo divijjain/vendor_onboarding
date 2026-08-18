@@ -26,24 +26,41 @@ defmodule DocumentComplianceEngine.Agent.DocumentReactor do
   input(:documents)
   input(:extraction_schema)
   input(:validation_rules)
+  # Optional per-role shape gate — see `Extraction.shape_matches?/2`.
+  input(:shape_signals)
   # nil on the initial run; supplied when resuming after human review.
   input(:human_decision)
 
   step :extract do
     argument(:documents, input(:documents))
     argument(:extraction_schema, input(:extraction_schema))
+    argument(:shape_signals, input(:shape_signals))
 
-    run(fn %{documents: documents, extraction_schema: schema}, _context ->
-      Extraction.extract_all(documents, schema)
+    run(fn %{documents: documents, extraction_schema: schema, shape_signals: shape_signals},
+           _context ->
+      case Extraction.extract_all(documents, schema, shape_signals) do
+        {:ok, fields, metadata} -> {:ok, %{fields: fields, metadata: metadata}}
+        {:error, reason} -> {:error, reason}
+      end
     end)
   end
 
   step :validate do
-    argument(:extracted, result(:extract))
+    argument(:extracted, result(:extract, [:fields]))
+    argument(:extraction_metadata, result(:extract, [:metadata]))
+    argument(:documents, input(:documents))
     argument(:validation_rules, input(:validation_rules))
+    argument(:shape_signals, input(:shape_signals))
 
-    run(fn %{extracted: extracted, validation_rules: rules}, _context ->
-      Checks.validate_all(extracted, rules)
+    run(fn %{
+             extracted: extracted,
+             extraction_metadata: extraction_metadata,
+             documents: documents,
+             validation_rules: rules,
+             shape_signals: shape_signals
+           },
+           _context ->
+      Checks.validate_all(extracted, documents, rules, shape_signals, extraction_metadata)
     end)
   end
 
@@ -61,7 +78,8 @@ defmodule DocumentComplianceEngine.Agent.DocumentReactor do
 
   step :finalize do
     argument(:gate, result(:gate))
-    argument(:extracted, result(:extract))
+    argument(:extracted, result(:extract, [:fields]))
+    argument(:extraction_metadata, result(:extract, [:metadata]))
     argument(:document_type_slug, input(:document_type_slug))
     argument(:human_decision, input(:human_decision))
 
@@ -73,7 +91,12 @@ defmodule DocumentComplianceEngine.Agent.DocumentReactor do
         end
 
       {:ok,
-       %{status: status, document_type_slug: args.document_type_slug, extracted: args.extracted}}
+       %{
+         status: status,
+         document_type_slug: args.document_type_slug,
+         extracted: args.extracted,
+         extraction_metadata: args.extraction_metadata
+       }}
     end)
   end
 end

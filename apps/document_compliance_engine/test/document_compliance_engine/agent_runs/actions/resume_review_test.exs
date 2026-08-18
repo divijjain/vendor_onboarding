@@ -30,7 +30,14 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
   test "enqueues ResumeAgentRunWorker with the run's thread_id on a :needs_review document_job" do
     document_job = needs_review_document_job("resume-1")
 
-    assert {:ok, returned} = AgentRuns.resume_review(document_job.id, :approved)
+    assert {:ok, returned} =
+             AgentRuns.resume_review(
+               document_job.id,
+               :approved,
+               "Jane Reviewer",
+               "Looks correct."
+             )
+
     assert returned.id == document_job.id
 
     assert_enqueued(
@@ -43,6 +50,24 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
     )
   end
 
+  test "records an audit trail entry with the reviewer, rationale, and evidence snapshot" do
+    document_job = needs_review_document_job("resume-audit")
+
+    assert {:ok, _document_job} =
+             AgentRuns.resume_review(
+               document_job.id,
+               :rejected,
+               "Jane Reviewer",
+               "Names don't match."
+             )
+
+    assert [decision] = AgentRuns.list_review_decisions(document_job.id)
+    assert decision.decision == :rejected
+    assert decision.reviewer == "Jane Reviewer"
+    assert decision.rationale == "Names don't match."
+    assert decision.thread_id == "thread-#{document_job.id}"
+  end
+
   test "rejects resuming an document_job that isn't :needs_review" do
     {:ok, received} =
       DocumentJobs.Repository.insert(%{
@@ -51,11 +76,14 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
         document_type_slug: "vendor_contract_w9"
       })
 
-    assert {:error, :not_awaiting_review} = AgentRuns.resume_review(received.id, :approved)
+    assert {:error, :not_awaiting_review} =
+             AgentRuns.resume_review(received.id, :approved, "Jane Reviewer", "Looks correct.")
+
     refute_enqueued(worker: ResumeAgentRunWorker)
   end
 
   test "returns {:error, :not_found} for a missing document_job" do
-    assert {:error, :not_found} = AgentRuns.resume_review(-1, :approved)
+    assert {:error, :not_found} =
+             AgentRuns.resume_review(-1, :approved, "Jane Reviewer", "Looks correct.")
   end
 end

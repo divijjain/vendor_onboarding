@@ -82,32 +82,55 @@ flowchart TD
 
 ## Evaluation
 
-The core resume claim — "0% hallucination rate on extracted entities" — is only credible if it's backed by the right kind of check. This project uses a **two-tier eval**, not LLM-as-judge for everything:
+The core resume claim — "0% hallucination rate on extracted entities" — is only credible if it's backed by the right kind of check. This project uses a **two-tier eval**, not LLM-as-judge for everything, and the harness itself is document-type-generic (`Evals.Fixtures`/`Evals.Run` — a fixture carries its own `document_type_slug` and `documents` map, not a hardcoded `contract`/`w9` pair), proven against two structurally different document types the same way the pipeline itself was:
 
-1. **Deterministic checks** (no LLM, fast, free): does the extracted Tax ID exist verbatim in the source document text? Does the model's output conform to the document type's `extraction_schema` (enforced by Instructor's schemaless-changeset validation)? These produce the hallucination-rate number.
-2. **LLM-as-judge checks** (for genuinely ambiguous judgment): does the entity mapping in the extraction hold up under formatting differences ("J. Smith" vs "John Smith")? Is the agent's drafted mismatch explanation actually grounded in the real discrepancy? The judge model (Claude Sonnet) is a different provider than the agent model (GPT-4o-mini), to avoid self-grading inflation.
+1. **Deterministic checks** (no LLM, fast, free): does the extracted Tax ID exist verbatim in the source W-9 text (`vendor_contract_w9` only)? Does *every* extracted field across every role appear grounded in its own source document (`Checks.grounded_extraction_checks/3` — any document type, and the exact same production check that gates the live pipeline, not a second eval-only reimplementation that could quietly drift)? Does the model's output conform to the document type's `extraction_schema`? These produce the hallucination-rate number.
+2. **LLM-as-judge checks** (for genuinely ambiguous judgment): does the entity mapping hold up under formatting differences ("J. Smith" vs "John Smith") — `vendor_contract_w9` only, invoice has no entity-match concept; is the agent's drafted explanation of *any* halted run actually grounded in the real findings, regardless of document type? The judge model (Claude Sonnet) is a different provider than the agent model (GPT-4o-mini), to avoid self-grading inflation.
 
-**Synthetic test set (55 documents), structured deliberately** — grown from an original 20 (10/5/3/2) specifically so the two thinnest buckets aren't one failure away from a meaningless swing:
+### `vendor_contract_w9` — 55 fixtures
+
+Grown from an original 20 (10/5/3/2) specifically so the two thinnest buckets aren't one failure away from a meaningless swing:
 
 | Bucket | Count | Tests |
 |---|---|---|
 | Clean, should auto-approve | 20 | happy path |
 | Genuine name/entity mismatch | 15 | true-positive flagging |
-| Subtle formatting difference, not a real mismatch | 12 | false-positive rate — the detail that makes "100% accuracy" credible rather than cherry-picked |
+| Subtle formatting difference, not a real mismatch | 12 | false-positive rate — the detail that makes a near-100% accuracy claim credible rather than cherry-picked |
 | Missing/malformed fields | 8 | graceful degradation |
 
-This fixture set is specific to the `vendor_contract_w9` document type (the contract-vs-W-9 name-mismatch scenario) — `invoice` has no eval fixtures yet, and its own end-to-end correctness is proven by the ExUnit test suite, not the eval harness. Even at 55 cases this isn't benchmark-scale — a couple of buckets are still small enough that a single failure is visible in the headline number — but it's past the point where the numbers were mostly noise; see CONTEXT.md's dated entry for the sizing rationale.
+Even at 55 cases this isn't benchmark-scale — a couple of buckets are still small enough that a single failure is visible in the headline number — but it's past the point where the numbers were mostly noise; see CONTEXT.md's dated entry for the sizing rationale.
 
-**Results, run for real** (`mix eval.run`, both API keys configured, both mock MCP servers running):
+### `invoice` — 14 fixtures
+
+Sized to what the type's actual rule surface can meaningfully exercise: one business rule (`screen_vendor`) plus the two automatic checks every document type gets for free — `grounded_extraction_checks/3` and `extraction_completeness_checks/1` (see "Why this shape" above).
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean, should auto-approve | 6 | happy path |
+| Sanctions hit | 2 | true-positive flagging — the exact two names the mock `sanctions_db` server's watchlist contains (an exact, case-insensitive match — not fuzzy), not invented values that would pass or fail by coincidence |
+| Malformed (vendor name present, other fields genuinely absent) | 3 | `extraction_completeness` catching a mostly-empty extraction |
+| Wrong document type (résumé/cover-letter text, not an invoice) | 3 | the shape gate (`Extraction.shape_matches?/2`) rejecting it *before* any extraction call — zero LLM cost |
+
+The wrong-document-type bucket isn't a hypothetical: an uploaded résumé was once extracted into a fully fabricated invoice (vendor name, invoice number, amount, and due date all invented from a document that mentioned none of them) before the shape gate and completeness check existed — see CONTEXT.md's dated entry. This bucket turns that real incident into a permanent regression test.
+
+### Results, run for real
+
+`mix eval.run`, both API keys configured, both mock MCP servers running — every number below is an actual model/tool-server response, not a fake:
 
 | Bucket | Decision accuracy |
 |---|---|
-| Clean | 20/20 |
-| Genuine mismatch | 15/15 |
-| Formatting (false-positive control) | 12/12 |
-| Malformed | 8/8 |
+| `vendor_contract_w9` / clean | 20/20 |
+| `vendor_contract_w9` / mismatch | 15/15 |
+| `vendor_contract_w9` / formatting | **11/12** |
+| `vendor_contract_w9` / malformed | 8/8 |
+| `invoice` / clean | 6/6 |
+| `invoice` / sanctions hit | 2/2 |
+| `invoice` / malformed | 3/3 |
+| `invoice` / wrong document type | 3/3 |
 
-LLM-judge tier (Claude Sonnet, scoring the GPT-4o-mini agent's own judgments — cross-provider, not self-grading): entity-match correctness averaged **1.00** (n=47, every fixture with a known expected match/mismatch), groundedness of drafted mismatch explanations averaged **1.00** (n=14, out of 15 mismatch-bucket fixtures — one judge call hit a transient `Req.TransportError{reason: :timeout}` and was correctly recorded as a surfaced error rather than silently dropped or retried).
+The one miss is real, not massaged away: `formatting-07` ("The Wilson Group" vs "Wilson Group LLC") landed in `staged_match/2`'s ambiguous band and GPT-4o-mini's entity-match judgment call this run said "different entities" — a genuine, if debatable, model call, not a bug in this codebase. An eval that always reports a suspiciously clean 100% is worth trusting less than one that shows its one real disagreement.
+
+LLM-judge tier (Claude Sonnet, scoring the GPT-4o-mini agent's own judgments — cross-provider, not self-grading): entity-match correctness averaged **0.98** (n=47, every `vendor_contract_w9` fixture with a known expected match/mismatch — the same `formatting-07` case is most of that gap from 1.00); groundedness of drafted explanations averaged **1.00** (n=32 — every fixture across *both* document types that actually halted with an explanation: 15 mismatch + 8 malformed + `formatting-07`'s unexpected halt, from `vendor_contract_w9`, plus all 8 halted `invoice` fixtures).
 
 An earlier 20-fixture run once reported groundedness as `n=4` instead of the expected `n=5` — `judge_scores/1` used to silently drop a failed judge call from the average rather than count it, so the gap wasn't visible until it was made to surface failures explicitly. That dropped call turned out to be a real parsing bug, not a flaky network error: Claude's extended-thinking responses put a `type: "thinking"` block ahead of the `type: "text"` block in the response, and `Judge.extract_text/1` assumed the first content block was always the answer. Fixed to search for the actual `text` block instead of assuming its position — see `CONTEXT.md`'s dated entry for the full story, including why an eval harness silently hiding its own failures is exactly the failure mode this whole project is built to catch on the agent side.
 
@@ -188,4 +211,4 @@ The two mock MCP tool servers are still separate OTP applications — genuinely 
 * `cd apps/tax_api && mix deps.get && iex -S mix` — mock Tax API MCP server, port 8010
 * `cd apps/sanctions_db && mix deps.get && iex -S mix` — mock Sanctions DB MCP server, port 8011
 * `mix test` from inside each app's own directory (likewise `cd apps/tax_api && mix test`, etc.)
-* `mix eval.run` (from `apps/document_compliance_engine`) — the eval harness; the deterministic tier needs `OPENAI_API_KEY` (+ the two MCP servers running), the LLM-judge tier also needs `ANTHROPIC_API_KEY`. Currently only exercises `vendor_contract_w9` — see Evaluation above.
+* `mix eval.run` (from `apps/document_compliance_engine`) — the eval harness; the deterministic tier needs `OPENAI_API_KEY` (+ the two MCP servers running), the LLM-judge tier also needs `ANTHROPIC_API_KEY`. Runs both `vendor_contract_w9` and `invoice`'s fixtures in one pass — see Evaluation above.

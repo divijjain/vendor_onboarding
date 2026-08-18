@@ -15,6 +15,8 @@ defmodule DocumentComplianceEngine.Application do
        query: Application.get_env(:document_compliance_engine, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: DocumentComplianceEngine.PubSub},
       {Oban, Application.fetch_env!(:document_compliance_engine, Oban)},
+      Hermes.Server.Registry,
+      {DocumentComplianceEngine.Mcp.Server, transport: :streamable_http},
       # Start to serve requests, typically the last entry
       DocumentComplianceEngineWeb.Endpoint
     ]

@@ -7,14 +7,14 @@ defmodule Mix.Tasks.Webhook.Send do
   way `VerifyWebhookSignature` expects a real vendor-email-provider request
   to be signed. For manually poking the dashboard with a known-good (or
   known-bad) document pair — the eval harness itself never goes over HTTP.
+  Works for any document type `Evals.Fixtures` defines (`vendor_contract_w9`
+  and `invoice` today) — a fixture carries its own `document_type_slug`
+  and `documents` map, so this task doesn't hardcode either.
 
       mix phx.server            # in one terminal
       mix webhook.send clean-01 # in another
 
-      mix webhook.send mismatch-03 --url http://localhost:4000
-
-  Only fixtures for `vendor_contract_w9` (the `contract`/`w9` pair) are
-  supported — `Evals.Fixtures` doesn't have `invoice` fixtures to send.
+      mix webhook.send invoice-sanctions-01 --url http://localhost:4000
   """
 
   use Mix.Task
@@ -31,11 +31,9 @@ defmodule Mix.Tasks.Webhook.Send do
 
     body =
       Jason.encode!(%{
-        "document_type_slug" => "vendor_contract_w9",
-        "documents" => %{
-          "contract" => Base.encode64(fixture.contract_text),
-          "w9" => Base.encode64(fixture.w9_text)
-        }
+        "document_type_slug" => fixture.document_type_slug,
+        "documents" =>
+          Map.new(fixture.documents, fn {role, text} -> {role, Base.encode64(text)} end)
       })
 
     url = (opts[:url] || @default_url) <> "/webhooks/document_compliance_engine"

@@ -5,10 +5,13 @@ defmodule DocumentComplianceEngine.DocumentTypes.Schema.DocumentType do
   and which validation rules apply. `extraction_schema` is a map of
   document role => field name => Ecto type (currently only `"string"`);
   `validation_rules` is a list of typed rule maps (`entity_match` or
-  `mcp_tool`) interpreted by `Agent.Checks.validate_all/2`. Both are
-  resolved by `Agent.Run` and passed into `Agent.DocumentReactor` as plain
-  inputs — genuinely read by the agent pipeline, not just stored config.
-  See CONTEXT.md's dated entries for the generalization history.
+  `mcp_tool`) interpreted by `Agent.Checks.validate_all/4`. `shape_signals`
+  is an optional per-role config (`%{"keywords" => [...], "min_matches" =>
+  n}`) `Extraction.extract_all/3` checks before spending an LLM call on a
+  role — a role with no entry is unrestricted. All three are resolved by
+  `Agent.Run` and passed into `Agent.DocumentReactor` as plain inputs —
+  genuinely read by the agent pipeline, not just stored config. See
+  CONTEXT.md's dated entries for the generalization history.
   """
 
   use Ecto.Schema
@@ -19,6 +22,7 @@ defmodule DocumentComplianceEngine.DocumentTypes.Schema.DocumentType do
     field :name, :string
     field :extraction_schema, :map, default: %{}
     field :validation_rules, {:array, :map}, default: []
+    field :shape_signals, :map, default: %{}
 
     timestamps(type: :utc_datetime)
   end
@@ -29,6 +33,7 @@ defmodule DocumentComplianceEngine.DocumentTypes.Schema.DocumentType do
           name: String.t() | nil,
           extraction_schema: map(),
           validation_rules: [map()],
+          shape_signals: map(),
           inserted_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil
         }
@@ -36,7 +41,7 @@ defmodule DocumentComplianceEngine.DocumentTypes.Schema.DocumentType do
   @doc "Changeset for creating or updating a document type."
   def changeset(document_type, attrs) do
     document_type
-    |> cast(attrs, [:slug, :name, :extraction_schema, :validation_rules])
+    |> cast(attrs, [:slug, :name, :extraction_schema, :validation_rules, :shape_signals])
     |> validate_required([:slug, :name])
     |> unique_constraint(:slug)
   end

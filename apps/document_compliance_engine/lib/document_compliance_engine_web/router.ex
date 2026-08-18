@@ -32,6 +32,13 @@ defmodule DocumentComplianceEngineWeb.Router do
     post "/document_compliance_engine", WebhookController, :create
   end
 
+  scope "/mcp" do
+    pipe_through :api
+
+    forward "/", Hermes.Server.Transport.StreamableHTTP.Plug,
+      server: DocumentComplianceEngine.Mcp.Server
+  end
+
   # Enable LiveDashboard and Swoosh mailbox preview in development
   if Application.compile_env(:document_compliance_engine, :dev_routes) do
     # If you want to use the LiveDashboard in production, you should put

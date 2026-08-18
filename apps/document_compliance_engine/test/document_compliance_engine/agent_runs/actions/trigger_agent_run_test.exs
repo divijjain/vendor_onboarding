@@ -15,8 +15,15 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.TriggerAgentRunTest do
     File.mkdir_p!(dir)
     contract_path = Path.join(dir, "contract.pdf")
     w9_path = Path.join(dir, "w9.pdf")
-    File.write!(contract_path, "contract text")
-    File.write!(w9_path, "w9 text")
+    # Matches the `agent_extract` stub's fake values verbatim — required
+    # now that the reactor's groundedness check (see checks.ex) halts any
+    # run whose extracted fields don't appear in these documents.
+    File.write!(
+      contract_path,
+      "Contract with Acme Corp. Payment Terms: Net 30. Liability: Standard."
+    )
+
+    File.write!(w9_path, "Form W-9. Name of entity: Acme Corp. EIN: 12-3456789.")
     on_exit(fn -> File.rm_rf!(dir) end)
 
     stub_agent(

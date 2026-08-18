@@ -4,13 +4,19 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
   correct, using injected fake agent calls — not a claim that these fakes
   match real GPT-4o-mini/Claude Sonnet behavior. Running the harness for
   real needs OPENAI_API_KEY (+ ANTHROPIC_API_KEY for the judge tier).
+
+  `vendor_contract_w9` fixtures are run through `Fixtures.vendor_contract_w9/0`
+  explicitly (not the bare `Fixtures.all/0` default), so this file's exact
+  fixture counts stay meaningful regardless of how many other document
+  types the fixture set grows to cover — see the `invoice` describe block
+  below for that type's own scoped coverage.
   """
 
   use DocumentComplianceEngine.DataCase, async: false
 
   import DocumentComplianceEngine.AgentFakes
 
-  alias DocumentComplianceEngine.Agent.Evals.Run
+  alias DocumentComplianceEngine.Agent.Evals.{Fixtures, Run}
   alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
 
   @suffixes ~w(inc llc corp corporation co company ltd incorporated group)
@@ -70,82 +76,183 @@ defmodule DocumentComplianceEngine.Agent.Evals.RunTest do
     :ok
   end
 
-  test "every fixture reaches its expected decision with a well-behaved agent" do
-    for result <- Run.run_all() do
-      assert result.error == nil, "#{result.fixture.id} errored: #{result.error}"
+  describe "vendor_contract_w9" do
+    test "every fixture reaches its expected decision with a well-behaved agent" do
+      for result <- Run.run_all(Fixtures.vendor_contract_w9()) do
+        assert result.error == nil, "#{result.fixture.id} errored: #{result.error}"
 
-      assert result.decision == result.fixture.expected_decision,
-             "#{result.fixture.id}: expected #{result.fixture.expected_decision}, got #{result.decision}"
+        assert result.decision == result.fixture.expected_decision,
+               "#{result.fixture.id}: expected #{result.fixture.expected_decision}, got #{result.decision}"
+      end
+    end
+
+    test "bucket accuracy reports 100% when every decision matches" do
+      accuracy = Run.run_all(Fixtures.vendor_contract_w9()) |> Run.bucket_accuracy()
+
+      assert accuracy[{"vendor_contract_w9", "clean"}] == %{total: 20, correct: 20}
+      assert accuracy[{"vendor_contract_w9", "mismatch"}] == %{total: 15, correct: 15}
+      assert accuracy[{"vendor_contract_w9", "formatting"}] == %{total: 12, correct: 12}
+      assert accuracy[{"vendor_contract_w9", "malformed"}] == %{total: 8, correct: 8}
+    end
+
+    test "tax ids are extracted verbatim for every well-formed fixture" do
+      well_formed =
+        Fixtures.vendor_contract_w9()
+        |> Run.run_all()
+        |> Enum.reject(&(&1.fixture.bucket == "malformed"))
+
+      assert length(well_formed) == 47
+      assert Enum.all?(well_formed, & &1.tax_id_verbatim_ok)
+    end
+
+    test "extracted fields are grounded in source for every well-behaved fixture" do
+      results = Run.run_all(Fixtures.vendor_contract_w9())
+      assert Enum.all?(results, & &1.fields_grounded)
+    end
+
+    test "the formatting bucket is not flagged as a mismatch" do
+      # The false-positive control — this is what makes a 100% accuracy
+      # claim credible rather than cherry-picked.
+      formatting =
+        Fixtures.vendor_contract_w9()
+        |> Run.run_all()
+        |> Enum.filter(&(&1.fixture.bucket == "formatting"))
+
+      assert length(formatting) == 12
+      assert Enum.all?(formatting, &(&1.decision == "approved"))
+      assert Enum.all?(formatting, & &1.entity_match)
+    end
+
+    test "a raising extractor is recorded as graceful degradation, not a crash" do
+      stub_defaults(
+        extract: fn
+          "contract", _schema, _text -> {:error, "simulated extraction failure"}
+          "w9", _schema, text -> parse_w9(text)
+        end
+      )
+
+      [result] = Run.run_all([hd(Fixtures.vendor_contract_w9())])
+
+      assert result.error =~ "simulated extraction failure"
+      assert result.decision == nil
+    end
+
+    test "judge_scores only scores completed fixtures with a known expectation" do
+      # stub/1, not stub_defaults/1 — the setup's parsing extractors must
+      # stay in place or nothing mismatches and no explanation is drafted.
+      stub(judge_fun: fn _criteria, _evidence -> {:ok, %{score: 0.9, reasoning: "ok"}} end)
+
+      scores = Fixtures.vendor_contract_w9() |> Run.run_all() |> Run.judge_scores()
+
+      # 47 fixtures have a known expected_entity_match (excludes the 8 malformed).
+      assert length(scores.entity_match.scores) == 47
+      assert Enum.all?(scores.entity_match.scores, &(&1 == 0.9))
+      assert scores.entity_match.errors == []
+
+      # Groundedness is scored wherever an explanation was actually
+      # drafted — the mismatch bucket (15) and the malformed bucket (8),
+      # since clean/formatting auto-approve with no explanation at all.
+      assert length(scores.groundedness.scores) == 23
+      assert scores.groundedness.errors == []
+    end
+
+    test "judge_scores surfaces a failed judge call instead of silently dropping it" do
+      stub(judge_fun: fn _criteria, _evidence -> {:error, :rate_limited} end)
+
+      scores = Fixtures.vendor_contract_w9() |> Run.run_all() |> Run.judge_scores()
+
+      assert scores.entity_match.scores == []
+      assert scores.entity_match.errors == List.duplicate(:rate_limited, 47)
+
+      assert scores.groundedness.scores == []
+      assert scores.groundedness.errors == List.duplicate(:rate_limited, 23)
     end
   end
 
-  test "bucket accuracy reports 100% when every decision matches" do
-    accuracy = Run.run_all() |> Run.bucket_accuracy()
+  describe "invoice" do
+    # Mirrors `SanctionsDb.Server.screen/1`'s real watchlist exactly (the
+    # two apps are genuinely separate Mix projects — see CLAUDE.md — so
+    # this can't just import that module; kept in sync by hand, same as
+    # any other cross-app boundary here).
+    @sanctioned MapSet.new(["rogue exports llc", "north star trading co"])
 
-    assert accuracy["clean"] == %{total: 20, correct: 20}
-    assert accuracy["mismatch"] == %{total: 15, correct: 15}
-    assert accuracy["formatting"] == %{total: 12, correct: 12}
-    assert accuracy["malformed"] == %{total: 8, correct: 8}
-  end
+    defp parse_invoice(text) do
+      [_, vendor] = Regex.run(~r/Vendor: (.+)/, text)
+      invoice_number = Regex.run(~r/Invoice Number: (.+)/, text)
+      amount = Regex.run(~r/Amount Due: (.+)/, text)
+      due_date = Regex.run(~r/Due Date: (.+)/, text)
 
-  test "tax ids are extracted verbatim for every well-formed fixture" do
-    well_formed = Enum.reject(Run.run_all(), &(&1.fixture.bucket == "malformed"))
+      {:ok,
+       %{
+         vendor_name: vendor,
+         invoice_number: invoice_number && Enum.at(invoice_number, 1),
+         amount: amount && Enum.at(amount, 1),
+         due_date: due_date && Enum.at(due_date, 1)
+       }}
+    end
 
-    assert length(well_formed) == 47
-    assert Enum.all?(well_formed, & &1.tax_id_verbatim_ok)
-  end
+    setup do
+      stub_defaults(
+        extract: fn "invoice", _schema, text -> parse_invoice(text) end,
+        screen_vendor: fn name ->
+          flagged = MapSet.member?(@sanctioned, name |> String.trim() |> String.downcase())
+          {:ok, %{flagged: flagged, reason: if(flagged, do: "Matched sanctions watchlist entry")}}
+        end
+      )
 
-  test "the formatting bucket is not flagged as a mismatch" do
-    # The false-positive control — this is what makes a 100% accuracy
-    # claim credible rather than cherry-picked.
-    formatting = Enum.filter(Run.run_all(), &(&1.fixture.bucket == "formatting"))
+      :ok
+    end
 
-    assert length(formatting) == 12
-    assert Enum.all?(formatting, &(&1.decision == "approved"))
-    assert Enum.all?(formatting, & &1.entity_match)
-  end
+    test "every fixture reaches its expected decision" do
+      for result <- Run.run_all(Fixtures.invoice()) do
+        assert result.error == nil, "#{result.fixture.id} errored: #{result.error}"
 
-  test "a raising extractor is recorded as graceful degradation, not a crash" do
-    stub_defaults(
-      extract: fn
-        "contract", _schema, _text -> {:error, "simulated extraction failure"}
-        "w9", _schema, text -> parse_w9(text)
+        assert result.decision == result.fixture.expected_decision,
+               "#{result.fixture.id}: expected #{result.fixture.expected_decision}, got #{result.decision}"
       end
-    )
+    end
 
-    [result] = Run.run_all([hd(DocumentComplianceEngine.Agent.Evals.Fixtures.all())])
+    test "bucket accuracy reports 100% when every decision matches" do
+      accuracy = Run.run_all(Fixtures.invoice()) |> Run.bucket_accuracy()
 
-    assert result.error =~ "simulated extraction failure"
-    assert result.decision == nil
-  end
+      assert accuracy[{"invoice", "invoice_clean"}] == %{total: 6, correct: 6}
+      assert accuracy[{"invoice", "invoice_sanctions_hit"}] == %{total: 2, correct: 2}
+      assert accuracy[{"invoice", "invoice_malformed"}] == %{total: 3, correct: 3}
+      assert accuracy[{"invoice", "invoice_wrong_type"}] == %{total: 3, correct: 3}
+    end
 
-  test "judge_scores only scores completed fixtures with a known expectation" do
-    # stub/1, not stub_defaults/1 — the setup's parsing extractors must
-    # stay in place or nothing mismatches and no explanation is drafted.
-    stub(judge_fun: fn _criteria, _evidence -> {:ok, %{score: 0.9, reasoning: "ok"}} end)
+    test "extracted fields are grounded in source for the clean and sanctions-hit buckets" do
+      results =
+        Fixtures.invoice()
+        |> Run.run_all()
+        |> Enum.filter(&(&1.fixture.bucket in ["invoice_clean", "invoice_sanctions_hit"]))
 
-    scores = Run.run_all() |> Run.judge_scores()
+      assert Enum.all?(results, & &1.fields_grounded)
+    end
 
-    # 47 fixtures have a known expected_entity_match (excludes the 8 malformed).
-    assert length(scores.entity_match.scores) == 47
-    assert Enum.all?(scores.entity_match.scores, &(&1 == 0.9))
-    assert scores.entity_match.errors == []
+    test "entity_match and tax_id_verbatim_ok are not applicable to invoice fixtures" do
+      results = Run.run_all(Fixtures.invoice())
 
-    # Groundedness is only scored where an explanation was actually
-    # drafted — the mismatch bucket, since clean/formatting auto-approve.
-    assert length(scores.groundedness.scores) == 15
-    assert scores.groundedness.errors == []
-  end
+      assert Enum.all?(results, &is_nil(&1.entity_match))
+      assert Enum.all?(results, &is_nil(&1.tax_id_verbatim_ok))
+    end
 
-  test "judge_scores surfaces a failed judge call instead of silently dropping it" do
-    stub(judge_fun: fn _criteria, _evidence -> {:error, :rate_limited} end)
+    test "the wrong-document-type bucket never reaches the LLM" do
+      test_pid = self()
 
-    scores = Run.run_all() |> Run.judge_scores()
+      stub_defaults(
+        extract: fn "invoice", _schema, text ->
+          send(test_pid, :extract_called)
+          parse_invoice(text)
+        end
+      )
 
-    assert scores.entity_match.scores == []
-    assert scores.entity_match.errors == List.duplicate(:rate_limited, 47)
+      wrong_type_fixtures = Enum.filter(Fixtures.invoice(), &(&1.bucket == "invoice_wrong_type"))
+      results = Run.run_all(wrong_type_fixtures)
 
-    assert scores.groundedness.scores == []
-    assert scores.groundedness.errors == List.duplicate(:rate_limited, 15)
+      assert Enum.all?(results, &(&1.decision == "needs_review"))
+      assert Enum.all?(results, &(&1.findings =~ "may not actually match"))
+      refute_received :extract_called
+    end
   end
 end

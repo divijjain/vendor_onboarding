@@ -20,14 +20,35 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
       end
     )
 
-    assert {:ok, extracted} =
+    assert {:ok, extracted, metadata} =
              Extraction.extract_all(%{"contract" => "c", "w9" => "w"}, @extraction_schema)
 
     assert extracted["contract"] == %{company_name: "value", payment_terms: "value"}
     assert extracted["w9"] == %{company_name: "value", tax_id: "value"}
 
+    # The fake doesn't return metadata, so extraction reports none — a
+    # fake opting in to it is covered separately below.
+    assert metadata == %{"contract" => %{}, "w9" => %{}}
+
     assert_received {:called, "contract", %{company_name: :string, payment_terms: :string}}
     assert_received {:called, "w9", %{company_name: :string, tax_id: :string}}
+  end
+
+  test "a fake may opt in to returning confidence + source_quote metadata" do
+    stub_defaults(
+      extract: fn "contract", _schema, _text ->
+        {:ok, %{company_name: "Acme Corp", payment_terms: "Net 30"},
+         %{company_name: %{confidence: 0.55, source_quote: "Acme Corp"}}}
+      end
+    )
+
+    assert {:ok, extracted, metadata} =
+             Extraction.extract_all(%{"contract" => "c"}, %{
+               "contract" => %{"company_name" => "string", "payment_terms" => "string"}
+             })
+
+    assert extracted["contract"].company_name == "Acme Corp"
+    assert metadata["contract"].company_name == %{confidence: 0.55, source_quote: "Acme Corp"}
   end
 
   test "fails the whole extraction when a role's document text is missing" do
@@ -47,6 +68,104 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
 
     assert {:error, :boom} =
              Extraction.extract_all(%{"contract" => "c", "w9" => "w"}, @extraction_schema)
+  end
+
+  describe "extract_all/3 shape gate" do
+    test "skips the LLM entirely and returns nil fields for a role that fails its shape gate" do
+      test_pid = self()
+
+      stub_defaults(extract: fn role, _schema, _text -> send(test_pid, {:called, role}) end)
+
+      shape_signals = %{
+        "invoice" => %{"keywords" => ["invoice", "bill to"], "min_matches" => 2}
+      }
+
+      schema = %{
+        "invoice" => %{"vendor_name" => "string", "amount" => "string"}
+      }
+
+      assert {:ok, extracted, metadata} =
+               Extraction.extract_all(
+                 %{"invoice" => "I am writing to express my enthusiasm for this position."},
+                 schema,
+                 shape_signals
+               )
+
+      assert extracted["invoice"] == %{vendor_name: nil, amount: nil}
+
+      assert metadata["invoice"] == %{
+               vendor_name: %{confidence: nil, source_quote: nil},
+               amount: %{confidence: nil, source_quote: nil}
+             }
+
+      refute_received {:called, "invoice"}
+    end
+
+    test "runs extraction normally when the shape gate passes" do
+      stub_defaults(
+        extract: fn "invoice", _schema, _text -> {:ok, %{vendor_name: "Acme Corp"}} end
+      )
+
+      shape_signals = %{
+        "invoice" => %{"keywords" => ["invoice", "vendor"], "min_matches" => 1}
+      }
+
+      assert {:ok, extracted, _metadata} =
+               Extraction.extract_all(
+                 %{"invoice" => "INVOICE\nVendor: Acme Corp"},
+                 %{"invoice" => %{"vendor_name" => "string"}},
+                 shape_signals
+               )
+
+      assert extracted["invoice"] == %{vendor_name: "Acme Corp"}
+    end
+
+    test "a role with no shape_signals entry is always extracted" do
+      stub_defaults(extract: fn "contract", _schema, _text -> {:ok, %{company_name: "Acme"}} end)
+
+      assert {:ok, extracted, _metadata} =
+               Extraction.extract_all(
+                 %{"contract" => "anything at all"},
+                 %{"contract" => %{"company_name" => "string"}},
+                 %{}
+               )
+
+      assert extracted["contract"] == %{company_name: "Acme"}
+    end
+  end
+
+  describe "shape_matches?/2" do
+    test "passes when unconfigured (nil or empty map)" do
+      assert Extraction.shape_matches?("anything", nil)
+      assert Extraction.shape_matches?("anything", %{})
+    end
+
+    test "passes when at least min_matches keywords are present" do
+      shape = %{"keywords" => ["invoice", "vendor", "amount"], "min_matches" => 2}
+      assert Extraction.shape_matches?("This INVOICE lists the Vendor name.", shape)
+    end
+
+    test "fails when fewer than min_matches keywords are present" do
+      shape = %{"keywords" => ["invoice", "bill to", "amount due"], "min_matches" => 2}
+      refute Extraction.shape_matches?("Just a résumé mentioning a Vendor in passing.", shape)
+    end
+
+    test "is case- and whitespace-insensitive" do
+      shape = %{"keywords" => ["bill   to"], "min_matches" => 1}
+      assert Extraction.shape_matches?("Please see BILL TO section below.", shape)
+    end
+  end
+
+  describe "denote_missing/1" do
+    test "converts the NOT_PRESENT sentinel to nil" do
+      assert Extraction.denote_missing(%{vendor_name: "Acme", invoice_number: "NOT_PRESENT"}) ==
+               %{vendor_name: "Acme", invoice_number: nil}
+    end
+
+    test "leaves other values untouched" do
+      fields = %{a: "real value", b: ""}
+      assert Extraction.denote_missing(fields) == fields
+    end
   end
 
   describe "maybe_regex_extract/2" do
@@ -88,11 +207,15 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
         end
       )
 
-      assert {:ok, fields} = Extraction.extract("w9", @field_types, text)
+      assert {:ok, fields, metadata} = Extraction.extract("w9", @field_types, text)
 
       # tax_id came from the regex match, verbatim — not the fake's canned value.
       assert fields.tax_id == "12-3456789"
       assert fields.company_name == "fake-company_name"
+
+      # A regex-resolved field is deterministically grounded — full
+      # confidence, and the source_quote is the matched text itself.
+      assert metadata.tax_id == %{confidence: 1.0, source_quote: "12-3456789"}
 
       # The LLM (fake) was only ever asked for company_name.
       assert_received {:called, "w9", response_model}
@@ -105,7 +228,8 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
 
       stub_defaults(extract: fn role, _schema, _text -> send(test_pid, {:called, role}) end)
 
-      assert {:ok, %{tax_id: "12-3456789"}} =
+      assert {:ok, %{tax_id: "12-3456789"},
+              %{tax_id: %{confidence: 1.0, source_quote: "12-3456789"}}} =
                Extraction.extract("w9", %{"tax_id" => "string"}, text)
 
       refute_received {:called, "w9"}
@@ -121,7 +245,8 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
         end
       )
 
-      assert {:ok, fields} = Extraction.extract("w9", @field_types, "no ein in this text")
+      assert {:ok, fields, _metadata} =
+               Extraction.extract("w9", @field_types, "no ein in this text")
 
       assert fields.tax_id == "fake-tax_id"
       assert_received {:called, "w9", %{company_name: :string, tax_id: :string}}
