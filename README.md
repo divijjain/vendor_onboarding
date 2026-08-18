@@ -82,6 +82,8 @@ flowchart TD
 
 ## Evaluation
 
+Full methodology and results: **[BENCHMARK.md](BENCHMARK.md)**.
+
 The core resume claim — "0% hallucination rate on extracted entities" — is only credible if it's backed by the right kind of check. This project uses a **two-tier eval**, not LLM-as-judge for everything, and the harness itself is document-type-generic (`Evals.Fixtures`/`Evals.Run` — a fixture carries its own `document_type_slug` and `documents` map, not a hardcoded `contract`/`w9` pair), proven against two structurally different document types the same way the pipeline itself was:
 
 1. **Deterministic checks** (no LLM, fast, free): does the extracted Tax ID exist verbatim in the source W-9 text (`vendor_contract_w9` only)? Does *every* extracted field across every role appear grounded in its own source document (`Checks.grounded_extraction_checks/3` — any document type, and the exact same production check that gates the live pipeline, not a second eval-only reimplementation that could quietly drift)? Does the model's output conform to the document type's `extraction_schema`? These produce the hallucination-rate number.
