@@ -20,6 +20,13 @@ if System.get_env("PHX_SERVER") do
   config :document_compliance_engine, DocumentComplianceEngineWeb.Endpoint, server: true
 end
 
+# Read fresh at boot in every environment (not compile time — config.exs's
+# .env/.envrc loader already populates this var for dev before runtime.exs
+# runs, and in a release this is the only point secrets are ever read from
+# the real container environment; baking an API key into config.exs would
+# freeze it as whatever was in the *build* environment, not the runtime one).
+config :instructor, openai: [api_key: System.get_env("OPENAI_API_KEY")]
+
 config :document_compliance_engine, DocumentComplianceEngineWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 

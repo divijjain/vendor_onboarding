@@ -104,9 +104,7 @@ config :document_compliance_engine, Oban,
   plugins: [Oban.Plugins.Pruner],
   queues: [agent_runs: 5]
 
-config :instructor,
-  adapter: Instructor.Adapters.OpenAI,
-  openai: [api_key: System.get_env("OPENAI_API_KEY")]
+config :instructor, adapter: Instructor.Adapters.OpenAI
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

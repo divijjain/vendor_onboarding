@@ -205,6 +205,41 @@ defmodule DocumentComplianceEngine.Agent.ChecksTest do
 
       assert Checks.grounded_extraction_checks(extracted, documents, shape_signals) == []
     end
+
+    test "a genuinely grounded value far from any keyword still passes, as long as the keyword is present somewhere" do
+      # Reproduces the real intermittent false positive found on
+      # `scanned-layout-table-01`: a due date phrased "Payment due by X"
+      # (not "Due Date: X") sits far from the nearest configured keyword
+      # purely because of document layout, not because the value is
+      # actually ungrounded — see CONTEXT.md's dated entry. The keyword
+      # ("amount", via the table header) is genuinely present in the
+      # document, just nowhere near this particular value.
+      extracted = %{"invoice" => %{due_date: "2026-09-20"}}
+
+      documents = %{
+        "invoice" => """
+        INVOICE
+
+        Vendor: Ironbridge Manufacturing Co.
+        #{String.duplicate("Line item filler text padding the document out. ", 20)}
+        Description       Qty   Rate    Amount
+        Machine parts     10    45.00   450.00
+
+        Total Due: $450.00
+
+        Payment due by 2026-09-20.
+        """
+      }
+
+      shape_signals = %{
+        "invoice" => %{
+          "keywords" => ["invoice", "vendor", "amount", "due date", "bill to"],
+          "min_matches" => 2
+        }
+      }
+
+      assert Checks.grounded_extraction_checks(extracted, documents, shape_signals) == []
+    end
   end
 
   describe "extraction_completeness_checks/1" do

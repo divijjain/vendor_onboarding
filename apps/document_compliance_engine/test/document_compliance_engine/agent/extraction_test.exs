@@ -168,6 +168,84 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
     end
   end
 
+  describe "recover_blank_companions/1" do
+    # Reproduces the real changeset from a live run: the primary field
+    # correctly used the NOT_PRESENT sentinel, but the model left its
+    # companion source_quote blank instead — see CONTEXT.md's dated entry.
+    test "recovers a single blank source_quote companion with the sentinel" do
+      changeset = %Ecto.Changeset{
+        changes: %{
+          company_name: "NOT_PRESENT",
+          tax_id: "N/A",
+          company_name_confidence: 0.0,
+          tax_id_confidence: 1.0,
+          tax_id_source_quote: "Taxpayer Identification Number (EIN): N/A"
+        },
+        errors: [company_name_source_quote: {"can't be blank", [validation: :required]}]
+      }
+
+      assert {:ok, recovered} = Extraction.recover_blank_companions(changeset)
+      assert recovered.company_name_source_quote == "NOT_PRESENT"
+      assert recovered.company_name == "NOT_PRESENT"
+      assert recovered.tax_id_source_quote == "Taxpayer Identification Number (EIN): N/A"
+    end
+
+    test "recovers a blank confidence companion with 0.0" do
+      changeset = %Ecto.Changeset{
+        changes: %{vendor_name: "NOT_PRESENT", vendor_name_source_quote: "NOT_PRESENT"},
+        errors: [vendor_name_confidence: {"can't be blank", [validation: :required]}]
+      }
+
+      assert {:ok, recovered} = Extraction.recover_blank_companions(changeset)
+      assert recovered.vendor_name_confidence == 0.0
+    end
+
+    test "recovers multiple blank companions at once" do
+      # The real case that hit invoice's scanned_malformed fixture: three
+      # companion fields blank in the same completion.
+      changeset = %Ecto.Changeset{
+        changes: %{
+          vendor_name: "Fairview Trading Co.",
+          vendor_name_source_quote: "Vendor: Fairview Trading Co.",
+          vendor_name_confidence: 1.0,
+          amount: "NOT_PRESENT",
+          due_date: "NOT_PRESENT",
+          invoice_number: "NOT_PRESENT"
+        },
+        errors: [
+          amount_source_quote: {"can't be blank", [validation: :required]},
+          due_date_source_quote: {"can't be blank", [validation: :required]},
+          invoice_number_source_quote: {"can't be blank", [validation: :required]}
+        ]
+      }
+
+      assert {:ok, recovered} = Extraction.recover_blank_companions(changeset)
+      assert recovered.amount_source_quote == "NOT_PRESENT"
+      assert recovered.due_date_source_quote == "NOT_PRESENT"
+      assert recovered.invoice_number_source_quote == "NOT_PRESENT"
+      assert recovered.vendor_name == "Fairview Trading Co."
+    end
+
+    test "does not recover when a primary field also failed validation" do
+      # A real missing value is a different, more serious problem than a
+      # metadata companion quirk — must not be silently papered over.
+      changeset = %Ecto.Changeset{
+        changes: %{company_name_confidence: 0.0, company_name_source_quote: ""},
+        errors: [
+          company_name: {"can't be blank", [validation: :required]},
+          company_name_source_quote: {"can't be blank", [validation: :required]}
+        ]
+      }
+
+      assert Extraction.recover_blank_companions(changeset) == :error
+    end
+
+    test "does not recover when there are no errors at all" do
+      changeset = %Ecto.Changeset{changes: %{}, errors: []}
+      assert Extraction.recover_blank_companions(changeset) == :error
+    end
+  end
+
   describe "maybe_regex_extract/2" do
     @field_types %{"company_name" => "string", "tax_id" => "string"}
 

@@ -22,11 +22,12 @@ defmodule DocumentComplianceEngine.Agent.Checks do
       the model to pull fields "verbatim as written"; a field that
       doesn't appear in the source either broke that instruction or was
       invented outright. When the document type configures
-      `shape_signals` for a role, this also requires the match to fall
-      near one of that role's configured keywords — plain substring
-      presence isn't enough on its own, since a long, multi-topic
-      document (a résumé, say) can contain a real dollar figure or date
-      that has nothing to do with the field it got mapped to. (Distinct
+      `shape_signals` for a role, this also requires at least one of
+      that role's configured keywords to appear somewhere in the source —
+      plain substring presence isn't enough on its own, since a long,
+      multi-topic document (a résumé, say) can contain a real dollar
+      figure or date that has nothing to do with the field it got mapped
+      to. (Distinct
       from `Evals.Judge.groundedness/2`, which scores whether a *drafted
       explanation* is grounded in validation findings — this checks
       whether *extracted field values* are grounded in the source
@@ -104,11 +105,6 @@ defmodule DocumentComplianceEngine.Agent.Checks do
     end
   end
 
-  # How much surrounding text (bytes, each side) counts as "near" a
-  # keyword when `shape_signals` are configured for a role — see
-  # `grounded_extraction_checks/3`.
-  @context_window 100
-
   @doc """
   Deterministic (no LLM) check that every non-blank extracted string field
   actually appears in the source text it was extracted from, case- and
@@ -118,14 +114,26 @@ defmodule DocumentComplianceEngine.Agent.Checks do
   type's config didn't think to check.
 
   When `shape_signals` configures keywords for a role, plain substring
-  presence isn't enough — the match must also fall within
-  #{@context_window} bytes of one of those keywords somewhere in the
-  source. A document with no real content for a role can still contain a
-  real, verbatim number or date that means something else entirely (see
-  CONTEXT.md's dated entry on the résumé-as-invoice case this closes);
-  requiring nearby field-relevant vocabulary is a cheap way to tell "this
-  value is really here for this reason" from "this value happens to be
-  somewhere in a long, unrelated document."
+  presence isn't enough — at least one of those keywords must also appear
+  *somewhere* in the source document. A document with no real content for
+  a role can still contain a real, verbatim number or date that means
+  something else entirely (see CONTEXT.md's dated entry on the
+  résumé-as-invoice case this closes); requiring some field-relevant
+  vocabulary anywhere in the document is a cheap way to tell "this document
+  is actually about this role" from "this value happens to be somewhere in
+  a document about something else."
+
+  This used to also require the matched keyword within a fixed byte window
+  of the value, not just present anywhere in the document — dropped after
+  a real, reproducible false positive: a genuinely correct, verbatim value
+  (a due date) sat far enough from the nearest configured keyword, purely
+  because of how that one document happened to phrase its label, to
+  intermittently fall outside the window depending on exactly where the
+  extracted value's own boundaries landed that call. Document-wide
+  presence still catches the case this check exists for — the résumé
+  fixture below has *zero* invoice keywords anywhere in it, not just none
+  nearby — without being sensitive to exactly where in the document the
+  value and the keyword each happen to sit. See CONTEXT.md's dated entry.
   """
   @spec grounded_extraction_checks(%{String.t() => map()}, %{String.t() => String.t()}, map()) ::
           [ValidationResult.check()]
@@ -147,24 +155,14 @@ defmodule DocumentComplianceEngine.Agent.Checks do
   end
 
   defp grounded?(value, source, shape) do
-    String.contains?(source, value) and near_keywords?(value, source, shape)
+    String.contains?(source, value) and keyword_present?(source, shape)
   end
 
-  defp near_keywords?(_value, _source, nil), do: true
-  defp near_keywords?(_value, _source, shape) when map_size(shape) == 0, do: true
+  defp keyword_present?(_source, nil), do: true
+  defp keyword_present?(_source, shape) when map_size(shape) == 0, do: true
 
-  defp near_keywords?(value, source, %{"keywords" => keywords}) do
-    normalized_keywords = Enum.map(keywords, &normalize_text/1)
-
-    source
-    |> :binary.matches(value)
-    |> Enum.any?(fn {start, len} ->
-      window_start = max(0, start - @context_window)
-      window_end = min(byte_size(source), start + len + @context_window)
-      window = :binary.part(source, window_start, window_end - window_start)
-
-      Enum.any?(normalized_keywords, &String.contains?(window, &1))
-    end)
+  defp keyword_present?(source, %{"keywords" => keywords}) do
+    Enum.any?(keywords, &String.contains?(source, normalize_text(&1)))
   end
 
   @doc """
@@ -194,10 +192,25 @@ defmodule DocumentComplianceEngine.Agent.Checks do
   defp blank?(value) when is_binary(value), do: String.trim(value) == ""
   defp blank?(_value), do: false
 
-  # Not empirically calibrated the way the entity-match thresholds above
-  # are (no eval data yet on how well-calibrated GPT-4o-mini's
-  # self-reported confidence actually is) — a conservative default
-  # pending real data, not a tuned number.
+  # A real calibration attempt was made (`Evals.Run.confidence_calibration/1`,
+  # `mix eval.run`'s "Confidence calibration" section) — not the same
+  # situation as the entity-match thresholds above, which had real
+  # separation data to calibrate against. Across all 288 real (non-regex,
+  # non-shape-gate-skipped) field confidences in the full 79-fixture
+  # corpus, every single one was 0.90 or higher, and *zero* fields with a
+  # genuine confidence value ever failed the grounding check — GPT-4o-mini
+  # is uniformly high-confidence on every field it actually attempts in
+  # this corpus, correct or not, so there is no natural separation point
+  # in the data to set a threshold from. That makes 0.7 (or any number
+  # below ~0.90) behaviorally identical here: this check has never fired
+  # once against this corpus. Left at 0.7 rather than invented a
+  # different number with equally no evidence behind it — the honest
+  # finding is that self-reported confidence doesn't discriminate at all
+  # in the data available, not that a better threshold is hiding
+  # somewhere. `grounded_extraction_checks/3` is doing the real work;
+  # this stays exactly the "complementary, not primary" signal the
+  # moduledoc always said it was, now with data behind that instead of
+  # a hunch. See CONTEXT.md's dated entry.
   @low_confidence_threshold 0.7
 
   @doc """

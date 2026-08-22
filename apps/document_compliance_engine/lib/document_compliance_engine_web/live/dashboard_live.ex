@@ -25,10 +25,10 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
 
     socket =
       Enum.reduce(@upload_roles, socket, fn {ref, _slug, _label}, socket ->
-        # .pdf is real now (PdfText runs it through pdftotext before
-        # extraction — see CONTEXT.md) — text-layer PDFs only, no OCR yet
-        # for a scanned/image-only PDF, still a documented, separate gap.
-        allow_upload(socket, ref, accept: ~w(.txt .pdf), max_entries: 1)
+        # .pdf runs through pdftotext (falling back to vision transcription
+        # for a scanned/image-only page); .jpg/.jpeg/.png go straight to
+        # that same vision transcription — see PdfText and CONTEXT.md.
+        allow_upload(socket, ref, accept: ~w(.txt .pdf .jpg .jpeg .png), max_entries: 1)
       end)
 
     {:ok,
@@ -159,7 +159,10 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
   end
 
   defp upload_error_message(:too_large), do: "File is too large"
-  defp upload_error_message(:not_accepted), do: "Only .txt or .pdf files are accepted"
+
+  defp upload_error_message(:not_accepted),
+    do: "Only .txt, .pdf, .jpg, .jpeg, or .png files are accepted"
+
   defp upload_error_message(:too_many_files), do: "Only one file allowed"
   defp upload_error_message(other), do: to_string(other)
 
@@ -218,7 +221,7 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
         <div class="card-body">
           <h2 class="card-title">Submit a document</h2>
           <p class="text-sm opacity-70">
-            Upload a document to run it through the compliance pipeline. .txt or .pdf (text-layer PDFs only — no OCR for scanned documents yet).
+            Upload a document to run it through the compliance pipeline. .txt, .pdf, .jpg, or .png — a scanned/image-only page is transcribed by a vision model automatically.
           </p>
           <form id="manual-upload-form" phx-change="upload_type_change" phx-submit="submit_upload">
             <.input

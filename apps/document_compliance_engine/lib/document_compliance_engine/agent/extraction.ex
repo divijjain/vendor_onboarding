@@ -45,6 +45,21 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   extraction_completeness_checks/1` turns into a halt when too much of a
   role's extraction comes back empty — one mechanism, two ways to reach it.
 
+  **The sentinel discipline has to cover the companion fields too, not just
+  the primary one.** The prompt tells the model to use `"NOT_PRESENT"` for
+  `<field>_source_quote` when `<field>` itself is absent — an LLM call isn't
+  guaranteed to comply every time, and when it doesn't (emits `""` instead),
+  Instructor's `validate_required/2` rejects it the same way it would reject
+  a blank primary field. `recover_blank_companions/1` is the backstop: when
+  *every* validation failure on a completion is confined to `_source_quote`/
+  `_confidence` companion keys (never a primary field — that's a real
+  missing value, not a metadata quirk, and is left to fail loudly), it
+  refills just those companions with the same default a compliant response
+  would have used and continues, instead of hard-failing the whole pipeline
+  run over what is, in substance, still an honest "not present." See
+  CONTEXT.md's dated entry — this recurred on both document types in this
+  app before the backstop existed.
+
   **Confidence + source-location grounding.** Every field extracted via a
   real LLM call also comes back with a self-reported `confidence` (0.0-1.0)
   and `source_quote` (the verbatim span of the document the model says
@@ -64,6 +79,8 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   the cross-provider judge, the deterministic checks elsewhere in this
   module), so it adds a check rather than becoming the primary one.
   """
+
+  require Logger
 
   @tax_id_pattern ~r/\b\d{2}-\d{7}\b/
   @not_present_sentinel "NOT_PRESENT"
@@ -221,9 +238,11 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
       "For each field named <field>, also provide <field>_confidence (a number from 0.0 to " <>
       "1.0 for how confident you are the value is correct and actually present in the " <>
       "document) and <field>_source_quote (the exact verbatim sentence or phrase from the " <>
-      "document that supports the value — an empty string if the field is not present). " <>
-      "If a field is not actually present in this document, output exactly the string " <>
-      "\"#{@not_present_sentinel}\" for it — never guess or infer a value from unrelated content.\n\n"
+      "document that supports the value). " <>
+      "If a field is not actually present in this document: output exactly the string " <>
+      "\"#{@not_present_sentinel}\" for the field itself AND for its <field>_source_quote " <>
+      "(never an empty string for either), and use 0.0 for its <field>_confidence — never " <>
+      "guess or infer a value from unrelated content.\n\n"
   end
 
   defp complete(role, field_types, text) do
@@ -236,11 +255,63 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
            messages: [%{role: "user", content: prompt(role, field_types) <> text}]
          ) do
       {:ok, raw} ->
-        {fields, metadata} = raw |> denote_missing() |> split_metadata(field_types)
-        {:ok, fields, metadata}
+        complete_ok(raw, field_types)
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        case recover_blank_companions(changeset) do
+          {:ok, raw} -> complete_ok(raw, field_types)
+          :error -> {:error, changeset}
+        end
 
       error ->
         error
+    end
+  end
+
+  defp complete_ok(raw, field_types) do
+    {fields, metadata} = raw |> denote_missing() |> split_metadata(field_types)
+    {:ok, fields, metadata}
+  end
+
+  @doc """
+  Backstop for when the model doesn't follow the companion-field sentinel
+  instruction in `prompt/2` — see the moduledoc. Only recovers when *every*
+  validation failure on the changeset is confined to a `_source_quote`/
+  `_confidence` companion key; a primary field failing validation is a
+  different, more serious problem and is left to fail loudly rather than
+  silently defaulted.
+  """
+  @spec recover_blank_companions(Ecto.Changeset.t()) :: {:ok, map()} | :error
+  def recover_blank_companions(changeset) do
+    error_fields = Keyword.keys(changeset.errors)
+
+    if error_fields != [] and Enum.all?(error_fields, &companion_field?/1) do
+      Logger.warning(
+        "Instructor left companion field(s) blank instead of using the NOT_PRESENT " <>
+          "sentinel: #{inspect(error_fields)} — recovering instead of failing the run"
+      )
+
+      recovered =
+        Enum.reduce(error_fields, changeset.changes, fn field, acc ->
+          Map.put(acc, field, companion_default(field))
+        end)
+
+      {:ok, recovered}
+    else
+      :error
+    end
+  end
+
+  defp companion_field?(field) do
+    name = Atom.to_string(field)
+    String.ends_with?(name, "_source_quote") or String.ends_with?(name, "_confidence")
+  end
+
+  defp companion_default(field) do
+    if String.ends_with?(Atom.to_string(field), "_confidence") do
+      0.0
+    else
+      @not_present_sentinel
     end
   end
 

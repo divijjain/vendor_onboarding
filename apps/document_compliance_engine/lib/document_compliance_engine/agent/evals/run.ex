@@ -9,7 +9,12 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   — genuinely document-type-generic, not hardcoded to one slug: a fixture
   carries its own `document_type_slug`, so `run_all/2` can be handed a mix
   of `vendor_contract_w9` and `invoice` fixtures (or any future type) in
-  one pass.
+  one pass. Most fixtures carry pre-extracted `documents` text and skip
+  straight to the reactor; the `scanned` bucket instead carries
+  `image_paths` and is run through `PdfText.extract/1` first by
+  `build_documents/1` — the one place this harness exercises the
+  vision-transcription fallback against real image bytes, see
+  `Fixtures`' moduledoc and CONTEXT.md's dated entry.
 
   Two tiers:
     - Deterministic (always runs, no judge key needed): Tax ID
@@ -31,6 +36,7 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   alias DocumentComplianceEngine.Agent.Evals.{Deterministic, Fixtures, Judge}
   alias DocumentComplianceEngine.Agent.{Checks, DocumentReactor}
   alias DocumentComplianceEngine.DocumentTypes
+  alias DocumentComplianceEngine.PdfText
 
   defmodule Result do
     @moduledoc false
@@ -40,6 +46,7 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       :entity_match,
       :tax_id_verbatim_ok,
       :fields_grounded,
+      :field_confidences,
       :explanation,
       :findings,
       :error
@@ -71,21 +78,48 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   def run_fixture(fixture, reactor \\ DocumentReactor, document_type \\ nil) do
     document_type = document_type || fetch_document_type!(fixture.document_type_slug)
 
-    inputs = %{
-      document_type_slug: fixture.document_type_slug,
-      documents: fixture.documents,
-      extraction_schema: document_type.extraction_schema,
-      validation_rules: document_type.validation_rules,
-      shape_signals: document_type.shape_signals,
-      human_decision: nil
-    }
+    case build_documents(fixture) do
+      {:ok, documents} ->
+        inputs = %{
+          document_type_slug: fixture.document_type_slug,
+          documents: documents,
+          extraction_schema: document_type.extraction_schema,
+          validation_rules: document_type.validation_rules,
+          shape_signals: document_type.shape_signals,
+          human_decision: nil
+        }
 
-    reactor
-    |> Reactor.run(inputs)
-    |> to_result(fixture, document_type)
+        reactor
+        |> Reactor.run(inputs)
+        |> to_result(fixture, document_type, documents)
+
+      {:error, reason} ->
+        %Result{fixture: fixture, error: inspect(reason)}
+    end
   end
 
-  defp to_result({:ok, final}, fixture, document_type) do
+  # Plain-text fixtures (`documents` set) go straight to the reactor, same
+  # as always. Image-backed fixtures (`image_paths` set — the `scanned`
+  # bucket) get read off disk and run through `PdfText.extract/1` first,
+  # exactly like production's `Agent.Run.read_documents/2` does with a
+  # webhook's uploaded bytes — so this is the one place the eval harness
+  # actually exercises the vision-transcription fallback, not just the
+  # plain-text reactor path.
+  defp build_documents(%Fixtures.Fixture{image_paths: image_paths})
+       when is_map(image_paths) and map_size(image_paths) > 0 do
+    Enum.reduce_while(image_paths, {:ok, %{}}, fn {role, path}, {:ok, acc} ->
+      with {:ok, bytes} <- File.read(path),
+           {:ok, text} <- PdfText.extract(bytes) do
+        {:cont, {:ok, Map.put(acc, role, text)}}
+      else
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp build_documents(fixture), do: {:ok, fixture.documents}
+
+  defp to_result({:ok, final}, fixture, document_type, documents) do
     tax_id = get_in(final.extracted, ["w9", :tax_id])
 
     %Result{
@@ -95,16 +129,19 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       # entity_match rule (when this type has one) is known true here
       # without re-reading the (completed) validation step.
       entity_match: if(fixture.expected_entity_match != nil, do: true),
-      tax_id_verbatim_ok: tax_id_verbatim_ok(fixture, tax_id),
-      fields_grounded: fields_grounded?(final.extracted, fixture, document_type)
+      tax_id_verbatim_ok: tax_id_verbatim_ok(documents, tax_id),
+      fields_grounded: fields_grounded?(final.extracted, documents, document_type),
+      field_confidences:
+        field_confidences(final.extracted, final.extraction_metadata, documents, document_type)
     }
   end
 
-  defp to_result({:halted, reactor}, fixture, document_type) do
+  defp to_result({:halted, reactor}, fixture, document_type, documents) do
     results = reactor.intermediate_results || %{}
     validation = results[:validate]
     extract_result = results[:extract] || %{}
     extracted = extract_result[:fields] || %{}
+    metadata = extract_result[:metadata] || %{}
     tax_id = get_in(extracted, ["w9", :tax_id])
 
     explanation =
@@ -120,28 +157,76 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       fixture: fixture,
       decision: "needs_review",
       entity_match: entity_match_check && entity_match_check.passed,
-      tax_id_verbatim_ok: tax_id_verbatim_ok(fixture, tax_id),
-      fields_grounded: fields_grounded?(extracted, fixture, document_type),
+      tax_id_verbatim_ok: tax_id_verbatim_ok(documents, tax_id),
+      fields_grounded: fields_grounded?(extracted, documents, document_type),
+      field_confidences: field_confidences(extracted, metadata, documents, document_type),
       explanation: explanation,
       findings: validation && Checks.describe_findings(validation)
     }
   end
 
-  defp to_result({:error, reason}, fixture, _document_type) do
+  defp to_result({:error, reason}, fixture, _document_type, _documents) do
     # Graceful degradation is itself a measured outcome, not a harness
     # crash — exactly what the malformed buckets test for.
     %Result{fixture: fixture, error: inspect(reason)}
   end
 
-  defp tax_id_verbatim_ok(fixture, tax_id) do
-    case Map.get(fixture.documents, "w9") do
+  defp tax_id_verbatim_ok(documents, tax_id) do
+    case Map.get(documents, "w9") do
       nil -> nil
       w9_text -> Deterministic.tax_id_verbatim?(tax_id, w9_text)
     end
   end
 
-  defp fields_grounded?(extracted, fixture, document_type) do
-    Deterministic.fields_grounded?(extracted, fixture.documents, document_type.shape_signals)
+  defp fields_grounded?(extracted, documents, document_type) do
+    Deterministic.fields_grounded?(extracted, documents, document_type.shape_signals)
+  end
+
+  # `:tax_id` is deliberately excluded — its confidence is either a
+  # synthesized `1.0` (regex-resolved, no model call at all) or a real LLM
+  # call, and the two are indistinguishable from `extraction_metadata`
+  # alone (see `Extraction.regex_metadata/1`). Mixing synthesized
+  # confidence into a calibration meant to measure the *model's own*
+  # self-report would silently bias it toward high-confidence/grounded,
+  # not a real read on whether confidence predicts correctness.
+  @calibration_excluded_field :tax_id
+
+  defp field_confidences(extracted, metadata, documents, document_type) do
+    ungrounded =
+      extracted
+      |> Checks.grounded_extraction_checks(documents, document_type.shape_signals)
+      |> MapSet.new(&{&1.rule["field"]["role"], &1.rule["field"]["name"]})
+
+    for {role, fields} <- extracted,
+        {field, value} <- fields,
+        field != @calibration_excluded_field,
+        is_binary(value),
+        confidence = get_in(metadata, [role, field, :confidence]),
+        is_number(confidence) do
+      %{
+        role: role,
+        field: field,
+        confidence: confidence,
+        grounded: not MapSet.member?(ungrounded, {role, field})
+      }
+    end
+  end
+
+  @doc """
+  Per-field self-reported confidence, bucketed by whether that field's own
+  value actually passed the deterministic grounding check — the empirical
+  question `Checks.low_confidence_checks/2`'s threshold needs a real answer
+  to, not a guess (its own moduledoc: "not empirically calibrated... a
+  conservative default pending real data"). See CONTEXT.md's dated entry.
+  """
+  @spec confidence_calibration([%Result{}]) :: %{grounded: [float()], ungrounded: [float()]}
+  def confidence_calibration(results) do
+    all = results |> Enum.filter(&is_nil(&1.error)) |> Enum.flat_map(& &1.field_confidences)
+
+    %{
+      grounded: all |> Enum.filter(& &1.grounded) |> Enum.map(& &1.confidence),
+      ungrounded: all |> Enum.reject(& &1.grounded) |> Enum.map(& &1.confidence)
+    }
   end
 
   @doc "Per document-type, per-bucket decision accuracy."

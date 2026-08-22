@@ -102,18 +102,23 @@ Grown from an original 20 (10/5/3/2) specifically so the two thinnest buckets ar
 
 Even at 55 cases this isn't benchmark-scale — a couple of buckets are still small enough that a single failure is visible in the headline number — but it's past the point where the numbers were mostly noise; see CONTEXT.md's dated entry for the sizing rationale.
 
-### `invoice` — 14 fixtures
+### `invoice` — 16 fixtures
 
 Sized to what the type's actual rule surface can meaningfully exercise: one business rule (`screen_vendor`) plus the two automatic checks every document type gets for free — `grounded_extraction_checks/3` and `extraction_completeness_checks/1` (see "Why this shape" above).
 
 | Bucket | Count | Tests |
 |---|---|---|
 | Clean, should auto-approve | 6 | happy path |
-| Sanctions hit | 2 | true-positive flagging — the exact two names the mock `sanctions_db` server's watchlist contains (an exact, case-insensitive match — not fuzzy), not invented values that would pass or fail by coincidence |
+| Sanctions hit | 2 | true-positive flagging — the exact two names the mock `sanctions_db` server's watchlist contains, not invented values that would pass or fail by coincidence |
+| Sanctions evasion | 2 | real adversarial-testing finds (an inserted word, a Cyrillic "о" homoglyph) — see Adversarial testing below |
 | Malformed (vendor name present, other fields genuinely absent) | 3 | `extraction_completeness` catching a mostly-empty extraction |
 | Wrong document type (résumé/cover-letter text, not an invoice) | 3 | the shape gate (`Extraction.shape_matches?/2`) rejecting it *before* any extraction call — zero LLM cost |
 
-The wrong-document-type bucket isn't a hypothetical: an uploaded résumé was once extracted into a fully fabricated invoice (vendor name, invoice number, amount, and due date all invented from a document that mentioned none of them) before the shape gate and completeness check existed — see CONTEXT.md's dated entry. This bucket turns that real incident into a permanent regression test.
+The wrong-document-type bucket isn't a hypothetical: an uploaded résumé was once extracted into a fully fabricated invoice (vendor name, invoice number, amount, and due date all invented from a document that mentioned none of them) before the shape gate and completeness check existed — see CONTEXT.md's dated entry. This bucket turns that real incident into a permanent regression test. The sanctions-evasion bucket is the same pattern applied to a second real incident, found deliberately via adversarial testing rather than by accident.
+
+### `invoice` (scanned) — 8 fixtures
+
+The only bucket that exercises `PdfText`'s vision-transcription fallback for real: synthetic scanned invoice images, run through `PdfText.extract/1` before the reactor instead of typed in as text — 2 clean (rotated, blurred), 1 sanctions hit (same real watchlisted name as above, this time as pixels), 1 malformed (vendor name legible, remaining fields blurred into genuine illegibility), 2 layout-diverse (a table-style invoice and a letterhead invoice with different field wording, deliberately breaking the fixed template the others share), and 2 photo-realistic (a real geometric perspective distortion plus grain and JPEG re-compression; simulated glare/uneven lighting via a composited gradient, also JPEG — the first real JPEG-magic-byte coverage in this corpus). A wiring smoke test, not a vision-transcription benchmark — 8 images can't support a statistical claim. See BENCHMARK.md for the full writeup, including two real, independently-surfaced bugs the diversity in this bucket found that a fixed rotate+blur template never could have.
 
 ### Results, run for real
 
@@ -127,14 +132,29 @@ The wrong-document-type bucket isn't a hypothetical: an uploaded résumé was on
 | `vendor_contract_w9` / malformed | 8/8 |
 | `invoice` / clean | 6/6 |
 | `invoice` / sanctions hit | 2/2 |
+| `invoice` / sanctions evasion | 2/2 |
 | `invoice` / malformed | 3/3 |
 | `invoice` / wrong document type | 3/3 |
+| `invoice` (scanned) / clean | 2/2 |
+| `invoice` (scanned) / sanctions hit | 1/1 |
+| `invoice` (scanned) / malformed | 1/1 |
+| `invoice` (scanned) / layout-diverse | 2/2 |
+| `invoice` (scanned) / photo-realistic | 2/2 |
 
-The one miss is real, not massaged away: `formatting-07` ("The Wilson Group" vs "Wilson Group LLC") landed in `staged_match/2`'s ambiguous band and GPT-4o-mini's entity-match judgment call this run said "different entities" — a genuine, if debatable, model call, not a bug in this codebase. An eval that always reports a suspiciously clean 100% is worth trusting less than one that shows its one real disagreement.
+Real bugs were found by this exact harness (plus deliberate adversarial testing — see below) on earlier runs, root-caused, fixed, and re-verified against the live pipeline:
 
-LLM-judge tier (Claude Sonnet, scoring the GPT-4o-mini agent's own judgments — cross-provider, not self-grading): entity-match correctness averaged **0.98** (n=47, every `vendor_contract_w9` fixture with a known expected match/mismatch — the same `formatting-07` case is most of that gap from 1.00); groundedness of drafted explanations averaged **1.00** (n=32 — every fixture across *both* document types that actually halted with an explanation: 15 mismatch + 8 malformed + `formatting-07`'s unexpected halt, from `vendor_contract_w9`, plus all 8 halted `invoice` fixtures).
+1. **Fixed — hard error instead of a graceful halt.** `malformed-02`/`malformed-08` (`vendor_contract_w9`) and, on a later run, `scanned-malformed-01` (`invoice`) all hard-errored instead of gracefully halting. GPT-4o-mini correctly used the `"NOT_PRESENT"` sentinel for an absent primary field, but the companion `<field>_source_quote` was prompted to return `""` instead, and Instructor's forced `validate_required` rejected that as blank. Fixed the prompt to ask for the sentinel on companions too, and added `Extraction.recover_blank_companions/1` as a defense-in-depth backstop for when the model still doesn't comply. Both buckets are now clean.
+2. **Fixed — intermittent grounding false-positive.** `scanned-layout-table-01` intermittently flagged a genuinely correct, verbatim due date as a possible hallucination, because `grounded_extraction_checks/3` required a `shape_signals` keyword within a fixed 100-byte window and this fixture's phrasing ("Payment due by", not "Due Date:") didn't reliably keep one that close. Fixed by requiring the keyword anywhere in the source document instead of near the specific match — still catches the résumé regression case (zero matching keywords anywhere), no longer sensitive to exact positioning. Now a clean 2/2.
+3. **Fixed — sanctions-screening evasion, found via deliberate adversarial testing.** Six realistic evasion attempts against a real watchlisted name (extra whitespace, a middle initial, a trailing period, a comma variant, a Cyrillic "о" homoglyph, an inserted word) all sailed through the old exact-match-only mock screen to full auto-approval — zero human review. Fixed by having `SanctionsDb.Server` compute Jaro-distance similarity against the watchlist; an exact match is still a certain hit, and anything above a threshold calibrated against these six real attempts is now flagged for manual review instead of silently cleared. See "Adversarial testing" in BENCHMARK.md for the other three vectors tried (prompt injection, a grounded-but-wrong-value probe, shape-gate keyword-stuffing) and what came of each.
+4. **Left standing — a genuinely ambiguous entity-match call.** `formatting-07` ("The Wilson Group" vs "Wilson Group LLC") landed in the ambiguous band and GPT-4o-mini's judgment call this run said "different entities" — not a bug, exactly the kind of real disagreement the 12-fixture formatting bucket exists to surface rather than hide.
+
+See BENCHMARK.md for the full changesets, the complete adversarial-testing writeup, and CONTEXT.md's dated entries, including the regression tests that lock each fix in.
+
+LLM-judge tier (Claude Sonnet, scoring the GPT-4o-mini agent's own judgments — cross-provider, not self-grading): entity-match correctness averaged **0.98** (n=47, every `vendor_contract_w9` fixture with a known expected match/mismatch); groundedness of drafted explanations averaged **1.00** (n=36 — every fixture across *both* document types that actually halted with an explanation).
 
 An earlier 20-fixture run once reported groundedness as `n=4` instead of the expected `n=5` — `judge_scores/1` used to silently drop a failed judge call from the average rather than count it, so the gap wasn't visible until it was made to surface failures explicitly. That dropped call turned out to be a real parsing bug, not a flaky network error: Claude's extended-thinking responses put a `type: "thinking"` block ahead of the `type: "text"` block in the response, and `Judge.extract_text/1` assumed the first content block was always the answer. Fixed to search for the actual `text` block instead of assuming its position — see `CONTEXT.md`'s dated entry for the full story, including why an eval harness silently hiding its own failures is exactly the failure mode this whole project is built to catch on the agent side.
+
+**Confidence calibration, run for real.** `Checks.low_confidence_checks/2`'s threshold (0.7) used to be an explicit guess — "not empirically calibrated... pending real data." `Evals.Run.confidence_calibration/1` now pairs every real per-field confidence score against whether that field passed grounding, across all 79 fixtures, and `mix eval.run` prints it every run. The honest result: all 288 real confidence values were 0.90 or higher, and *zero* fields with genuine confidence ever failed grounding — GPT-4o-mini is uniformly high-confidence on everything it attempts in this corpus, correct or not, so there's no natural separation point to calibrate a threshold from, unlike `entity_match`'s thresholds (which had a real, measurable gap between buckets). The threshold stays at 0.7 rather than trading one unjustified guess for another — see BENCHMARK.md's "Confidence calibration" section for the full data and reasoning.
 
 ## Tech stack
 
@@ -161,14 +181,14 @@ The pipeline is document-type-generic, proven against two real, structurally dif
 **Current state:**
 
 - 142 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently.
-- Real PDF text extraction: `PdfText` detects a PDF by its magic-number header and runs it through `pdftotext` before extraction — text-layer PDFs only, no OCR yet. Both the webhook and the dashboard's upload form accept `.pdf` now, not just `.txt`.
+- Real PDF text extraction, with a vision-transcription fallback for scanned/image-only input: `PdfText` detects a PDF by its magic-number header and runs it through `pdftotext`; a PDF with no text layer (or a raw JPEG/PNG upload) is rasterized/transcribed by a vision-capable LLM call instead. Both the webhook and the dashboard's upload form accept `.pdf`, `.jpg`/`.jpeg`, and `.png` now, not just `.txt`.
 - Entity-match and Tax ID extraction are staged, not always-LLM: a calibrated string-similarity pre-filter resolves clear entity matches/mismatches without a call, and Tax ID resolves via regex when the EIN pattern is unambiguous in the source text — both fall through to the LLM only when genuinely ambiguous, never guess. See "Why this shape" above and `CONTEXT.md` for the research and calibration behind the thresholds.
 - `mix dialyzer` clean except 4 known, pre-existing errors — 2 `Mix.Task` callback-info warnings in `lib/mix/tasks/eval.run.ex`, 2 `guard_fail`s on a defensive `|| %{}` fallback that Reactor's own types prove unreachable — deliberately not wired into CI yet (see `CLAUDE.md`'s Pre-commit section).
 - Every LLM call (both extractions, entity-match, explanation-drafting, and the eval judge) is dependency-injected and overridable via `Application.get_env(:document_compliance_engine, :agent_*)`, so the ExUnit test suite (this project's correctness guarantee, run on every `mix precommit`) always uses injected fakes plus the two *real* MCP servers and the *real* Postgres checkpointer — never a live model call, by design, regardless of whether API keys happen to be configured locally. The eval harness is separate: `mix eval.run` has now been run for real, with both API keys and both MCP servers live — see the Evaluation section above for the results, and for the real bug that surfaced along the way.
 - The durable-pause guarantee (a paused review surviving a killed-and-restarted process, mid-review) and the resume-doesn't-re-extract guarantee have both been re-verified against the current, generalized reactor — not just inherited from the pre-generalization implementation.
 - Both document types were also verified against a real running server (not just the test suite): POSTed over real HTTP with a valid HMAC signature, correctly land on `document_jobs` with the right `document_type_slug`, and — with no `OPENAI_API_KEY` present — fail gracefully at extraction rather than hanging in `:processing`, for both document shapes.
 
-**PDF text extraction:** `DocumentComplianceEngine.PdfText` detects a PDF by its `%PDF-` magic-number header and runs it through `pdftotext` (poppler-utils — `brew install poppler`, a real system dependency, not bundled) before anything reaches the extraction prompt; anything else (every eval fixture, a `.txt` upload) is treated as already-plain-text and passed through unchanged. **Known limitation:** this only handles PDFs with a real text layer — a scanned/image-only PDF has no text layer for `pdftotext` to find, and OCR on top of this remains real, separate, currently-unscoped work. See `CONTEXT.md`'s dated entry.
+**PDF text extraction and vision fallback:** `DocumentComplianceEngine.PdfText` detects a PDF by its `%PDF-` magic-number header and runs it through `pdftotext` (poppler-utils — `brew install poppler`, a real system dependency, not bundled) before anything reaches the extraction prompt; anything else (every eval fixture, a `.txt` upload) is treated as already-plain-text and passed through unchanged. A PDF whose `pdftotext` output comes back empty (a scanned/image-only page has no text layer to find) is rasterized page-by-page via `pdftoppm` — the same poppler-utils dependency, no new system requirement — and each page image is transcribed by a vision-capable LLM call; a raw photo/screenshot upload (JPEG/PNG, detected by its own magic header) skips straight to that same transcription step. Either way the output is still plain text, so extraction, groundedness checking, and confidence scoring downstream never need to know or care whether a document's text came from a text layer, OCR, or a vision model reading a photo. Verified for real against a synthetic rotated, blurred "scanned" invoice image, not just tests: correct transcription, correct structured extraction with 1.0 confidence and correct source quotes, and an `approved` decision through the full pipeline including the real sanctions-screening MCP call. See `CONTEXT.md`'s dated entry.
 
 Full dated build history and every architectural decision, with rationale, lives in `CONTEXT.md`.
 
@@ -206,7 +226,7 @@ doesn't do what you'd expect here.
 
   Two lighter-weight alternatives to hand-signing curl requests:
   - `mix webhook.send <fixture_id>` (e.g. `mix webhook.send clean-01`) signs and posts one of the eval harness's 55 fixtures against a running `mix phx.server`
-  - The dashboard itself (`/document_jobs`) has a "Submit a document" form — file upload, calls the same `DocumentJobs.ingest_webhook/1` the real webhook hits (just without the HMAC step, since it's a trusted in-process LiveView action, not an untrusted network caller). `.txt` or `.pdf` (text-layer PDFs only, via `PdfText` — see "PDF text extraction" above; no OCR yet for a scanned/image PDF).
+  - The dashboard itself (`/document_jobs`) has a "Submit a document" form — file upload, calls the same `DocumentJobs.ingest_webhook/1` the real webhook hits (just without the HMAC step, since it's a trusted in-process LiveView action, not an untrusted network caller). `.txt`, `.pdf`, `.jpg`/`.jpeg`, or `.png` — via `PdfText`, see "PDF text extraction and vision fallback" above.
 
 The two mock MCP tool servers are still separate OTP applications — genuinely external tools, not part of the agent pipeline — and run alongside Phoenix during local development:
 

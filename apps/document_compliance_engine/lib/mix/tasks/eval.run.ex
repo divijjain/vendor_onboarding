@@ -28,6 +28,7 @@ defmodule Mix.Tasks.Eval.Run do
     print_table(results)
     print_buckets(results)
     print_judge(results)
+    print_confidence_calibration(results)
   end
 
   # Without this the agents fail per-fixture with an opaque adapter error
@@ -124,4 +125,39 @@ defmodule Mix.Tasks.Eval.Run do
       end)
     end
   end
+
+  defp print_confidence_calibration(results) do
+    IO.puts("")
+    IO.puts("--- Confidence calibration (Checks.low_confidence_checks/2's threshold) ---")
+
+    %{grounded: grounded, ungrounded: ungrounded} = Run.confidence_calibration(results)
+
+    print_confidence_stats("grounded", grounded)
+    print_confidence_stats("ungrounded", ungrounded)
+  end
+
+  defp print_confidence_stats(_label, []), do: IO.puts("  no data")
+
+  defp print_confidence_stats(label, confidences) do
+    sorted = Enum.sort(confidences)
+    avg = Enum.sum(confidences) / length(confidences)
+
+    IO.puts(
+      "  #{label}: n=#{length(confidences)} min=#{fmt(hd(sorted))} " <>
+        "median=#{fmt(median(sorted))} avg=#{fmt(avg)} max=#{fmt(List.last(sorted))}"
+    )
+  end
+
+  defp median(sorted) do
+    count = length(sorted)
+    mid = div(count, 2)
+
+    if rem(count, 2) == 0 do
+      (Enum.at(sorted, mid - 1) + Enum.at(sorted, mid)) / 2
+    else
+      Enum.at(sorted, mid)
+    end
+  end
+
+  defp fmt(n), do: :erlang.float_to_binary(n * 1.0, decimals: 2)
 end

@@ -1,0 +1,25 @@
+app = "document-compliance-engine"
+primary_region = "iad"
+
+[build]
+
+[env]
+  PORT = "8080"
+  PHX_SERVER = "true"
+  # Reached over Fly's private 6PN network, not the public internet.
+  TAX_API_MCP_URL = "http://document-compliance-tax-api.internal:8080/mcp"
+  SANCTIONS_DB_MCP_URL = "http://document-compliance-sanctions-db.internal:8080/mcp"
+
+[deploy]
+  release_command = "/app/bin/migrate"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

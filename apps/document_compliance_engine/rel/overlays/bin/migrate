@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+# Fly's release_command machine is freshly launched per deploy and starts
+# this script before its own join to the private 6PN network has finished —
+# DATABASE_URL's .internal/.flycast hostname resolves fine from any
+# already-running machine, just not for the first several seconds of this
+# one's life, and that join time isn't consistent enough for a fixed sleep.
+# Poll for DNS resolution instead of guessing a delay.
+db_host=$(echo "$DATABASE_URL" | sed -E 's#.*@([^:/]+).*#\1#')
+i=0
+while [ "$i" -lt 30 ] && ! getent hosts "$db_host" >/dev/null 2>&1; do
+  i=$((i + 1))
+  sleep 1
+done
+
+cd -P -- "$(dirname -- "$0")"
+exec ./document_compliance_engine eval DocumentComplianceEngine.Release.migrate

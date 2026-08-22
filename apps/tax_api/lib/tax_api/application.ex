@@ -18,7 +18,12 @@ defmodule TaxApi.Application do
         [
           Hermes.Server.Registry,
           {TaxApi.Server, transport: :streamable_http},
-          {Bandit, plug: TaxApi.Router, port: port}
+          # ip: :: — Bandit otherwise binds IPv4-only, and Fly's private
+          # network (6PN, what document_compliance_engine reaches this on
+          # in prod) is IPv6-only. Dual-stack on Linux still accepts IPv4
+          # (e.g. localhost in dev/test) unless IPV6_V6ONLY is set, which
+          # this doesn't do.
+          {Bandit, plug: TaxApi.Router, port: port, ip: {0, 0, 0, 0, 0, 0, 0, 0}}
         ]
     end
   end

@@ -20,7 +20,7 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
     12 formatting-only     -> NOT a real mismatch (tests false-positive rate)
      8 missing/malformed   -> tests graceful degradation
 
-  **`invoice`** — 14 fixtures, sized to what the type's actual rule
+  **`invoice`** — 16 fixtures, sized to what the type's actual rule
   surface can meaningfully exercise (one business rule — `screen_vendor`
   — plus the two automatic checks every document type gets for free:
   `Checks.grounded_extraction_checks/3` and
@@ -34,6 +34,14 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
                                not invented, so a real eval run's result is
                                a genuine pass/fail against that mock, not a
                                coin flip)
+     2 sanctions evasion    -> should also flag — real adversarial-testing
+                               finds (an inserted word, a Cyrillic "о"
+                               homoglyph), not hypothetical worst-cases.
+                               Every one of these auto-approved with zero
+                               human review before `SanctionsDb.Server`
+                               grew fuzzy matching — see CONTEXT.md's dated
+                               entry. A standing regression check for that
+                               fix, not just a smoke test.
      3 malformed            -> vendor name present and grounded, but most
                                other fields genuinely absent from the
                                source — tests `extraction_completeness`
@@ -46,34 +54,90 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
                                résumé was extracted into a fully fabricated
                                invoice before this check existed — see
                                CONTEXT.md's dated entry.
+
+  **`scanned`** — 8 fixtures, the only bucket that exercises `PdfText`'s
+  vision-transcription fallback (every other fixture above is plain text,
+  fed straight to the reactor, and never touches `PdfText` at all — see
+  `Evals.Run.build_documents/1`). This is a smoke test, not a benchmark:
+  eight synthetic images is nowhere near enough to make a real accuracy
+  claim about vision transcription in general, only enough to prove the
+  fallback path is wired correctly end-to-end against real image bytes
+  instead of one hand-picked demo. See CONTEXT.md's dated entry.
+
+     2 clean    -> rendered invoice text, mild rotate+blur, fully
+                   legible -> should auto-approve
+     1 sanctions-hit -> same, vendor name is one of `SanctionsDb.Server`'s
+                   real watchlisted names -> should flag
+     1 malformed -> vendor name rendered clearly, remaining fields
+                   rendered then heavily blurred into genuine illegibility
+                   -> tests that the vision prompt's "[illegible], never
+                   guess" discipline survives into extraction_completeness
+                   the same way a malformed text fixture does
+     2 layout-diverse -> deliberately NOT the same template as the four
+                   above (which only ever vary rotation/blur on one fixed
+                   field order/wording) — a columnar/table invoice with a
+                   header text box, and a letterhead invoice with no
+                   "Vendor:" label at all and different field wording
+                   ("Balance Due" not "Amount Due", "Client" not "Bill
+                   To") -> both should still auto-approve. Added because
+                   rotation/blur alone tests image-quality robustness, not
+                   layout robustness, which is closer to what actually
+                   varies between real vendors' invoices — see CONTEXT.md's
+                   dated entry, including a real transcription-completeness
+                   miss this pair surfaced that the other four never would
+                   have.
+     2 photo-realistic -> still a step short of a real phone photo (no
+                   real camera, real paper, or real hand tremor), but a
+                   harder synthetic proxy than plain rotate+blur: one uses
+                   an actual geometric perspective distortion (`-distort
+                   Perspective`, not just `-rotate`) plus grain and heavy
+                   JPEG re-compression; the other simulates uneven ambient
+                   lighting/glare via a composited radial gradient, also
+                   JPEG. Both fully legible, both should auto-approve —
+                   this bucket is about capture-artifact robustness, not
+                   legibility (that's `malformed`) or layout (that's
+                   `layout-diverse`). Also the first *real* end-to-end
+                   verification of `PdfText`'s JPEG-magic-byte path against
+                   actual image content — every earlier vision fixture was
+                   a PNG. See CONTEXT.md's dated entry.
   """
 
   defmodule Fixture do
     @moduledoc false
-    @enforce_keys [:id, :bucket, :document_type_slug, :documents, :expected_decision]
+    @enforce_keys [:id, :bucket, :document_type_slug, :expected_decision]
     defstruct [
       :id,
       :bucket,
       :document_type_slug,
-      :documents,
       :expected_decision,
       # nil where the check doesn't meaningfully apply (malformed w9 docs,
       # or any invoice fixture — invoice has no entity-match concept).
-      :expected_entity_match
+      :expected_entity_match,
+      # Exactly one of `documents`/`image_paths` is set. Plain-text
+      # fixtures set `documents` and go straight to the reactor.
+      # Image-backed fixtures (the `scanned` bucket) set `image_paths`
+      # instead — real PNG bytes on disk that `Evals.Run.build_documents/1`
+      # reads and runs through `PdfText.extract/1` first, the same as
+      # production's `Agent.Run.read_documents/2` does, so the eval
+      # actually exercises the vision-transcription path rather than
+      # assuming it works from a hand-picked demo.
+      documents: nil,
+      image_paths: nil
     ]
 
     @type t :: %__MODULE__{
             id: String.t(),
             bucket: String.t(),
             document_type_slug: String.t(),
-            documents: %{String.t() => String.t()},
+            documents: %{String.t() => String.t()} | nil,
+            image_paths: %{String.t() => Path.t()} | nil,
             expected_decision: String.t(),
             expected_entity_match: boolean() | nil
           }
   end
 
   @spec all() :: [Fixture.t()]
-  def all, do: vendor_contract_w9() ++ invoice()
+  def all, do: vendor_contract_w9() ++ invoice() ++ scanned()
 
   @spec vendor_contract_w9() :: [Fixture.t()]
   def vendor_contract_w9 do
@@ -235,7 +299,9 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
 
   @spec invoice() :: [Fixture.t()]
   def invoice do
-    invoice_clean() ++ invoice_sanctions_hit() ++ invoice_malformed() ++ invoice_wrong_type()
+    invoice_clean() ++
+      invoice_sanctions_hit() ++
+      invoice_sanctions_evasion() ++ invoice_malformed() ++ invoice_wrong_type()
   end
 
   @invoice_clean [
@@ -247,11 +313,19 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
     {"Pioneer Manufacturing Inc.", "INV-1006", "3,200.00", "2026-10-05"}
   ]
 
-  # The exact two names `SanctionsDb.Server`'s mock watchlist flags
-  # (case-insensitive, trimmed exact match — not fuzzy, so these have to
-  # be the real values, not invented ones a real eval run would just
-  # happen to pass).
+  # The exact two names `SanctionsDb.Server`'s mock watchlist flags on a
+  # certain (similarity 1.0, post-normalization) match — not invented
+  # values that would pass or fail by coincidence.
   @invoice_sanctioned ["Rogue Exports LLC", "North Star Trading Co"]
+
+  # Real evasion attempts against "Rogue Exports LLC" found via
+  # adversarial testing, not invented worst-cases — an extra word and a
+  # Cyrillic "о" homoglyph substitution, the two attempts that scored
+  # closest to `SanctionsDb.Server`'s fuzzy-match threshold rather than
+  # the easiest ones to catch. Before the fuzzy-match fix, every one of
+  # these sailed through the old exact-match-only screen to full
+  # auto-approval with zero human review. See CONTEXT.md's dated entry.
+  @invoice_sanctions_evasion ["Rogue Global Exports LLC", "Rоge Exports LLC"]
 
   defp invoice_clean do
     @invoice_clean
@@ -277,6 +351,22 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
         document_type_slug: "invoice",
         documents: %{
           "invoice" => invoice_text(vendor, "INV-20#{i}0", "999.99", "2026-09-30")
+        },
+        expected_decision: "needs_review"
+      }
+    end)
+  end
+
+  defp invoice_sanctions_evasion do
+    @invoice_sanctions_evasion
+    |> Enum.with_index(1)
+    |> Enum.map(fn {vendor, i} ->
+      %Fixture{
+        id: "invoice-sanctions-evasion-#{pad(i)}",
+        bucket: "invoice_sanctions_evasion",
+        document_type_slug: "invoice",
+        documents: %{
+          "invoice" => invoice_text(vendor, "INV-21#{i}0", "750.00", "2026-10-10")
         },
         expected_decision: "needs_review"
       }
@@ -369,4 +459,95 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
     Due Date: #{due_date}
     """
   end
+
+  @scanned_dir Application.app_dir(:document_compliance_engine, "priv/eval_fixtures/scanned")
+
+  @spec scanned() :: [Fixture.t()]
+  def scanned do
+    [
+      %Fixture{
+        id: "scanned-clean-01",
+        bucket: "scanned_clean",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("clean_01.png")},
+        expected_decision: "approved"
+      },
+      %Fixture{
+        id: "scanned-clean-02",
+        bucket: "scanned_clean",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("clean_02.png")},
+        expected_decision: "approved"
+      },
+      # "Rogue Exports LLC" — a real name from `SanctionsDb.Server`'s mock
+      # watchlist (see `@invoice_sanctioned` above), rendered into an image
+      # rather than typed as text.
+      %Fixture{
+        id: "scanned-sanctions-01",
+        bucket: "scanned_sanctions_hit",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("sanctions_01.png")},
+        expected_decision: "needs_review"
+      },
+      %Fixture{
+        id: "scanned-malformed-01",
+        bucket: "scanned_malformed",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("malformed_01.png")},
+        expected_decision: "needs_review"
+      },
+      # Columnar/table layout: line-item table, invoice #/date in a
+      # separate header text box instead of inline with the rest of the
+      # fields, "Total Due" instead of "Amount Due". A real run of this
+      # fixture found the vision transcription drops that header box
+      # entirely — see CONTEXT.md's dated entry — so this fixture is also
+      # a standing regression check for that, not just a layout-diversity
+      # smoke test.
+      %Fixture{
+        id: "scanned-layout-table-01",
+        bucket: "scanned_layout_diverse",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("layout_table_01.png")},
+        expected_decision: "approved"
+      },
+      # Letterhead layout: vendor name is the page heading with no
+      # "Vendor:" label at all, plus different field wording throughout
+      # ("Client" not "Bill To", "Balance Due" not "Amount Due", due date
+      # phrased as "Please remit by ..."). Tests whether extraction
+      # generalizes past the exact wording every other invoice fixture
+      # uses, not just whether it's legible.
+      %Fixture{
+        id: "scanned-layout-alt-01",
+        bucket: "scanned_layout_diverse",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("layout_alt_01.png")},
+        expected_decision: "approved"
+      },
+      # Real perspective distortion (not just -rotate) plus grain and
+      # heavy JPEG re-compression — closer to a handheld photo than a flat
+      # scan. Also the first fixture that's actually a JPEG on disk, so
+      # this is real end-to-end coverage of PdfText's JPEG-magic-byte
+      # routing, not just PNG.
+      %Fixture{
+        id: "scanned-photo-skew-01",
+        bucket: "scanned_photo_realistic",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("photo_skew_01.jpg")},
+        expected_decision: "approved"
+      },
+      # Uneven ambient lighting / glare, simulated via a composited radial
+      # gradient, also re-saved as JPEG. Content is fully legible — this
+      # bucket is about capture-artifact robustness, not illegibility
+      # (that's `scanned_malformed`).
+      %Fixture{
+        id: "scanned-photo-glare-01",
+        bucket: "scanned_photo_realistic",
+        document_type_slug: "invoice",
+        image_paths: %{"invoice" => scanned_path("photo_glare_01.jpg")},
+        expected_decision: "approved"
+      }
+    ]
+  end
+
+  defp scanned_path(filename), do: Path.join(@scanned_dir, filename)
 end
