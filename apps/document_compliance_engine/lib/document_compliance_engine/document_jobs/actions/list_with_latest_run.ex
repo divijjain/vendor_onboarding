@@ -11,18 +11,18 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.ListWithLatestRun do
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.DocumentJobs.Repository
 
-  @spec run(keyword()) :: [map()]
-  def run(opts \\ []) do
-    document_jobs = Repository.list(opts)
+  @spec run(pos_integer(), keyword()) :: [map()]
+  def run(organization_id, opts \\ []) do
+    document_jobs = Repository.list(organization_id, opts)
     ids = Enum.map(document_jobs, & &1.id)
     latest_runs = AgentRuns.latest_by_document_job_ids(ids)
 
     Enum.map(document_jobs, &build_row(&1, Map.get(latest_runs, &1.id)))
   end
 
-  @spec reload(pos_integer()) :: {:ok, map()} | {:error, :not_found}
-  def reload(id) do
-    with {:ok, document_job} <- Repository.get(id) do
+  @spec reload(pos_integer(), pos_integer()) :: {:ok, map()} | {:error, :not_found}
+  def reload(id, organization_id) do
+    with {:ok, document_job} <- Repository.get(id, organization_id) do
       agent_run =
         case AgentRuns.get_latest_for_document_job(id) do
           {:ok, run} -> run

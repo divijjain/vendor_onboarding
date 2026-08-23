@@ -27,6 +27,13 @@ config :document_compliance_engine, DocumentComplianceEngine.Vault,
 # DocumentComplianceEngineWeb.ConnCase.
 config :document_compliance_engine, :webhook_secret, "test-only-webhook-secret"
 
+# Tests never drive a real Google OAuth2 handshake — they set
+# conn.assigns.ueberauth_auth directly — but Ueberauth.Strategy.Google.OAuth
+# still needs *some* configured value to exist.
+config :ueberauth, Ueberauth.Strategy.Google.OAuth,
+  client_id: "test-client-id",
+  client_secret: "test-client-secret"
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :document_compliance_engine, DocumentComplianceEngineWeb.Endpoint,
@@ -47,6 +54,10 @@ config :document_compliance_engine,
 
 # Don't actually run jobs in the test suite — assert on enqueueing instead.
 config :document_compliance_engine, Oban, testing: :manual
+
+# Deterministic by default — tests that care about audit sampling set this
+# to 1.0 for the duration of that test (see MaybeSampleForAudit's moduledoc).
+config :document_compliance_engine, :audit_sample_rate, 0.0
 
 # Print only warnings and errors during test
 config :logger, level: :warning

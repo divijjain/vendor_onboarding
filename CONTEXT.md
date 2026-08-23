@@ -1252,6 +1252,271 @@ using a hand-built extractor fake with a deliberately fabricated-but-high-confid
 test proves the pairing is about grounding, not about confidence agreeing with itself), dialyzer
 unchanged (same 7 baseline errors).
 
+## 2026-08-23 — closed the audit-sampling gap left open above
+
+The other half of the "ensurity" ask: post-hoc spot-checking of auto-approved decisions, so a
+compliance officer has a way to catch a wrong auto-approval that no human ever looked at, without
+this being a random one-off "someone should really check that sometime."
+
+**Eligibility signal, reused rather than invented**: a run is only sampled if it reached
+`:approved` with `thread_id == nil`. `Agent.Run.handle_result/3` only ever sets `thread_id` on a
+halt (see its own code comment), so a `nil` thread_id on an `:approved` run is already the
+reliable, existing marker for "the pipeline never paused, no human has seen this" — a run that
+was `:needs_review`'d and later approved by a human already got the strongest possible check and
+is deliberately excluded, same reasoning as `low_confidence_checks/2`'s relationship to
+`entity_match`'s staged thresholds: don't spend review effort somewhere it's already been spent.
+
+**New `agent_runs.AuditSamples`** (nested the same way `review_decisions` is, not a sibling
+top-level context — it's audit metadata about a specific `agent_runs` row, not a new domain):
+`audit_samples` table, one row per sampled run. Unlike `review_decisions` (append-only, a
+decision's evidentiary snapshot must never change), an audit sample is genuinely mutable — starts
+`:pending`, is updated in place to `:confirmed` or `:discrepancy` once a compliance officer looks
+at it, since there's exactly one outcome to record, not a growing history. `agent_run_id` is
+uniquely indexed — one sample per run, no accidental double-queueing.
+
+**Sampling itself lives in a new `MaybeSampleForAudit` action**, called from
+`HandleAgentCallback` right after the result write-back and status mirror, same place
+`review_decisions` conceptually plugs in on the other branch. Rate is
+`Application.get_env(:document_compliance_engine, :audit_sample_rate)` (`0.10` in `config.exs`,
+`0.0` in `config/test.exs` so unrelated tests don't get incidental rows) compared with
+`:rand.uniform() < rate` — deliberately not an injected random function the way the LLM/MCP calls
+are: `0.0` and `1.0` are already fully deterministic thresholds, so tests that care set the rate
+itself (`1.0` to force sampling, matching the `AgentFakes.stub`-style `Application.put_env` +
+`on_exit` pattern, in a dedicated `async: false` test module — same reason `agent/run_test.exs`
+and `agent/evals/run_test.exs` are `async: false`, `Application.put_env` is node-global state).
+
+**Review is deliberately out-of-band, not a second status writer.** `RecordAuditReview` records a
+reviewer's verdict and nothing else — no write to `agent_runs` or `document_jobs` either way, same
+"one source of truth" boundary `HandleAgentCallback`'s moduledoc already documents for
+`ResumeReview`. A `:discrepancy` finding is a signal for a human to act on (the compliance
+officer's next step, not this system's), not an automatic pipeline re-open — re-triggering the
+run would race against the `AgentRun`'s existing single-writer contract for no clear benefit, and
+wasn't part of what was asked.
+
+New `/audits` LiveView (linked from the navbar and from a new "Pending audits" dashboard-health
+stat) lists the pending queue oldest-first and a recently-reviewed history, with an inline
+approve/flag form per pending sample — deliberately one page, not a list + detail pair like
+`ReviewLive`, since an audit sample's whole point is a single at-a-glance spot-check, not a
+multi-document side-by-side review.
+
+`mix precommit` clean, 239 tests (19 new, across the schema/repository/action/LiveView-callback
+layers), dialyzer unchanged (same 7 baseline errors, none of them touching new code — the new
+`AuditSample` schema declares `@type t`, avoiding the `unknown_type` trap `CLAUDE.md`'s Pre-commit
+section warns about).
+
+## 2026-08-23 — Google OAuth login + genuine per-account data isolation
+
+Explicit ask: "build login by google oauth to platform for dashboard access. it must be usable by
+separate account basis." Three real forks surfaced during planning, each resolved with the user
+before writing code (see `/Users/divij/.claude/plans/generic-leaping-pearl.md` for the full plan
+this session executed against):
+
+1. **Shared dashboard + individual login, or real per-account data isolation?** Chosen: real
+   isolation — each Google account only ever sees the `document_jobs` it owns. This is a
+   deliberate reversal of `PRINCIPLES.md`'s previous "no multi-tenant `user_id` here" note (now
+   rewritten in place, not left stale).
+2. **Who can sign in?** Any Google account, auto-provisioned on first login — no domain
+   restriction, no allow-list, matching this project's current stage (internal tool, not
+   publicly deployed).
+3. **Webhook ingestion has no logged-in human** (a vendor's email triggers an HMAC-signed POST,
+   not a browser session). Resolved by adding a required `owner_email` field to the webhook JSON
+   contract — a real, documented breaking change to that contract, not hidden behind a default.
+   The dashboard's manual-upload form (already sharing `ingest_webhook/1`) fills this from the
+   signed-in session instead, so there's one code path, not two.
+4. Follow-up, asked separately: is `/audits` (the post-hoc audit queue from the previous entry)
+   siloed per-owner too, or a shared compliance-officer view across everyone? Chosen: siloed,
+   consistent with #1 — a shared-queue "compliance officer" role was a real, plausible
+   alternative but would need its own justification and a role concept this project doesn't have.
+5. **`/mcp` and the webhook POST route are explicitly out of scope** — the ask was specifically
+   about dashboard access. `/mcp` has zero auth of its own today; its `trigger_run` tool gained
+   the same required `owner_email` field only because it shares `ingest_webhook/1`'s contract,
+   not because MCP itself became access-controlled — scoping two of its three tools while
+   `trigger_run` accepts an arbitrary unverified `owner_email` would be inconsistent theater, not
+   a real boundary. If MCP access itself needs restricting later, that's separate, larger work
+   (a real authentication mechanism for that surface).
+
+**New `Accounts` context**, same shape as every other context (`schema/user.ex`,
+`repository.ex`, `actions/`, `accounts.ex` as a `defdelegate`-only façade). `users.email` is
+unique (case-normalized in the changeset); `users.google_sub` is unique but nullable — a row can
+exist with only `email` set (pre-provisioned by a webhook's `owner_email`, before that person
+ever signs in) and gets linked (its `google_sub`/`name`/`avatar_url` set) the first time that
+email successfully logs in via Google, rather than creating a duplicate account. That merge is
+the one real piece of logic in the context (`FindOrCreateFromGoogle`); the webhook/MCP/
+manual-upload path (`GetOrCreateByEmail`) never touches `google_sub`.
+
+**`document_jobs.owner_user_id`**: a plain `:integer`, **no DB `references()` at all** — verified
+against the actual migrations that `review_decisions.document_job_id` and
+`audit_samples.document_job_id`/`agent_run_id` already carry no FK either (one step further than
+"plain field, not `belongs_to`," which was this session's first guess at the convention).
+Followed here for `owner_user_id` too. Real trade-off, not a free lunch: a bug in `Accounts`'s
+find-or-create path could silently write an `owner_user_id` pointing at nothing, with no
+DB-level backstop — accepted because nothing in this app ever deletes a `users` row, but this
+field carries real access-control weight, unlike the audit-trail tables it's mirroring.
+`null: false` with no backfill — this app has no real production data yet, so existing dev rows
+were cleared via `mix ecto.reset` rather than migrated.
+
+**Google sign-in**: `ueberauth` + `ueberauth_google`, `plug Ueberauth` in a new `AuthController`
+(not the router — that's where the strategy actually intercepts the callback action). Static
+provider list (`config.exs`) kept separate from the client secret (`runtime.exs`, read fresh at
+boot, same placement/rationale this repo already uses for `OPENAI_API_KEY`) — a real prior
+mistake-avoidance decision in this codebase, reapplied rather than reinvented. A new
+`UserAuth` module is deliberately simpler than `mix phx.gen.auth`'s usual shape: no
+`users_tokens` table, since there's no password-reset / sign-out-everywhere requirement for
+OAuth-only auth — a signed session cookie holding a bare `user_id` is enough, and
+`log_in_user/2` renews the session (fixation hygiene) before storing it.
+
+**Owner-scoping propagated through both contexts**, not bolted on at the LiveView edge:
+`DocumentJobs.Repository.list/2`/`get/2`/`get!/2` take `owner_user_id` as a **required
+positional argument**, not a buried keyword option, specifically so a future call site can't
+forget to scope it — the one unscoped `get/1` that remains is documented as being for trusted
+internal/cross-context callers only (an Oban job's own args, another `AgentRuns` action
+continuing a flow a LiveView already authorized), never a web request's raw params.
+`agent_runs`/`review_decisions`/`audit_samples` gained no owner column of their own —
+authorization for those is transitive through their `document_job`, following the same batched
+no-join pattern `ListPendingAudits` already used for the previous entry's feature.
+`RecordAuditReview` needed a real fix here, not just a signature change: `audit_sample_id`
+arrives as a client-submitted form field (unlike `ResumeReview`'s `document_job_id`, which only
+ever comes from a LiveView's own already-authorized socket assigns), so it now re-verifies
+ownership itself via the sample's `document_job` before allowing a review to be recorded — a
+real IDOR closed, not a hypothetical one.
+
+**A PubSub topic leak, found during planning, not in the original ask.**
+`HandleAgentCallback` used to broadcast every status change on one flat, shared topic, and
+`DashboardLive`/`ReviewLive` both subscribed to it. Once isolation is real, every connected
+browser — regardless of owner — would still have received every other owner's
+`{:status_updated, id}` events, and `DashboardLive`'s handler would have spliced a stranger's row
+into the current user's list. Fixed by broadcasting on a per-owner topic
+(`AgentRuns.PubSubTopic.for_owner/1`, `"document_compliance_engine:owner:#{owner_user_id}"`)
+instead — the message now never reaches another owner's LiveView process at all, which is
+strictly better than "subscribe globally and filter after reload": a bug in the reload/filter
+logic can no longer leak data as a second line of defense, because there's no second line of
+defense needed.
+
+**Other `ingest_webhook` callers, since it's the one shared entry point for the real webhook, the
+dashboard's manual upload, and `mcp/server.ex`'s `trigger_run` tool**: the MCP tool gained the
+required `owner_email` input-schema field (its other two tools, `get_document_job_status`/
+`submit_review_decision`, deliberately stayed unscoped per decision #5 above); `mix webhook.send`
+gained a required `--owner <email>` flag (`Mix.raise`s if omitted, matching `fetch_fixture!`'s
+existing raise-on-missing style — a silent default email would have quietly reused one fixed dev
+user across sessions without anyone noticing).
+
+Verified live, not just via the test suite: started `mix phx.server`, drove the full sign-in
+flow with real Google OAuth credentials, confirmed `/document_jobs` only ever shows the signed-in
+account's own jobs, confirmed a direct `/document_jobs/:id` URL for another account's job 404s
+(via `Repo.get_by!/2` raising the same `Ecto.NoResultsError` a missing id would, which
+`phoenix_ecto`'s existing `Plug.Exception` impl already maps to a 404 — no new error-handling
+code needed), and confirmed two owners' browser tabs each only ever react to their own PubSub
+topic.
+
+`mix precommit` clean, 280 tests (41 new: `Accounts` schema/repository/action tests, `AuthController`
+tests that simulate `conn.assigns.ueberauth_auth`/`.ueberauth_failure` directly rather than
+driving a real OAuth2 handshake, `UserAuth` plug tests, a new `AuditLive` test file covering both
+the audit-review flow and cross-owner isolation, plus isolation assertions added to the existing
+`DocumentJobs`/`AgentRuns` repository and LiveView test suites). `mix dialyzer`: 8 errors, up from
+the prior 7 — the new one is `mix webhook.send`'s new `--owner` flag's `Mix.raise/1` call,
+structurally identical to the three pre-existing `Mix.raise`/`callback_info_missing` errors
+already accepted in that same file (Mix.Task callback info isn't available in this dialyzer
+setup) — not a new category of error.
+
+## 2026-08-23 — Organizations: the isolation boundary moves from account to business customer
+
+Follow-up ask, immediately after the Google OAuth session above: "what if there's a business
+customer, where multiple users login to the portal using their separate emails" — i.e. real
+employees at the same paying customer, each with their own Google account, needing to share one
+view of their company's `document_jobs`. Per-account isolation (the previous entry) answers that
+with "they can't" — each login was its own silo. Two decisions made with the user before writing
+code:
+
+1. **One organization per user**, not many-to-many — no org-switcher UI anywhere, simplest model
+   for how this tool is actually used.
+2. **Invite-based** — an existing member invites a teammate by email; a matching Google login
+   auto-joins. Not domain auto-join (fails for business customers on personal/shared email
+   providers), not a manual join-code (relies on out-of-band communication that can typo into a
+   stray org with no error).
+
+**The bootstrap problem invite-only doesn't answer on its own**: no one exists yet to invite the
+*first* person at a new business customer. Resolved the standard SaaS way (Slack/Notion/Linear) —
+first Google login with no organization and no matching pending invite lands on a
+"create your organization" page instead; a login *with* a matching invite auto-joins.
+
+**New `Organizations` context**, same shape as every other (`schema/organization.ex`,
+`schema/invitation.ex`, `repository.ex`, `actions/`, `organizations.ex` as a `defdelegate`-only
+façade). `invitations.email` has a **partial** unique index — `where accepted_at IS NULL` — so
+"at most one pending invite per email" holds without permanently blocking a later re-invite once
+the first one's resolved. Needed an explicit index name
+(`invitations_email_pending_index`) so `Invitation.create_changeset/2`'s `unique_constraint/3`
+could reference it exactly: the default derived name doesn't match a custom-named partial index,
+and a mismatch there silently degrades from a changeset error to a raw `Ecto.ConstraintError`
+crash — the kind of gap that only shows up the first time the duplicate-invite path actually
+gets exercised for real, so a test for it was written up front rather than left implicit.
+
+**`users.organization_id` is written through `Accounts`, not `Organizations`, mirroring an
+existing precedent.** `PRINCIPLES.md`'s "no context reaches into another context's schema" rule
+applies to writes exactly as reads — same shape as `HandleAgentCallback` (in `AgentRuns`) calling
+`DocumentJobs.update_status/2` to mutate a field it doesn't own. New `Accounts.set_organization_id/2`
+and `Accounts.list_users_by_organization/1`, called from `Organizations`' actions.
+
+**The invite-accept action is deliberately reachable from exactly one path — the Google OAuth
+callback — never webhook/MCP ingestion.** `GetOrCreateByEmail` (the webhook-facing path) never
+touches `organization_id`; if it did, an unauthenticated webhook payload naming someone else's
+invited email would silently join a stranger to that org. `AcceptPendingInvitation` is sequenced
+in `AuthController.callback/2` right after `Accounts.find_or_create_user_from_google/1` succeeds,
+its result only logged — an org-join hiccup shouldn't block sign-in.
+
+**`document_jobs.owner_user_id` was kept, not replaced — a new `organization_id` sits alongside
+it.** `owner_user_id` keeps its narrower, pre-existing meaning ("which specific account a
+webhook's `owner_email` resolved to, or who submitted a manual upload"); `organization_id`
+becomes the real isolation boundary everywhere `DocumentJobs.Repository`/`AgentRuns` used to
+scope by owner (`list/2`, `get/2`, `get!/2`, the audit-sampling actions,
+`SystemHealth.snapshot/1`, `AgentRuns.PubSubTopic` — renamed `for_owner/1` → `for_organization/1`,
+its moduledoc rewritten to say the topic is now *deliberately* shared across every member of an
+organization, the opposite framing from the previous entry, on purpose). Chosen over computing
+organization at read time via a join, consistent with this app's house rule against cross-schema
+joins and because the dashboard list is the hottest read path in the app.
+
+**Backfill problem, symmetrical to the account-level one from the previous entry**: a webhook can
+pre-provision a user (by `owner_email`) with no organization yet, leaving `document_jobs.organization_id: nil`
+— orphaned until that person's first login creates or joins one. `Organizations.Actions.JoinOrganization`
+(the shared step behind both `CreateOrganization` and `AcceptPendingInvitation`) calls a new
+`DocumentJobs.backfill_organization_id_for_owner/2` — one bulk `Repo.update_all`, not N individual
+updates — so those documents don't stay permanently invisible once the account catches up.
+
+**Auth-flow gating needed a second `on_mount` hook, not a modified first one.** `current_user` can
+now be non-nil with `organization_id: nil` (signed in, no org yet). Added
+`UserAuth.on_mount(:ensure_organization, ...)` (redirects to `/organizations/new` if absent) and
+its inverse `:ensure_no_organization` (for the create-org page itself, so a user who already has
+one can't create a second — one-organization-per-user). Router needed **two separate**
+`live_session` blocks (`:require_authenticated_user` with both `:ensure_authenticated` and
+`:ensure_organization`; `:require_no_organization` with `:ensure_authenticated` and
+`:ensure_no_organization`) — a `live_session` takes one `on_mount:` stack, not a per-route one.
+Confirmed empirically (a dedicated ordering test) that a `{:halt, ...}` from the first hook in a
+`live_session`'s list stops the chain before any later hook or `mount/3` runs — an unauthenticated
+request to a gated route redirects to `/`, never to `/organizations/new`. Confirmed
+`Phoenix.LiveView.redirect/2` (not `push_navigate/2`) forces a real reconnect across the boundary
+between the two `live_session`s, same as it already did crossing from a live route to the plain
+`/` route in the previous entry.
+
+**Two new LiveViews**: `/organizations/new` (name-your-org form) and `/organizations` (members +
+pending invites + an invite-by-email form) — deliberately no roles (any member can invite), and
+no invitation email is actually sent (creating the `invitations` row is the whole feature; the
+inviter tells the invitee out-of-band). Both stated as real, cheap-to-add-later scope decisions,
+not silently dropped gaps.
+
+**Test fixtures got the highest-leverage single change**: `AccountsFixtures.user_fixture/1` now
+auto-creates and joins a fresh organization by default (accepting an existing `organization_id`
+to put two users in the same org instead, or `nil` for the pre-bootstrap state). Two independent
+`user_fixture()` calls land in two different organizations by construction, so the large majority
+of the existing owner-scoped test suite kept passing with a rename (`owner.id` → `owner.organization_id`
+at call sites), not a rewrite — the same "biggest lever" shape the account-isolation session used
+for its own fixture changes.
+
+`mix precommit` clean, 318 tests (32 new: `Organizations` schema/repository/action tests including
+the backfill-on-join assertion, `CreateOrganizationLive`/`OrganizationLive` tests, the `on_mount`
+ordering test, `AuthController` invite-acceptance tests, plus a "same organization" sharing case
+added to each of the existing `DocumentJobs`/`AgentRuns` repository and LiveView test files
+alongside their renamed isolation cases). `mix dialyzer`: unchanged at 8 errors, same baseline as
+the previous entry.
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow

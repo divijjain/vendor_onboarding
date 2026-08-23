@@ -46,4 +46,16 @@ defmodule DocumentComplianceEngineWeb.ConnCase do
     hex = :crypto.mac(:hmac, :sha256, secret, raw_body) |> Base.encode16(case: :lower)
     "sha256=" <> hex
   end
+
+  @doc """
+  Puts a real, signed session on `conn` for `user`, the same way
+  `UserAuth.log_in_user/2` does — for driving an authenticated
+  `live(conn, ~p"/...")` call against a route behind
+  `:require_authenticated_user`.
+  """
+  def log_in_user(conn, user) do
+    conn
+    |> Phoenix.ConnTest.init_test_session(%{})
+    |> Plug.Conn.put_session(:user_id, user.id)
+  end
 end

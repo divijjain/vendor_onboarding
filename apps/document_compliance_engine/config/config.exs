@@ -97,6 +97,13 @@ config :phoenix, :json_library, Jason
 
 config :document_compliance_engine, :storage_upload_dir, "priv/uploads"
 
+# Probability that a fully-automated `:approved` run (no human ever
+# paused on it) is sampled for post-hoc audit — see
+# `AgentRuns.Actions.MaybeSampleForAudit`. 0.0 in test (see config/test.exs)
+# so unrelated tests don't get incidental audit_samples rows; individual
+# audit tests set this to 1.0 to make sampling deterministic.
+config :document_compliance_engine, :audit_sample_rate, 0.10
+
 config :document_compliance_engine, Oban,
   engine: Oban.Engines.Basic,
   notifier: Oban.Notifiers.Postgres,
@@ -105,6 +112,13 @@ config :document_compliance_engine, Oban,
   queues: [agent_runs: 5]
 
 config :instructor, adapter: Instructor.Adapters.OpenAI
+
+# Static provider list only — no secrets here, see runtime.exs for
+# GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET.
+config :ueberauth, Ueberauth,
+  providers: [
+    google: {Ueberauth.Strategy.Google, [default_scope: "email"]}
+  ]
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

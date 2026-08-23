@@ -27,6 +27,12 @@ end
 # freeze it as whatever was in the *build* environment, not the runtime one).
 config :instructor, openai: [api_key: System.get_env("OPENAI_API_KEY")]
 
+# Same "read fresh at boot, never at compile time" reasoning as the
+# OPENAI_API_KEY config above.
+config :ueberauth, Ueberauth.Strategy.Google.OAuth,
+  client_id: System.get_env("GOOGLE_CLIENT_ID"),
+  client_secret: System.get_env("GOOGLE_CLIENT_SECRET")
+
 config :document_compliance_engine, DocumentComplianceEngineWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 

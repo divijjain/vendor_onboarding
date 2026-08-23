@@ -7,11 +7,16 @@ defmodule DocumentComplianceEngine.AgentRuns do
   """
 
   alias DocumentComplianceEngine.AgentRuns.Actions.{
+    CountPendingAudits,
     HandleAgentCallback,
+    ListPendingAudits,
+    ListReviewedAudits,
+    RecordAuditReview,
     ResumeReview,
     TriggerAgentRun
   }
 
+  alias DocumentComplianceEngine.AgentRuns.PubSubTopic
   alias DocumentComplianceEngine.AgentRuns.Repository
 
   alias DocumentComplianceEngine.AgentRuns.ReviewDecisions.Repository,
@@ -34,4 +39,17 @@ defmodule DocumentComplianceEngine.AgentRuns do
     as: :list_for_document_job
 
   defdelegate count_active(), to: Repository
+
+  defdelegate list_pending_audits(organization_id), to: ListPendingAudits, as: :call
+
+  defdelegate record_audit_review(audit_sample_id, organization_id, decision, reviewer, notes),
+    to: RecordAuditReview,
+    as: :call
+
+  defdelegate list_reviewed_audits(organization_id, limit \\ 20),
+    to: ListReviewedAudits,
+    as: :call
+
+  defdelegate count_pending_audits(organization_id), to: CountPendingAudits, as: :call
+  defdelegate pubsub_topic(organization_id), to: PubSubTopic, as: :for_organization
 end

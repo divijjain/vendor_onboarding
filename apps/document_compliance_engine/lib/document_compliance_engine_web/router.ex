@@ -1,6 +1,8 @@
 defmodule DocumentComplianceEngineWeb.Router do
   use DocumentComplianceEngineWeb, :router
 
+  import DocumentComplianceEngineWeb.UserAuth, only: [fetch_current_user: 2]
+
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
@@ -8,6 +10,7 @@ defmodule DocumentComplianceEngineWeb.Router do
     plug :put_root_layout, html: {DocumentComplianceEngineWeb.Layouts, :root}
     plug :protect_from_forgery
     plug :put_secure_browser_headers
+    plug :fetch_current_user
   end
 
   pipeline :api do
@@ -22,8 +25,29 @@ defmodule DocumentComplianceEngineWeb.Router do
     pipe_through :browser
 
     get "/", PageController, :home
-    live "/document_jobs", DashboardLive
-    live "/document_jobs/:id", ReviewLive
+
+    get "/auth/:provider", AuthController, :request
+    get "/auth/:provider/callback", AuthController, :callback
+    delete "/auth/logout", AuthController, :delete
+
+    live_session :require_authenticated_user,
+      on_mount: [
+        {DocumentComplianceEngineWeb.UserAuth, :ensure_authenticated},
+        {DocumentComplianceEngineWeb.UserAuth, :ensure_organization}
+      ] do
+      live "/document_jobs", DashboardLive
+      live "/document_jobs/:id", ReviewLive
+      live "/audits", AuditLive
+      live "/organizations", OrganizationLive
+    end
+
+    live_session :require_no_organization,
+      on_mount: [
+        {DocumentComplianceEngineWeb.UserAuth, :ensure_authenticated},
+        {DocumentComplianceEngineWeb.UserAuth, :ensure_no_organization}
+      ] do
+      live "/organizations/new", CreateOrganizationLive
+    end
   end
 
   scope "/webhooks", DocumentComplianceEngineWeb do

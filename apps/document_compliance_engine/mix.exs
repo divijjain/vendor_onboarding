@@ -85,6 +85,8 @@ defmodule DocumentComplianceEngine.MixProject do
       {:hermes_mcp, "~> 0.14"},
       {:reactor, "~> 1.0"},
       {:instructor, "~> 0.1.0"},
+      {:ueberauth, "~> 0.10"},
+      {:ueberauth_google, "~> 0.12"},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
   end

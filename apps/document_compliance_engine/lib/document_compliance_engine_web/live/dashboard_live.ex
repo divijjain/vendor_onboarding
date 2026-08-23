@@ -1,7 +1,7 @@
 defmodule DocumentComplianceEngineWeb.DashboardLive do
   use DocumentComplianceEngineWeb, :live_view
 
-  alias DocumentComplianceEngine.{DocumentJobs, DocumentTypes, SystemHealth}
+  alias DocumentComplianceEngine.{AgentRuns, DocumentJobs, DocumentTypes, SystemHealth}
 
   @health_refresh_interval :timer.seconds(5)
 
@@ -18,8 +18,14 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
 
   @impl true
   def mount(_params, _session, socket) do
+    organization_id = socket.assigns.current_user.organization_id
+
     if connected?(socket) do
-      Phoenix.PubSub.subscribe(DocumentComplianceEngine.PubSub, "document_compliance_engine")
+      Phoenix.PubSub.subscribe(
+        DocumentComplianceEngine.PubSub,
+        AgentRuns.pubsub_topic(organization_id)
+      )
+
       schedule_health_refresh()
     end
 
@@ -34,20 +40,23 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
     {:ok,
      socket
      |> assign(document_types: DocumentTypes.list_document_types(), selected_document_type: nil)
-     |> assign(document_jobs: DocumentJobs.list_document_jobs_with_latest_run())
-     |> assign(health: SystemHealth.snapshot())
+     |> assign(document_jobs: DocumentJobs.list_document_jobs_with_latest_run(organization_id))
+     |> assign(health: SystemHealth.snapshot(organization_id))
      |> assign(upload_document_type: nil)}
   end
 
   @impl true
   def handle_info({:status_updated, id}, socket) do
-    {:noreply, update(socket, :document_jobs, &reload_row(&1, id))}
+    organization_id = socket.assigns.current_user.organization_id
+    {:noreply, update(socket, :document_jobs, &reload_row(&1, id, organization_id))}
   end
 
   @impl true
   def handle_info(:refresh_health, socket) do
     schedule_health_refresh()
-    {:noreply, assign(socket, health: SystemHealth.snapshot())}
+
+    {:noreply,
+     assign(socket, health: SystemHealth.snapshot(socket.assigns.current_user.organization_id))}
   end
 
   defp schedule_health_refresh do
@@ -63,7 +72,10 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
      |> assign(selected_document_type: selected)
      |> assign(
        document_jobs:
-         DocumentJobs.list_document_jobs_with_latest_run(document_type_slug: selected)
+         DocumentJobs.list_document_jobs_with_latest_run(
+           socket.assigns.current_user.organization_id,
+           document_type_slug: selected
+         )
      )}
   end
 
@@ -88,7 +100,11 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
 
     case consume_documents(socket, roles) do
       {:ok, documents} ->
-        %{"document_type_slug" => slug, "documents" => documents}
+        %{
+          "document_type_slug" => slug,
+          "documents" => documents,
+          "owner_email" => socket.assigns.current_user.email
+        }
         |> Jason.encode!()
         |> DocumentJobs.ingest_webhook()
         |> handle_ingest_result(socket)
@@ -124,7 +140,10 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
 
   defp handle_ingest_result({:ok, document_job}, socket) do
     socket
-    |> update(:document_jobs, &reload_row(&1, document_job.id))
+    |> update(
+      :document_jobs,
+      &reload_row(&1, document_job.id, socket.assigns.current_user.organization_id)
+    )
     |> assign(upload_document_type: nil)
     |> put_flash(:info, "Document job ##{document_job.id} submitted.")
   end
@@ -166,8 +185,8 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
   defp upload_error_message(:too_many_files), do: "Only one file allowed"
   defp upload_error_message(other), do: to_string(other)
 
-  defp reload_row(document_jobs, id) do
-    case DocumentJobs.reload_document_job_row(id) do
+  defp reload_row(document_jobs, id, organization_id) do
+    case DocumentJobs.reload_document_job_row(id, organization_id) do
       {:ok, updated} -> replace_or_prepend(document_jobs, updated)
       {:error, :not_found} -> document_jobs
     end
@@ -190,26 +209,38 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
     assigns = assign(assigns, :counts, status_counts(assigns.document_jobs))
 
     ~H"""
-    <Layouts.app flash={@flash}>
+    <Layouts.app flash={@flash} current_user={@current_user}>
       <.header>
         Document Jobs
         <:subtitle>Updates automatically as documents move through review.</:subtitle>
       </.header>
 
-      <div class="stats shadow w-full">
+      <div class="stats shadow-xl border border-base-content/10 w-full">
         <div class="stat">
+          <div class="stat-figure text-primary">
+            <.icon name="hero-document-text" class="size-7" />
+          </div>
           <div class="stat-title">Total</div>
           <div class="stat-value text-2xl">{length(@document_jobs)}</div>
         </div>
         <div class="stat">
+          <div class="stat-figure text-warning">
+            <.icon name="hero-clock" class="size-7" />
+          </div>
           <div class="stat-title">Needs review</div>
           <div class="stat-value text-2xl text-warning">{@counts[:needs_review] || 0}</div>
         </div>
         <div class="stat">
+          <div class="stat-figure text-success">
+            <.icon name="hero-check-circle" class="size-7" />
+          </div>
           <div class="stat-title">Approved</div>
           <div class="stat-value text-2xl text-success">{@counts[:approved] || 0}</div>
         </div>
         <div class="stat">
+          <div class="stat-figure text-error">
+            <.icon name="hero-exclamation-triangle" class="size-7" />
+          </div>
           <div class="stat-title">Needs attention</div>
           <div class="stat-value text-2xl text-error">
             {(@counts[:rejected] || 0) + (@counts[:failed] || 0)}
@@ -273,6 +304,7 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
       </div>
 
       <div :if={@document_jobs == []} class="text-center py-12 opacity-60">
+        <.icon name="hero-inbox" class="size-10 mx-auto mb-2" />
         <p>No documents yet.</p>
         <p class="text-sm">Submit one above to see it move through the pipeline.</p>
       </div>
@@ -314,6 +346,12 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
             <div class="stat">
               <div class="stat-title">Active agent runs</div>
               <div class="stat-value text-lg">{@health.active_agent_runs}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-title">Pending audits</div>
+              <div class="stat-value text-lg">
+                <.link navigate={~p"/audits"} class="link">{@health.pending_audits}</.link>
+              </div>
             </div>
             <div class="stat">
               <div class="stat-title">Tax API MCP</div>

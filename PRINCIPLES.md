@@ -87,6 +87,26 @@ apps/document_compliance_engine/lib/document_compliance_engine/
     repository.ex                 all Repo.* calls for `document_types`
   document_types.ex               public API — defdelegate only
 
+  accounts/
+    schema/user.ex                 Ecto schema + changesets (email-only vs. Google-linked)
+    actions/
+      get_or_create_by_email.ex    webhook/MCP/manual-upload owner resolution
+      find_or_create_from_google.ex  OAuth callback — links a pre-provisioned row, never duplicates
+    repository.ex                  all Repo.* calls for `users`
+  accounts.ex                      public API — defdelegate only
+
+  organizations/
+    schema/organization.ex          Ecto schema + changeset
+    schema/invitation.ex             pending-invite-by-email, partial-unique on pending rows
+    actions/
+      join_organization.ex           shared step: Accounts.set_organization_id/2 + DocumentJobs backfill
+      create_organization.ex         bootstrap path — first member at a business customer
+      accept_pending_invitation.ex   Google-login path only — see its own moduledoc for why
+      invite_member.ex               any member can invite — no roles
+      list_members.ex                thin wrapper over Accounts.list_users_by_organization/1
+    repository.ex                    all Repo.* calls for `organizations`/`invitations`
+  organizations.ex                   public API — defdelegate only
+
   agent_runs/
     schema/agent_run.ex           Ecto schema + changesets
     actions/
@@ -132,20 +152,32 @@ apps/document_compliance_engine/lib/document_compliance_engine/
 ## 2. context design
 
 - `document_jobs.ex` / `agent_runs.ex` / `document_types.ex` contain only `defdelegate` — no `import`, no `alias`, no logic
-- Repository and action functions scope to what's available for this app: there's no
-  multi-tenant `user_id` here (vendor onboarding is an internal back-office tool), but
-  every query still filters by ID/idempotency key explicitly — never fetch unbounded lists
+- **`document_jobs` is genuinely multi-tenant, per business-customer `Organization`** —
+  `organization_id` (a plain integer, not a `belongs_to` — see the cross-context convention
+  below), the real isolation boundary. `DocumentJobs.Repository.list/2`/`get/2`/`get!/2` take
+  `organization_id` as a required positional argument (not a buried opt) specifically so a
+  new call site can't forget to scope it. `owner_user_id` (also required, also a plain
+  integer) is a separate, narrower fact — which specific signed-in account a webhook's
+  `owner_email` resolved to, or who submitted a manual upload — kept for that meaning, not
+  for isolation. `agent_runs`/`review_decisions`/`audit_samples` carry no organization
+  column of their own — authorization for those is transitive through their document_job.
+  (Isolation was per individual Google account before organizations existed, and "no
+  multi-tenant `user_id`" before that — see CONTEXT.md's dated entries; don't re-litigate
+  without a real reason, but do keep in mind the boundary has moved twice.)
+- Every query still filters by ID/idempotency key explicitly — never fetch unbounded lists
 - All context functions return `{:ok, result} | {:error, reason}`
 
 ### function naming conventions
 ```elixir
 # DocumentJobs
 ingest_webhook(raw_payload)                       # {:ok, document_job} | {:error, :duplicate | :invalid_payload | changeset}
-get_document_job(id)                              # {:ok, document_job} | {:error, :not_found}
-get_document_job!(id)                             # raises — only in LiveView assigns
-list_document_jobs(opts \\ [])                    # returns list, filter/sort in SQL
-list_document_jobs_with_latest_run(opts \\ [])    # dashboard read model, delegates to ListWithLatestRun
-reload_document_job_row(id)                       # single-row equivalent, for PubSub-triggered reload
+get_document_job(id)                              # unscoped — trusted internal/cross-context callers only
+get_document_job(id, organization_id)              # organization-scoped — for any id sourced from a web request
+get_document_job!(id, organization_id)             # raises — only in LiveView assigns
+list_document_jobs(organization_id, opts \\ [])    # returns list, filter/sort in SQL, organization required
+list_document_jobs_with_latest_run(organization_id, opts \\ [])   # dashboard read model, delegates to ListWithLatestRun
+reload_document_job_row(id, organization_id)       # single-row equivalent, for PubSub-triggered reload
+backfill_organization_id_for_owner(owner_user_id, organization_id)  # bulk-fills webhook-orphaned rows on org join
 update_status(id, status)                         # called by AgentRuns to mirror run status onto the job
 
 # AgentRuns
@@ -160,6 +192,20 @@ enqueue_trigger(document_job_id)                  # Oban enqueue — called by D
 get_document_type_by_slug(slug)                   # DocumentType.t() | nil
 list_document_types()                             # returns list — small config table, no pagination needed
 create_document_type(attrs)                       # {:ok, document_type} | {:error, changeset}
+
+# Accounts
+get_user(id)                                      # {:ok, user} | {:error, :not_found}
+get_or_create_user_by_email(email)                # webhook/MCP/manual-upload owner resolution, never touches google_sub
+find_or_create_user_from_google(attrs)            # OAuth callback path — links a pre-provisioned row instead of duplicating
+set_organization_id(user, organization_id)        # written on Accounts' behalf by Organizations' actions only
+list_users_by_organization(organization_id)       # every member, for the team page
+
+# Organizations
+create_organization(user, name)                   # bootstrap path — creator becomes the first member
+accept_pending_invitation(user)                   # Google-login path only, never webhook/MCP — see its moduledoc
+invite_member(inviter, email)                     # any member can invite; no roles (deliberately, see CONTEXT.md)
+list_members(organization_id)                     # delegates to Accounts.list_users_by_organization/1
+list_pending_invitations(organization_id)         # for the team page
 ```
 
 ---

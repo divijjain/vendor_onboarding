@@ -2,11 +2,15 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
   use DocumentComplianceEngine.DataCase, async: true
   use Oban.Testing, repo: DocumentComplianceEngine.Repo
 
+  import DocumentComplianceEngine.AccountsFixtures
+
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.AgentRuns.Workers.{ResumeAgentRunWorker, TriggerAgentRunWorker}
   alias DocumentComplianceEngine.DocumentJobs
   alias DocumentComplianceEngine.Mcp.Server
   alias Hermes.Server.Frame
+
+  defp unique_owner_email, do: "mcp-#{System.unique_integer([:positive])}@example.com"
 
   defp call_tool(name, args) do
     assert {:reply, response, _frame} = Server.handle_tool_call(name, args, Frame.new())
@@ -23,7 +27,8 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
       DocumentJobs.Repository.insert(%{
         idempotency_key: "mcp-server-test-#{System.unique_integer([:positive])}",
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: user_fixture().id
       })
 
     {:ok, run} =
@@ -47,7 +52,11 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
       documents = %{"invoice" => Base.encode64("Invoice from Acme Corp.")}
 
       {result, is_error} =
-        call_tool("trigger_run", %{document_type_slug: "invoice", documents: documents})
+        call_tool("trigger_run", %{
+          document_type_slug: "invoice",
+          documents: documents,
+          owner_email: unique_owner_email()
+        })
 
       refute is_error
       assert result["status"] == "received"
@@ -64,7 +73,12 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
 
     test "ignores a repeated payload as a duplicate" do
       documents = %{"invoice" => Base.encode64("Invoice from Acme Corp, take two.")}
-      args = %{document_type_slug: "invoice", documents: documents}
+
+      args = %{
+        document_type_slug: "invoice",
+        documents: documents,
+        owner_email: unique_owner_email()
+      }
 
       {first, false} = call_tool("trigger_run", args)
       {:ok, document_job} = DocumentJobs.get_document_job(first["document_job_id"])
@@ -79,7 +93,11 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
       documents = %{"invoice" => Base.encode64("irrelevant")}
 
       {result, is_error} =
-        call_tool("trigger_run", %{document_type_slug: "not_a_real_type", documents: documents})
+        call_tool("trigger_run", %{
+          document_type_slug: "not_a_real_type",
+          documents: documents,
+          owner_email: unique_owner_email()
+        })
 
       assert is_error
       assert result =~ "unknown_document_type"
@@ -89,7 +107,11 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
       documents = %{"wrong_role" => Base.encode64("irrelevant")}
 
       {result, is_error} =
-        call_tool("trigger_run", %{document_type_slug: "invoice", documents: documents})
+        call_tool("trigger_run", %{
+          document_type_slug: "invoice",
+          documents: documents,
+          owner_email: unique_owner_email()
+        })
 
       assert is_error
       assert result =~ "invalid_payload"
@@ -108,7 +130,8 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
         DocumentJobs.Repository.insert(%{
           idempotency_key: "mcp-server-test-no-run",
           document_paths: %{},
-          document_type_slug: "invoice"
+          document_type_slug: "invoice",
+          owner_user_id: user_fixture().id
         })
 
       {result, false} = call_tool("get_document_job_status", %{document_job_id: document_job.id})
@@ -202,7 +225,8 @@ defmodule DocumentComplianceEngine.Mcp.ServerTest do
         DocumentJobs.Repository.insert(%{
           idempotency_key: "mcp-server-test-not-review-#{System.unique_integer([:positive])}",
           document_paths: %{},
-          document_type_slug: "vendor_contract_w9"
+          document_type_slug: "vendor_contract_w9",
+          owner_user_id: user_fixture().id
         })
 
       {result, is_error} =

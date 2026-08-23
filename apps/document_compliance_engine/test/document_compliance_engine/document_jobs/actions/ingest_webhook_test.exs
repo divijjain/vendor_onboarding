@@ -2,15 +2,19 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.IngestWebhookTest do
   use DocumentComplianceEngine.DataCase, async: true
   use Oban.Testing, repo: DocumentComplianceEngine.Repo
 
+  alias DocumentComplianceEngine.Accounts
   alias DocumentComplianceEngine.AgentRuns.Workers.TriggerAgentRunWorker
   alias DocumentComplianceEngine.DocumentJobs
 
   defp unique_bytes(label), do: "#{label}-#{System.unique_integer([:positive])}"
 
-  defp payload(document_type_slug, documents) do
+  defp unique_email, do: "ingest-#{System.unique_integer([:positive])}@example.com"
+
+  defp payload(document_type_slug, documents, owner_email \\ nil) do
     Jason.encode!(%{
       "document_type_slug" => document_type_slug,
-      "documents" => Map.new(documents, fn {role, bytes} -> {role, Base.encode64(bytes)} end)
+      "documents" => Map.new(documents, fn {role, bytes} -> {role, Base.encode64(bytes)} end),
+      "owner_email" => owner_email || unique_email()
     })
   end
 
@@ -57,7 +61,7 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.IngestWebhookTest do
     assert {:ok, document_job} = DocumentJobs.ingest_webhook(raw_payload)
     assert {:error, :duplicate} = DocumentJobs.ingest_webhook(raw_payload)
 
-    assert [found] = DocumentJobs.list_document_jobs()
+    assert {:ok, found} = DocumentJobs.get_document_job(document_job.id)
     assert found.id == document_job.id
 
     on_exit(fn ->
@@ -69,8 +73,16 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.IngestWebhookTest do
     assert {:error, :invalid_payload} = DocumentJobs.ingest_webhook("not json")
   end
 
-  test "rejects JSON missing document_type_slug/documents as :invalid_payload" do
+  test "rejects JSON missing document_type_slug/documents/owner_email as :invalid_payload" do
     assert {:error, :invalid_payload} = DocumentJobs.ingest_webhook(Jason.encode!(%{}))
+
+    assert {:error, :invalid_payload} =
+             DocumentJobs.ingest_webhook(
+               Jason.encode!(%{
+                 "document_type_slug" => "invoice",
+                 "documents" => %{"invoice" => "x"}
+               })
+             )
   end
 
   test "rejects an unknown document_type_slug" do
@@ -81,5 +93,28 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.IngestWebhookTest do
   test "rejects documents whose keys don't match the document type's expected roles" do
     assert {:error, :invalid_payload} =
              DocumentJobs.ingest_webhook(payload("vendor_contract_w9", %{"contract" => "only"}))
+  end
+
+  test "auto-provisions a user by owner_email, reusing the same account on a repeat email" do
+    email = unique_email()
+
+    assert {:ok, first} =
+             DocumentJobs.ingest_webhook(
+               payload("invoice", %{"invoice" => unique_bytes("invoice")}, email)
+             )
+
+    assert {:ok, second} =
+             DocumentJobs.ingest_webhook(
+               payload("invoice", %{"invoice" => unique_bytes("invoice")}, email)
+             )
+
+    assert first.owner_user_id == second.owner_user_id
+    assert {:ok, user} = Accounts.get_or_create_user_by_email(email)
+    assert user.id == first.owner_user_id
+
+    on_exit(fn ->
+      first.document_paths["invoice"] |> Path.dirname() |> File.rm_rf()
+      second.document_paths["invoice"] |> Path.dirname() |> File.rm_rf()
+    end)
   end
 end

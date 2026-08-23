@@ -5,8 +5,15 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallback do
   broadcasts via PubSub so the LiveView dashboard can react. Called
   directly by `DocumentComplianceEngine.Agent.Run` when the agent pipeline
   finishes or pauses.
+
+  Broadcasts on the document_job's own organization-scoped topic (see
+  `PubSubTopic`) — never a flat, globally-shared topic — so a status
+  update physically never reaches another organization's connected
+  LiveView process.
   """
 
+  alias DocumentComplianceEngine.AgentRuns.Actions.MaybeSampleForAudit
+  alias DocumentComplianceEngine.AgentRuns.PubSubTopic
   alias DocumentComplianceEngine.AgentRuns.Repository
   alias DocumentComplianceEngine.DocumentJobs
 
@@ -18,10 +25,12 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallback do
   def call(%{"document_job_id" => document_job_id} = params) do
     with {:ok, agent_run} <- Repository.get_latest_for_document_job(document_job_id),
          {:ok, updated} <- Repository.update_result(agent_run, result_attrs(params)),
-         {:ok, _document_job} <- DocumentJobs.update_status(document_job_id, updated.status) do
+         {:ok, document_job} <- DocumentJobs.update_status(document_job_id, updated.status) do
+      :ok = MaybeSampleForAudit.call(updated)
+
       Phoenix.PubSub.broadcast(
         DocumentComplianceEngine.PubSub,
-        "document_compliance_engine",
+        PubSubTopic.for_organization(document_job.organization_id),
         {:status_updated, updated.document_job_id}
       )
 

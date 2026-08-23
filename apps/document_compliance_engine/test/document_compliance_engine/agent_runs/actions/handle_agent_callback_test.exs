@@ -1,15 +1,21 @@
 defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallbackTest do
   use DocumentComplianceEngine.DataCase, async: true
 
+  import DocumentComplianceEngine.AccountsFixtures
+
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.DocumentJobs
 
   defp insert_document_job_with_run(key) do
+    owner = user_fixture()
+
     {:ok, document_job} =
       DocumentJobs.Repository.insert(%{
         idempotency_key: key,
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: owner.id,
+        organization_id: owner.organization_id
       })
 
     {:ok, _run} =
@@ -22,7 +28,10 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallbackTest do
     document_job = insert_document_job_with_run("cb-1")
     document_job_id = document_job.id
 
-    Phoenix.PubSub.subscribe(DocumentComplianceEngine.PubSub, "document_compliance_engine")
+    Phoenix.PubSub.subscribe(
+      DocumentComplianceEngine.PubSub,
+      AgentRuns.pubsub_topic(document_job.organization_id)
+    )
 
     assert {:ok, updated_run} =
              AgentRuns.handle_agent_callback(%{
@@ -62,11 +71,15 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallbackTest do
   end
 
   test "returns {:error, :not_found} when no run has started for that document_job" do
+    owner = user_fixture()
+
     {:ok, document_job} =
       DocumentJobs.Repository.insert(%{
         idempotency_key: "cb-2",
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: owner.id,
+        organization_id: owner.organization_id
       })
 
     assert {:error, :not_found} =

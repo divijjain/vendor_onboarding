@@ -53,7 +53,13 @@ defmodule DocumentComplianceEngine.Mcp.Server do
             {:required, {:map, :string, :string},
              description:
                "Map of document role name to base64-encoded document bytes. Roles must " <>
-                 "exactly match the document type's extraction_schema roles."}
+                 "exactly match the document type's extraction_schema roles."},
+          owner_email:
+            {:required, :string,
+             description:
+               "Account this document_job belongs to — auto-provisioned if it's never " <>
+                 "been seen before. Not itself authenticated by this tool call; this server " <>
+                 "has no auth of its own, see CLAUDE.md."}
         },
         annotations: %{read_only: false},
         description:
@@ -89,8 +95,12 @@ defmodule DocumentComplianceEngine.Mcp.Server do
   end
 
   @impl true
-  def handle_tool_call("trigger_run", %{document_type_slug: slug, documents: documents}, frame) do
-    {:reply, trigger_run(slug, documents), frame}
+  def handle_tool_call(
+        "trigger_run",
+        %{document_type_slug: slug, documents: documents, owner_email: owner_email},
+        frame
+      ) do
+    {:reply, trigger_run(slug, documents, owner_email), frame}
   end
 
   def handle_tool_call("get_document_job_status", %{document_job_id: id}, frame) do
@@ -105,9 +115,13 @@ defmodule DocumentComplianceEngine.Mcp.Server do
     {:reply, submit_review_decision(id, decision, reviewer, rationale), frame}
   end
 
-  defp trigger_run(document_type_slug, documents) do
+  defp trigger_run(document_type_slug, documents, owner_email) do
     payload =
-      Jason.encode!(%{"document_type_slug" => document_type_slug, "documents" => documents})
+      Jason.encode!(%{
+        "document_type_slug" => document_type_slug,
+        "documents" => documents,
+        "owner_email" => owner_email
+      })
 
     case DocumentJobs.ingest_webhook(payload) do
       {:ok, document_job} ->

@@ -33,7 +33,8 @@ defmodule DocumentComplianceEngine.InvoiceDocumentTypeTest do
     raw_payload =
       Jason.encode!(%{
         "document_type_slug" => "invoice",
-        "documents" => %{"invoice" => Base.encode64(invoice_text)}
+        "documents" => %{"invoice" => Base.encode64(invoice_text)},
+        "owner_email" => "invoice-type-#{System.unique_integer([:positive])}@example.com"
       })
 
     {:ok, document_job} = DocumentJobs.ingest_webhook(raw_payload)

@@ -9,7 +9,8 @@ defmodule DocumentComplianceEngineWeb.WebhookControllerTest do
       "documents" => %{
         "contract" => Base.encode64("contract-bytes-#{unique}"),
         "w9" => Base.encode64("w9-bytes-#{unique}")
-      }
+      },
+      "owner_email" => "webhook-#{unique}@example.com"
     })
   end
 
@@ -60,7 +61,8 @@ defmodule DocumentComplianceEngineWeb.WebhookControllerTest do
     raw_payload =
       Jason.encode!(%{
         "document_type_slug" => "not_a_real_type",
-        "documents" => %{"invoice" => Base.encode64("x")}
+        "documents" => %{"invoice" => Base.encode64("x")},
+        "owner_email" => "webhook-unknown-type@example.com"
       })
 
     conn = post_webhook(conn, raw_payload)

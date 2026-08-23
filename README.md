@@ -180,7 +180,9 @@ The pipeline is document-type-generic, proven against two real, structurally dif
 
 **Current state:**
 
-- 142 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite) + 6 across the two MCP servers, `mix precommit` clean in each of the three apps independently.
+- 318 Elixir tests in the Phoenix app (control plane + agent pipeline, one suite) + 15 across the two MCP servers, `mix precommit` clean in each of the three apps independently.
+- **Google OAuth login, with isolation per business-customer organization.** `/document_jobs`, `/document_jobs/:id`, `/audits`, and `/organizations` require Google sign-in; every `document_jobs` row has an `organization_id`, and every list/fetch in `DocumentJobs`/`AgentRuns` is scoped to it — one business customer's team never sees another's document_jobs, agent_runs, or audit samples, but every member of the *same* organization does. Auto-provisions on first sign-in (any Google account); a first-time login with no organization creates one (becoming its first member) or auto-joins one via a pending invite sent by an existing member. A webhook's `owner_email` can pre-provision an account (and, once that account has an organization, a document_job) by email alone before anyone ever logs in — later linked and backfilled rather than left orphaned. See `CONTEXT.md`'s dated entries.
+- **Post-hoc audit sampling.** A run that reaches `:approved` with no human ever pausing on it (no `thread_id` — see `Agent.Run.handle_result/3`) has a configured probability (`audit_sample_rate`, `0.10` by default) of being queued for a compliance officer's after-the-fact spot-check, at `/audits`. Deliberately out-of-band: recording the audit's outcome (`:confirmed`/`:discrepancy`) never writes back to `agent_runs` or `document_jobs` — a discrepancy is a finding for a human to act on, not an automatic pipeline re-open. See `CONTEXT.md`'s dated entry.
 - Real PDF text extraction, with a vision-transcription fallback for scanned/image-only input: `PdfText` detects a PDF by its magic-number header and runs it through `pdftotext`; a PDF with no text layer (or a raw JPEG/PNG upload) is rasterized/transcribed by a vision-capable LLM call instead. Both the webhook and the dashboard's upload form accept `.pdf`, `.jpg`/`.jpeg`, and `.png` now, not just `.txt`.
 - Entity-match and Tax ID extraction are staged, not always-LLM: a calibrated string-similarity pre-filter resolves clear entity matches/mismatches without a call, and Tax ID resolves via regex when the EIN pattern is unambiguous in the source text — both fall through to the LLM only when genuinely ambiguous, never guess. See "Why this shape" above and `CONTEXT.md` for the research and calibration behind the thresholds.
 - `mix dialyzer` clean except 4 known, pre-existing errors — 2 `Mix.Task` callback-info warnings in `lib/mix/tasks/eval.run.ex`, 2 `guard_fail`s on a defensive `|| %{}` fallback that Reactor's own types prove unreachable — deliberately not wired into CI yet (see `CLAUDE.md`'s Pre-commit section).
@@ -204,29 +206,30 @@ doesn't do what you'd expect here.
 * `cd apps/document_compliance_engine && mix setup` to install dependencies and run migrations (includes the agent pipeline's checkpoint table, in its own `agent_checkpoints` schema, and seeds both document types: `vendor_contract_w9`, `invoice`)
 * `brew install poppler` (or your platform's equivalent) for `pdftotext` — only needed to actually process a real PDF (uploading one, or a webhook payload containing one); not required for `mix test`, which fakes the PDF-extraction step like every other external call
 * Set `OPENAI_API_KEY` (agents) and `ANTHROPIC_API_KEY` (LLM judge) to run the real LLM calls (neither is required to run the test suite — it uses injected fakes). Either export them in your shell, or `cp .env.example .env` and fill in real values — `.env` is gitignored and auto-loaded by `config/config.exs` (a real exported shell var always takes priority over it)
+* Set `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` for "Sign in with Google" on the dashboard — create an OAuth client at the [Google Cloud Console](https://console.cloud.google.com/apis/credentials) with redirect URI `http://localhost:4000/auth/google/callback`. Required to reach `/document_jobs`, `/document_jobs/:id`, `/audits`, or `/organizations` at all. The first sign-in with no organization lands on `/organizations/new` to create one (you become its first member); from `/organizations` you can invite a teammate by email — no email is actually sent, just tell them to sign in with that address and they'll auto-join. Every document_job belongs to exactly one organization, and every member of that organization sees the same ones.
 * Start Phoenix with `mix phx.server` or inside IEx with `iex -S mix phx.server` (from `apps/document_compliance_engine`)
-* Visit [`localhost:4000`](http://localhost:4000)
-* Webhook requests must be HMAC-SHA256 signed (`x-webhook-signature: sha256=<hex>` over the raw body) and carry a `document_type_slug` plus a `documents` map keyed by the roles that type's `extraction_schema` expects. Dev uses the fixed secret in `apps/document_compliance_engine/config/dev.exs`; sign a local curl request with:
+* Visit [`localhost:4000`](http://localhost:4000) and sign in
+* Webhook requests must be HMAC-SHA256 signed (`x-webhook-signature: sha256=<hex>` over the raw body) and carry a `document_type_slug`, a `documents` map keyed by the roles that type's `extraction_schema` expects, and an `owner_email` — the account this document_job belongs to, auto-provisioned if it's never been seen before (a webhook has no signed-in human attached to it, unlike the dashboard's own upload form, which fills this in from the current session instead). Dev uses the fixed secret in `apps/document_compliance_engine/config/dev.exs`; sign a local curl request with:
 
   ```sh
   SECRET="dev-only-webhook-secret-change-me"
 
   # vendor_contract_w9 — two documents
-  BODY='{"document_type_slug":"vendor_contract_w9","documents":{"contract":"'"$(echo -n 'contract text' | base64)"'","w9":"'"$(echo -n 'w9 text' | base64)"'"}}'
+  BODY='{"document_type_slug":"vendor_contract_w9","owner_email":"dev@example.com","documents":{"contract":"'"$(echo -n 'contract text' | base64)"'","w9":"'"$(echo -n 'w9 text' | base64)"'"}}'
   SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
   curl -X POST localhost:4000/webhooks/document_compliance_engine \
     -H "content-type: application/json" -H "x-webhook-signature: sha256=$SIG" -d "$BODY"
 
   # invoice — one document
-  BODY='{"document_type_slug":"invoice","documents":{"invoice":"'"$(echo -n 'invoice text' | base64)"'"}}'
+  BODY='{"document_type_slug":"invoice","owner_email":"dev@example.com","documents":{"invoice":"'"$(echo -n 'invoice text' | base64)"'"}}'
   SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
   curl -X POST localhost:4000/webhooks/document_compliance_engine \
     -H "content-type: application/json" -H "x-webhook-signature: sha256=$SIG" -d "$BODY"
   ```
 
   Two lighter-weight alternatives to hand-signing curl requests:
-  - `mix webhook.send <fixture_id>` (e.g. `mix webhook.send clean-01`) signs and posts one of the eval harness's 55 fixtures against a running `mix phx.server`
-  - The dashboard itself (`/document_jobs`) has a "Submit a document" form — file upload, calls the same `DocumentJobs.ingest_webhook/1` the real webhook hits (just without the HMAC step, since it's a trusted in-process LiveView action, not an untrusted network caller). `.txt`, `.pdf`, `.jpg`/`.jpeg`, or `.png` — via `PdfText`, see "PDF text extraction and vision fallback" above.
+  - `mix webhook.send <fixture_id> --owner <email>` (e.g. `mix webhook.send clean-01 --owner dev@example.com`) signs and posts one of the eval harness's 55 fixtures against a running `mix phx.server`
+  - The dashboard itself (`/document_jobs`, once signed in) has a "Submit a document" form — file upload, calls the same `DocumentJobs.ingest_webhook/1` the real webhook hits (just without the HMAC step, since it's a trusted in-process LiveView action, not an untrusted network caller, and with `owner_email` filled in from the signed-in session rather than a form field). `.txt`, `.pdf`, `.jpg`/`.jpeg`, or `.png` — via `PdfText`, see "PDF text extraction and vision fallback" above.
 
 The two mock MCP tool servers are still separate OTP applications — genuinely external tools, not part of the agent pipeline — and run alongside Phoenix during local development:
 

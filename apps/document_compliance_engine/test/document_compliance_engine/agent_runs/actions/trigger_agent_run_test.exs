@@ -2,6 +2,8 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.TriggerAgentRunTest do
   # async: false — stubs the agent pipeline via shared Application env.
   use DocumentComplianceEngine.DataCase, async: false
 
+  import DocumentComplianceEngine.AccountsFixtures
+
   alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
 
   alias DocumentComplianceEngine.AgentRuns
@@ -62,7 +64,8 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.TriggerAgentRunTest do
       DocumentJobs.Repository.insert(%{
         idempotency_key: key,
         document_paths: document_paths,
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: user_fixture().id
       })
 
     document_job

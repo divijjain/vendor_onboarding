@@ -106,6 +106,9 @@ apps/
                                     # validation_rules; resolved by Agent.Run and interpreted by
                                     # Extraction/Checks — genuinely read by the agent pipeline
       agent_runs/                  # agent-run context — workers/actions call Agent.Run directly
+      accounts/                    # Google-authenticated + webhook-pre-provisioned users
+      organizations/                # business-customer accounts; document_jobs.organization_id
+                                    # is the real multi-tenancy boundary now — see PRINCIPLES.md
       system_health.ex             # operational snapshot for the dashboard — not a context,
                                     # no table; reads Oban's table directly + AgentRuns' public API
       agent/                       # the agent brain, a plain module tree, NOT a separate app
@@ -222,7 +225,27 @@ apps/document_compliance_engine/lib/document_compliance_engine/agent/document_re
 apps/document_compliance_engine/lib/document_compliance_engine/agent/checkpoint/repository.ex
 apps/document_compliance_engine/lib/document_compliance_engine/agent/checkpoint/schema/run_checkpoint.ex
 
+apps/document_compliance_engine/lib/document_compliance_engine/accounts/schema/user.ex
+apps/document_compliance_engine/lib/document_compliance_engine/accounts/actions/get_or_create_by_email.ex
+apps/document_compliance_engine/lib/document_compliance_engine/accounts/actions/find_or_create_from_google.ex
+apps/document_compliance_engine/lib/document_compliance_engine/accounts/repository.ex
+apps/document_compliance_engine/lib/document_compliance_engine/accounts.ex
+
+apps/document_compliance_engine/lib/document_compliance_engine/organizations/schema/organization.ex
+apps/document_compliance_engine/lib/document_compliance_engine/organizations/schema/invitation.ex
+apps/document_compliance_engine/lib/document_compliance_engine/organizations/actions/join_organization.ex
+apps/document_compliance_engine/lib/document_compliance_engine/organizations/actions/create_organization.ex
+apps/document_compliance_engine/lib/document_compliance_engine/organizations/actions/accept_pending_invitation.ex
+apps/document_compliance_engine/lib/document_compliance_engine/organizations/actions/invite_member.ex
+apps/document_compliance_engine/lib/document_compliance_engine/organizations/repository.ex
+apps/document_compliance_engine/lib/document_compliance_engine/organizations.ex
+
 apps/document_compliance_engine/lib/document_compliance_engine_web/controllers/webhook_controller.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/controllers/auth_controller.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/user_auth.ex
 apps/document_compliance_engine/lib/document_compliance_engine_web/live/dashboard_live.ex
 apps/document_compliance_engine/lib/document_compliance_engine_web/live/review_live.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/live/audit_live.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/live/create_organization_live.ex
+apps/document_compliance_engine/lib/document_compliance_engine_web/live/organization_live.ex
 ```

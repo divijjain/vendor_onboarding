@@ -1,6 +1,8 @@
 defmodule DocumentComplianceEngine.AgentRuns.RepositoryTest do
   use DocumentComplianceEngine.DataCase, async: true
 
+  import DocumentComplianceEngine.AccountsFixtures
+
   alias DocumentComplianceEngine.AgentRuns.Repository
   alias DocumentComplianceEngine.DocumentJobs.Repository, as: DocumentJobsRepository
 
@@ -9,7 +11,8 @@ defmodule DocumentComplianceEngine.AgentRuns.RepositoryTest do
       DocumentJobsRepository.insert(%{
         idempotency_key: key,
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: user_fixture().id
       })
 
     document_job

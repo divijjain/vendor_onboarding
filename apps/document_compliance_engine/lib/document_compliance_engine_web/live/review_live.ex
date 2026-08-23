@@ -6,15 +6,20 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
 
   @impl true
   def mount(%{"id" => id}, _session, socket) do
+    organization_id = socket.assigns.current_user.organization_id
+
     if connected?(socket) do
-      Phoenix.PubSub.subscribe(DocumentComplianceEngine.PubSub, "document_compliance_engine")
+      Phoenix.PubSub.subscribe(
+        DocumentComplianceEngine.PubSub,
+        AgentRuns.pubsub_topic(organization_id)
+      )
     end
 
     {:ok, assign_document_job_and_run(socket, id)}
   end
 
   defp assign_document_job_and_run(socket, id) do
-    document_job = DocumentJobs.get_document_job!(id)
+    document_job = DocumentJobs.get_document_job!(id, socket.assigns.current_user.organization_id)
 
     agent_run =
       case AgentRuns.get_latest_for_document_job(id) do
@@ -104,7 +109,7 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
+    <Layouts.app flash={@flash} current_user={@current_user}>
       <.header>
         Review DocumentJob #{@document_job.id}
         <:subtitle>

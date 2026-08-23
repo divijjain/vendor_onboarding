@@ -2,6 +2,8 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
   use DocumentComplianceEngine.DataCase, async: true
   use Oban.Testing, repo: DocumentComplianceEngine.Repo
 
+  import DocumentComplianceEngine.AccountsFixtures
+
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.AgentRuns.Workers.ResumeAgentRunWorker
   alias DocumentComplianceEngine.DocumentJobs
@@ -11,7 +13,8 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
       DocumentJobs.Repository.insert(%{
         idempotency_key: key,
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: user_fixture().id
       })
 
     {:ok, run} =
@@ -73,7 +76,8 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.ResumeReviewTest do
       DocumentJobs.Repository.insert(%{
         idempotency_key: "resume-2",
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: user_fixture().id
       })
 
     assert {:error, :not_awaiting_review} =

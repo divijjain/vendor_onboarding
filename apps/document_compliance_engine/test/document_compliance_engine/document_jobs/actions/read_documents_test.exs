@@ -8,7 +8,8 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.ReadDocumentsTest do
   defp payload(documents) do
     Jason.encode!(%{
       "document_type_slug" => "vendor_contract_w9",
-      "documents" => Map.new(documents, fn {role, bytes} -> {role, Base.encode64(bytes)} end)
+      "documents" => Map.new(documents, fn {role, bytes} -> {role, Base.encode64(bytes)} end),
+      "owner_email" => "read-documents-#{System.unique_integer([:positive])}@example.com"
     })
   end
 

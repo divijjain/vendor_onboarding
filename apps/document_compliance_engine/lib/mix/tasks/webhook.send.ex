@@ -11,10 +11,10 @@ defmodule Mix.Tasks.Webhook.Send do
   and `invoice` today) — a fixture carries its own `document_type_slug`
   and `documents` map, so this task doesn't hardcode either.
 
-      mix phx.server            # in one terminal
-      mix webhook.send clean-01 # in another
+      mix phx.server                                    # in one terminal
+      mix webhook.send clean-01 --owner dev@example.com  # in another
 
-      mix webhook.send invoice-sanctions-01 --url http://localhost:4000
+      mix webhook.send invoice-sanctions-01 --owner dev@example.com --url http://localhost:4000
   """
 
   use Mix.Task
@@ -26,14 +26,18 @@ defmodule Mix.Tasks.Webhook.Send do
 
   @impl Mix.Task
   def run(args) do
-    {opts, positional, _invalid} = OptionParser.parse(args, strict: [url: :string])
+    {opts, positional, _invalid} =
+      OptionParser.parse(args, strict: [url: :string, owner: :string])
+
     fixture = fetch_fixture!(positional)
+    owner_email = fetch_owner!(opts)
 
     body =
       Jason.encode!(%{
         "document_type_slug" => fixture.document_type_slug,
         "documents" =>
-          Map.new(fixture.documents, fn {role, text} -> {role, Base.encode64(text)} end)
+          Map.new(fixture.documents, fn {role, text} -> {role, Base.encode64(text)} end),
+        "owner_email" => owner_email
       })
 
     url = (opts[:url] || @default_url) <> "/webhooks/document_compliance_engine"
@@ -70,6 +74,13 @@ defmodule Mix.Tasks.Webhook.Send do
       fixture ->
         fixture
     end
+  end
+
+  # No silent default — a fixed fallback email would quietly reuse one dev
+  # user across sessions without whoever's running this noticing.
+  defp fetch_owner!(opts) do
+    opts[:owner] ||
+      Mix.raise("--owner <email> is required, e.g. --owner dev@example.com")
   end
 
   defp sign(body) do

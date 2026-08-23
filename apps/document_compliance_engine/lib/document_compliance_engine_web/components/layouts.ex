@@ -27,25 +27,46 @@ defmodule DocumentComplianceEngineWeb.Layouts do
   """
   attr :flash, :map, required: true, doc: "the map of flash messages"
 
-  attr :current_scope, :map,
+  attr :current_user, :map,
     default: nil,
-    doc: "the current [scope](https://phoenix.hexdocs.pm/scopes.html)"
+    doc: "the signed-in DocumentComplianceEngine.Accounts.Schema.User, or nil if logged out"
 
   slot :inner_block, required: true
 
   def app(assigns) do
     ~H"""
-    <header class="navbar px-4 sm:px-6 lg:px-8">
+    <header class="navbar sticky top-0 z-40 px-4 sm:px-6 lg:px-8 backdrop-blur-xl bg-base-100/70 border-b border-base-content/10">
       <div class="flex-1">
         <a href={~p"/document_jobs"} class="flex-1 flex w-fit items-center gap-2">
           <img src={~p"/images/logo.svg"} width="36" />
-          <span class="text-sm font-semibold">Document Compliance Engine</span>
+          <span class="font-display text-sm font-semibold tracking-tight text-gradient-brand">
+            Document Compliance Engine
+          </span>
         </a>
       </div>
       <div class="flex-none">
-        <ul class="flex flex-column px-1 space-x-4 items-center">
-          <li>
-            <.link navigate={~p"/document_jobs"} class="btn btn-ghost">Dashboard</.link>
+        <ul class="flex flex-column px-1 space-x-2 items-center">
+          <li :if={@current_user}>
+            <.link navigate={~p"/document_jobs"} class="btn btn-ghost rounded-full">Dashboard</.link>
+          </li>
+          <li :if={@current_user}>
+            <.link navigate={~p"/audits"} class="btn btn-ghost rounded-full">Audits</.link>
+          </li>
+          <li :if={@current_user && @current_user.organization_id}>
+            <.link navigate={~p"/organizations"} class="btn btn-ghost rounded-full">
+              Organization
+            </.link>
+          </li>
+          <li :if={@current_user} class="text-sm opacity-70">{@current_user.email}</li>
+          <li :if={@current_user}>
+            <.link href={~p"/auth/logout"} method="delete" class="btn btn-ghost rounded-full">
+              Log out
+            </.link>
+          </li>
+          <li :if={!@current_user}>
+            <.link href={~p"/auth/google"} class="btn btn-primary rounded-full">
+              Sign in with Google
+            </.link>
           </li>
           <li>
             <.theme_toggle />

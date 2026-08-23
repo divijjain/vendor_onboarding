@@ -19,16 +19,24 @@ defmodule DocumentComplianceEngine.SystemHealth do
           beam_process_count: pos_integer(),
           oban_queue_depth: non_neg_integer(),
           active_agent_runs: non_neg_integer(),
+          pending_audits: non_neg_integer(),
           tax_api_status: mcp_status(),
           sanctions_db_status: mcp_status()
         }
 
-  @spec snapshot() :: t()
-  def snapshot do
+  @doc """
+  `pending_audits` is scoped to `organization_id` — the audit queue is
+  siloed per-organization, so a global count here would mismatch what
+  `/audits` actually shows that organization. Every other figure stays
+  system-wide (infra facts, not user data).
+  """
+  @spec snapshot(pos_integer()) :: t()
+  def snapshot(organization_id) do
     %{
       beam_process_count: :erlang.system_info(:process_count),
       oban_queue_depth: oban_queue_depth(),
       active_agent_runs: AgentRuns.count_active(),
+      pending_audits: AgentRuns.count_pending_audits(organization_id),
       tax_api_status: mcp_status(tax_api_health_url()),
       sanctions_db_status: mcp_status(sanctions_db_health_url())
     }

@@ -2,27 +2,38 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
   use DocumentComplianceEngineWeb.ConnCase, async: true
   use Oban.Testing, repo: DocumentComplianceEngine.Repo
 
+  import DocumentComplianceEngine.AccountsFixtures
+
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.AgentRuns.Workers.TriggerAgentRunWorker
   alias DocumentComplianceEngine.DocumentJobs
 
-  defp failed_document_job do
+  setup %{conn: conn} do
+    owner = user_fixture()
+    %{conn: log_in_user(conn, owner), owner: owner}
+  end
+
+  defp failed_document_job(owner) do
     {:ok, document_job} =
       DocumentJobs.Repository.insert(%{
         idempotency_key: "review-failed-#{System.unique_integer([:positive])}",
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: owner.id,
+        organization_id: owner.organization_id
       })
 
     DocumentJobs.update_status(document_job.id, :failed)
   end
 
-  defp needs_review_document_job do
+  defp needs_review_document_job(owner) do
     {:ok, document_job} =
       DocumentJobs.Repository.insert(%{
         idempotency_key: "review-#{System.unique_integer([:positive])}",
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: owner.id,
+        organization_id: owner.organization_id
       })
 
     {:ok, run} =
@@ -43,8 +54,11 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     DocumentJobs.update_status(document_job.id, :needs_review)
   end
 
-  test "shows the side-by-side contract/W-9 diff and the drafted explanation", %{conn: conn} do
-    {:ok, document_job} = needs_review_document_job()
+  test "shows the side-by-side contract/W-9 diff and the drafted explanation", %{
+    conn: conn,
+    owner: owner
+  } do
+    {:ok, document_job} = needs_review_document_job(owner)
 
     {:ok, _view, html} = live(conn, ~p"/document_jobs/#{document_job.id}")
 
@@ -56,12 +70,17 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     assert html =~ "Reject"
   end
 
-  test "shows confidence and source-quote grounding per extracted field", %{conn: conn} do
+  test "shows confidence and source-quote grounding per extracted field", %{
+    conn: conn,
+    owner: owner
+  } do
     {:ok, document_job} =
       DocumentJobs.Repository.insert(%{
         idempotency_key: "review-confidence-#{System.unique_integer([:positive])}",
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: owner.id,
+        organization_id: owner.organization_id
       })
 
     {:ok, run} =
@@ -94,8 +113,11 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     assert html =~ "40% confidence"
   end
 
-  test "approve calls resume_review, records an audit entry, and shows a flash", %{conn: conn} do
-    {:ok, document_job} = needs_review_document_job()
+  test "approve calls resume_review, records an audit entry, and shows a flash", %{
+    conn: conn,
+    owner: owner
+  } do
+    {:ok, document_job} = needs_review_document_job(owner)
 
     {:ok, view, _html} = live(conn, ~p"/document_jobs/#{document_job.id}")
 
@@ -115,12 +137,14 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     assert decision.evidence == "Names do not match."
   end
 
-  test "hides approve/reject once no longer awaiting review", %{conn: conn} do
+  test "hides approve/reject once no longer awaiting review", %{conn: conn, owner: owner} do
     {:ok, document_job} =
       DocumentJobs.Repository.insert(%{
         idempotency_key: "review-approved",
         document_paths: %{},
-        document_type_slug: "vendor_contract_w9"
+        document_type_slug: "vendor_contract_w9",
+        owner_user_id: owner.id,
+        organization_id: owner.organization_id
       })
 
     {:ok, document_job} = DocumentJobs.update_status(document_job.id, :approved)
@@ -131,7 +155,10 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     assert html =~ "no longer awaiting review"
   end
 
-  test "shows the original stored documents alongside the extracted fields", %{conn: conn} do
+  test "shows the original stored documents alongside the extracted fields", %{
+    conn: conn,
+    owner: owner
+  } do
     contract_text = "contract-#{System.unique_integer([:positive])}"
     w9_text = "w9-#{System.unique_integer([:positive])}"
 
@@ -141,7 +168,8 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
         "documents" => %{
           "contract" => Base.encode64(contract_text),
           "w9" => Base.encode64(w9_text)
-        }
+        },
+        "owner_email" => owner.email
       })
 
     {:ok, document_job} = DocumentJobs.ingest_webhook(payload)
@@ -157,8 +185,8 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
   end
 
   test "shows a retry button for a failed run, and retrying enqueues the agent run again",
-       %{conn: conn} do
-    {:ok, document_job} = failed_document_job()
+       %{conn: conn, owner: owner} do
+    {:ok, document_job} = failed_document_job(owner)
 
     {:ok, view, html} = live(conn, ~p"/document_jobs/#{document_job.id}")
     assert html =~ ~s(phx-click="retry")
@@ -168,5 +196,15 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     assert html =~ "Retry queued"
 
     assert_enqueued(worker: TriggerAgentRunWorker, args: %{document_job_id: document_job.id})
+  end
+
+  test "a document_job belonging to another organization 404s instead of leaking data", %{
+    conn: conn
+  } do
+    {:ok, document_job} = needs_review_document_job(user_fixture())
+
+    assert_raise Ecto.NoResultsError, fn ->
+      live(conn, ~p"/document_jobs/#{document_job.id}")
+    end
   end
 end

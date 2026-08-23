@@ -24,6 +24,23 @@ defmodule DocumentComplianceEngine.AgentRuns.Repository do
     |> Repo.update()
   end
 
+  @spec get(pos_integer()) :: {:ok, AgentRun.t()} | {:error, :not_found}
+  def get(id) do
+    case Repo.get(AgentRun, id) do
+      nil -> {:error, :not_found}
+      agent_run -> {:ok, agent_run}
+    end
+  end
+
+  @doc "Batched fetch by primary key, for merging into a list read model without an N+1."
+  @spec get_by_ids([pos_integer()]) :: %{pos_integer() => AgentRun.t()}
+  def get_by_ids(ids) do
+    AgentRun
+    |> where([r], r.id in ^ids)
+    |> Repo.all()
+    |> Map.new(&{&1.id, &1})
+  end
+
   @spec get_latest_for_document_job(pos_integer()) :: {:ok, AgentRun.t()} | {:error, :not_found}
   def get_latest_for_document_job(document_job_id) do
     AgentRun
