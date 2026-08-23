@@ -52,6 +52,17 @@ config :document_compliance_engine,
        :storage_upload_dir,
        Path.join(System.tmp_dir!(), "document_compliance_engine_test_uploads")
 
+# `:storage_adapter` is left unset (defaults to `LocalDisk`, see
+# `storage.ex`) — this only configures `Storage.S3` itself for its own
+# direct unit tests (`storage/s3_test.exs`), which stub the HTTP layer via
+# `Req.Test` rather than hitting real S3/Tigris.
+config :document_compliance_engine, :s3,
+  bucket: "test-bucket",
+  region: "auto",
+  endpoint: "https://fly.storage.tigris.dev",
+  access_key_id: "test-access-key-id",
+  secret_access_key: "test-secret-access-key"
+
 # Don't actually run jobs in the test suite — assert on enqueueing instead.
 config :document_compliance_engine, Oban, testing: :manual
 

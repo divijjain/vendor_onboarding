@@ -111,6 +111,33 @@ if config_env() == :prod do
 
   config :document_compliance_engine, :webhook_secret, webhook_secret
 
+  # Documents live in S3-compatible object storage in prod — Fly machines
+  # don't have durable/shared local disk, so `LocalDisk` (the dev/test
+  # default, see config.exs) would silently lose every upload on restart
+  # or redeploy. Works against any S3 API implementation via `endpoint`
+  # (Fly's Tigris today — `fly storage create` auto-injects all four env
+  # vars below as app secrets); see `Storage.S3`.
+  config :document_compliance_engine, :storage_adapter, DocumentComplianceEngine.Storage.S3
+
+  config :document_compliance_engine, :s3,
+    bucket:
+      System.get_env("BUCKET_NAME") ||
+        raise("environment variable BUCKET_NAME is missing (set by `fly storage create`)"),
+    region:
+      System.get_env("AWS_REGION") ||
+        raise("environment variable AWS_REGION is missing (set by `fly storage create`)"),
+    endpoint:
+      System.get_env("AWS_ENDPOINT_URL_S3") ||
+        raise("environment variable AWS_ENDPOINT_URL_S3 is missing (set by `fly storage create`)"),
+    access_key_id:
+      System.get_env("AWS_ACCESS_KEY_ID") ||
+        raise("environment variable AWS_ACCESS_KEY_ID is missing (set by `fly storage create`)"),
+    secret_access_key:
+      System.get_env("AWS_SECRET_ACCESS_KEY") ||
+        raise(
+          "environment variable AWS_SECRET_ACCESS_KEY is missing (set by `fly storage create`)"
+        )
+
   config :document_compliance_engine, DocumentComplianceEngineWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [

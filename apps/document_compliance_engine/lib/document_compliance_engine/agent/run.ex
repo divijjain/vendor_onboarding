@@ -21,6 +21,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.DocumentTypes
   alias DocumentComplianceEngine.PdfText
+  alias DocumentComplianceEngine.Storage
 
   # Extracted roles this app currently has dedicated AgentRun columns for.
   # Any other role's fields land in the generic `extracted_fields` column
@@ -78,7 +79,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
     |> Map.keys()
     |> Enum.reduce_while({:ok, %{}}, fn role, {:ok, acc} ->
       with path when not is_nil(path) <- document_paths[role],
-           {:ok, bytes} <- File.read(path),
+           {:ok, bytes} <- Storage.read(path),
            {:ok, text} <- PdfText.extract(bytes) do
         {:cont, {:ok, Map.put(acc, role, text)}}
       else
