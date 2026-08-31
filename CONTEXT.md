@@ -1517,6 +1517,77 @@ added to each of the existing `DocumentJobs`/`AgentRuns` repository and LiveView
 alongside their renamed isolation cases). `mix dialyzer`: unchanged at 8 errors, same baseline as
 the previous entry.
 
+## 2026-08-31 — Prometheus metrics via PromEx, on their own listener, not the main endpoint
+
+Prompted directly: prep for a job interview whose JD names Kubernetes/Prometheus-shaped
+observability as a core requirement, and this project's existing `SystemHealth` panel (BEAM
+process count, Oban queue depth, MCP up/down) is human-readable-dashboard-shaped, not
+scrape-shaped — no machine-readable metrics endpoint existed at all before this.
+
+**Two real bugs found by testing this for real, not assumed away:**
+
+1. **`:telemetry.span/3`'s `:stop` event does not inherit the `:start` event's metadata** —
+   only a `telemetry_span_context` reference carries over automatically; anything else has to be
+   explicitly re-included in the wrapped function's returned `{result, stop_metadata}` tuple. First
+   pass at instrumenting `Agent.Run.trigger/3`/`resume/3` put `document_job_id` only in the
+   `:start` metadata, assuming it would show up in `:stop` too — a telemetry test written
+   immediately after (not trusted to "obviously work") caught the `KeyError` before it reached
+   any real handler. Fixed by returning `document_job_id` explicitly from both wrapped functions.
+2. **PromEx's background poller is not Ecto Sandbox-safe.** Leaving `DocumentComplianceEngine.PromEx`
+   enabled during `mix test` (deliberately, to let a real HTTP call against `/metrics` prove the
+   wiring rather than just trusting it compiled) surfaced a genuine
+   `DBConnection.ConnectionError`: the poller's background process checked out a raw connection
+   from `Repo`'s pool outside any test's Sandbox ownership and raced a real test's connection.
+   Same class of problem `Oban, testing: :manual` already exists to avoid in this exact config
+   file, for the same underlying reason (background work + Sandbox don't mix) — fixed the same
+   way, `disabled: true` in `config/test.exs`, and rewrote the PromEx test file from a live-HTTP
+   smoke test into structural assertions on the plugin's own `event_metrics/1`/`polling_metrics/1`
+   output. The actual event-firing behavior is proven by the `Agent.Run` telemetry test instead,
+   which needs no running PromEx at all — `:telemetry.span/3` fires its events unconditionally,
+   independent of who's listening.
+
+**Metrics live on their own standalone Cowboy listener (port 9568, `plug_cowboy` added as a new
+dependency for exactly this), not folded into the main Phoenix endpoint the way `/mcp` is.**
+Deliberate divergence from that precedent, not an oversight: `/mcp` is in-process control flow
+with no separate-port reason to exist; a Prometheus scrape target is conventionally put on its
+own port specifically so it can be firewalled off from public traffic, the same shape a
+Kubernetes `NetworkPolicy` restricting `/metrics` to the in-cluster Prometheus pod would give —
+`fly.toml` has no `[[services]]` block exposing port 9568, so in prod it's only reachable over
+Fly's private network, making `auth_strategy: :none` a defensible default rather than a gap.
+
+**Two new telemetry event families**, both emitted via `:telemetry.span/3` (automatic
+`:start`/`:stop`/`:exception` + duration, rather than hand-threading timestamps):
+`[:document_compliance_engine, :agent_run, :stop]` wraps `Agent.Run.trigger/3`/`resume/3` (tags:
+`status`, `document_type_slug`); `[:document_compliance_engine, :mcp_call, :stop]` wraps
+`Agent.McpClient`'s `call_tool/3` (tags: `tool`, `status`). **Deliberately never tagged by
+`document_job_id`** — a Prometheus label needs a small, fixed set of values, and tagging by an
+ever-growing document id would mint a permanent new time series per document forever, a real way
+to take down a Prometheus server rather than a hypothetical one. `document_job_id` still rides
+along in the raw telemetry metadata (useful to a future log/trace-based handler), it's just never
+read into a metric tag.
+
+**`PromEx.Plugins.Oban` (a built-in plugin) already covers queue depth/job duration** — confirmed
+before writing a redundant gauge, not assumed. The one genuinely new domain gauge,
+`active_agent_runs` (agent runs currently paused on human review), is a business fact Oban's own
+telemetry has no way to see, since those jobs already finished executing as far as Oban is
+concerned. It reuses `SystemHealth.oban_queue_depth/0` and `AgentRuns.count_active/0` rather than
+adding a second place that queries `Oban.Job` directly — same "only `SystemHealth` reads Oban's
+table" invariant CLAUDE.md already states, kept true with a second consumer by making the one
+existing function public instead of duplicating its query.
+
+**A real, unrelated bug fixed in passing, not left blocking**: `router.ex` (mid-edit in a
+concurrent, separate session adding an authenticated document-viewer route) failed to compile —
+a pipeline named `:require_authenticated_user` collided with an import of a function by the same
+name, which `Phoenix.Router.pipeline/2` rejects outright. Renamed the pipeline to `:require_auth`;
+zero behavior change, the plug inside it still calls the same imported function.
+
+**Verified**: `mix precommit` clean, 341 tests (318 prior + 4 new telemetry/`PromEx` tests + a
+5th one recovering that had been broken by the same unrelated concurrent edit above, not by this
+work). New transitive dependency risk disclosed, not hidden: `plug_cowboy` pulls in `cowlib`,
+which carries three low/medium CVEs (cookie/link-header encoding, response splitting) — all in
+code paths (`cow_cookie`, `cow_link`) this metrics-only endpoint never calls, since it only ever
+serves a static Prometheus-text body.
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow

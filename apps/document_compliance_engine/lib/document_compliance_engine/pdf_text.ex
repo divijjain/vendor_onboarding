@@ -55,6 +55,28 @@ defmodule DocumentComplianceEngine.PdfText do
 
   def extract(bytes) when is_binary(bytes), do: {:ok, bytes}
 
+  @doc """
+  Sniffs a document's MIME type from the same magic numbers `extract/1`
+  routes on — kept here, beside those clauses, so the byte-header table
+  lives in exactly one place and can't drift from what conversion
+  actually recognizes. For serving stored bytes back to a browser
+  (`DocumentJobs.Actions.ReadRawDocument`), where the stored `.pdf`
+  extension is meaningless.
+
+  Note the deliberate asymmetry with `extract/1`: unknown bytes are
+  *text* as far as conversion is concerned, but serving them is a
+  different risk. Returning `:error` here forces the caller to decide,
+  rather than handing an unrecognized attacker-supplied blob an inline,
+  browser-sniffable content type.
+  """
+  @spec content_type(binary()) :: {:ok, String.t()} | :error
+  def content_type(<<"%PDF-", _::binary>>), do: {:ok, "application/pdf"}
+  def content_type(<<0xFF, 0xD8, 0xFF, _::binary>>), do: {:ok, "image/jpeg"}
+
+  def content_type(<<0x89, "PNG\r\n", 0x1A, "\n", _::binary>>), do: {:ok, "image/png"}
+
+  def content_type(bytes) when is_binary(bytes), do: :error
+
   defp pdf_to_text(bytes) do
     fun =
       Application.get_env(:document_compliance_engine, :agent_pdf_to_text_fun, &run_pdftotext/1)

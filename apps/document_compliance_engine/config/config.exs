@@ -113,6 +113,29 @@ config :document_compliance_engine, Oban,
 
 config :instructor, adapter: Instructor.Adapters.OpenAI
 
+# Prometheus metrics on their own standalone listener (port 9568) rather
+# than the main Phoenix endpoint — see `DocumentComplianceEngine.PromEx`'s
+# moduledoc for why that's a deliberate departure from how `/mcp` is
+# mounted. Disabled in test (config/test.exs) — its polling metrics query
+# `Repo` from a plain background process with no Ecto Sandbox ownership of
+# its own, which races real test connections (confirmed directly: leaving
+# it enabled surfaced a genuine `DBConnection.ConnectionError` from the
+# poller stealing a sandboxed connection mid-test, not a hypothetical).
+# Same reasoning as `Oban, testing: :manual` below — background work and
+# the Sandbox don't mix.
+config :document_compliance_engine, DocumentComplianceEngine.PromEx,
+  manual_metrics_start_delay: :no_delay,
+  drop_metrics_groups: [],
+  grafana: :disabled,
+  metrics_server: [
+    port: 9568,
+    path: "/metrics",
+    protocol: :http,
+    pool_size: 5,
+    cowboy_opts: [],
+    auth_strategy: :none
+  ]
+
 # Static provider list only — no secrets here, see runtime.exs for
 # GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET.
 config :ueberauth, Ueberauth,

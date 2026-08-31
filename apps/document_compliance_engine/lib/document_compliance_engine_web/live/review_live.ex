@@ -83,6 +83,13 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
     end
   end
 
+  # `:unknown` (unsniffable bytes) renders no viewer at all — the
+  # transcript is all we can safely show for it.
+  defp image?(content_type) when is_binary(content_type),
+    do: String.starts_with?(content_type, "image/")
+
+  defp image?(_content_type), do: false
+
   defp format_confidence(nil), do: "confidence n/a"
   defp format_confidence(confidence), do: "#{round(confidence * 100)}% confidence"
 
@@ -118,10 +125,30 @@ defmodule DocumentComplianceEngineWeb.ReviewLive do
       </.header>
 
       <div :if={@documents != []} class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div :for={{role, text} <- @documents} class="card bg-base-200 shadow">
+        <div :for={doc <- @documents} class="card bg-base-200 shadow">
           <div class="card-body">
-            <h2 class="card-title capitalize">{role}</h2>
-            <pre class="whitespace-pre-wrap text-sm font-mono">{text}</pre>
+            <h2 class="card-title capitalize">{doc.role}</h2>
+
+            <img
+              :if={image?(doc.content_type)}
+              src={~p"/document_jobs/#{@document_job.id}/documents/#{doc.role}"}
+              alt={"Original #{doc.role} document"}
+              class="max-w-full rounded border border-base-300"
+            />
+
+            <iframe
+              :if={doc.content_type == "application/pdf"}
+              src={~p"/document_jobs/#{@document_job.id}/documents/#{doc.role}"}
+              title={"Original #{doc.role} document"}
+              class="w-full h-96 rounded border border-base-300"
+            ></iframe>
+
+            <details>
+              <summary class="cursor-pointer text-sm opacity-70">
+                Extracted text (what the agent read)
+              </summary>
+              <pre class="whitespace-pre-wrap text-sm font-mono mt-2">{doc.text}</pre>
+            </details>
           </div>
         </div>
       </div>

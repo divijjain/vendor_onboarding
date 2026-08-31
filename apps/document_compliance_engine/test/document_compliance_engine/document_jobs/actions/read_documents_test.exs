@@ -1,6 +1,8 @@
 defmodule DocumentComplianceEngine.DocumentJobs.Actions.ReadDocumentsTest do
   use DocumentComplianceEngine.DataCase, async: true
 
+  import DocumentComplianceEngine.AgentFakes
+
   alias DocumentComplianceEngine.DocumentJobs
 
   defp unique_bytes(label), do: "#{label}-#{System.unique_integer([:positive])}"
@@ -24,7 +26,32 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.ReadDocumentsTest do
       document_job.document_paths["contract"] |> Path.dirname() |> File.rm_rf()
     end)
 
-    assert DocumentJobs.read_documents(document_job) == [{"contract", contract}, {"w9", w9}]
+    assert DocumentJobs.read_documents(document_job) == [
+             %{role: "contract", text: contract, content_type: :unknown},
+             %{role: "w9", text: w9, content_type: :unknown}
+           ]
+  end
+
+  test "carries the sniffed content type so the viewer can pick an element" do
+    png = <<0x89, "PNG\r\n", 0x1A, "\n", "not a real png body">>
+
+    stub(vision_transcribe_fun: fn _bytes, _mime -> {:ok, "transcribed"} end)
+
+    {:ok, path} =
+      DocumentComplianceEngine.Storage.store(
+        "read-documents-#{System.unique_integer([:positive])}/w9.pdf",
+        png
+      )
+
+    on_exit(fn -> path |> Path.dirname() |> File.rm_rf() end)
+
+    document_job = %DocumentComplianceEngine.DocumentJobs.Schema.DocumentJob{
+      document_paths: %{"w9" => path}
+    }
+
+    assert DocumentJobs.read_documents(document_job) == [
+             %{role: "w9", text: "transcribed", content_type: "image/png"}
+           ]
   end
 
   test "skips a role whose file can't be read instead of failing" do

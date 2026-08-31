@@ -28,8 +28,31 @@ defmodule DocumentComplianceEngine.Agent.Run do
   # instead — e.g. today's second type, `invoice`, has none of these.
   @known_roles ~w(contract w9)
 
+  # Telemetry metadata deliberately carries `document_job_id` (useful for a
+  # log/trace-based handler to correlate one run), but PromEx/Telemetry.Metrics
+  # tags below only ever key on `status`/`document_type_slug` — both small,
+  # fixed sets. Tagging a Prometheus metric by `document_job_id` would mint a
+  # brand-new time series per document forever; the event metadata and the
+  # metric tags are different things on purpose.
   @spec trigger(pos_integer(), String.t(), map()) :: :ok
   def trigger(document_job_id, document_type_slug, document_paths) do
+    :telemetry.span(
+      [:document_compliance_engine, :agent_run],
+      %{document_job_id: document_job_id, document_type_slug: document_type_slug},
+      fn ->
+        status = do_trigger(document_job_id, document_type_slug, document_paths)
+
+        {:ok,
+         %{
+           document_job_id: document_job_id,
+           status: status,
+           document_type_slug: document_type_slug
+         }}
+      end
+    )
+  end
+
+  defp do_trigger(document_job_id, document_type_slug, document_paths) do
     with {:ok, document_type} <- fetch_document_type(document_type_slug),
          {:ok, documents} <- read_documents(document_paths, document_type.extraction_schema) do
       inputs = %{
@@ -51,6 +74,23 @@ defmodule DocumentComplianceEngine.Agent.Run do
 
   @spec resume(pos_integer(), String.t(), String.t()) :: :ok
   def resume(document_job_id, thread_id, decision) do
+    :telemetry.span(
+      [:document_compliance_engine, :agent_run],
+      %{document_job_id: document_job_id, thread_id: thread_id},
+      fn ->
+        {status, document_type_slug} = do_resume(document_job_id, thread_id, decision)
+
+        {:ok,
+         %{
+           document_job_id: document_job_id,
+           status: status,
+           document_type_slug: document_type_slug
+         }}
+      end
+    )
+  end
+
+  defp do_resume(document_job_id, thread_id, decision) do
     case Repository.get_by_thread_id(thread_id) do
       {:ok, checkpoint} ->
         reactor = :erlang.binary_to_term(checkpoint.reactor_state)
@@ -58,12 +98,15 @@ defmodule DocumentComplianceEngine.Agent.Run do
 
         Repository.mark_resumed(checkpoint)
 
-        reactor
-        |> Reactor.run(inputs, %{})
-        |> handle_result(document_job_id, inputs)
+        status =
+          reactor
+          |> Reactor.run(inputs, %{})
+          |> handle_result(document_job_id, inputs)
+
+        {status, inputs.document_type_slug}
 
       {:error, :not_found} ->
-        fail(document_job_id, "no checkpoint for thread_id #{thread_id}")
+        {fail(document_job_id, "no checkpoint for thread_id #{thread_id}"), nil}
     end
   end
 
@@ -237,6 +280,10 @@ defmodule DocumentComplianceEngine.Agent.Run do
 
   defp truncate(text), do: text
 
+  # Returns the run's final status (for the telemetry span in trigger/1 and
+  # resume/3 to tag with) regardless of whether persisting the report itself
+  # succeeded — a failed write-back doesn't change what the pipeline actually
+  # decided, it only means that decision wasn't recorded (logged above).
   defp report(payload) do
     callback_fun =
       Application.get_env(
@@ -246,12 +293,10 @@ defmodule DocumentComplianceEngine.Agent.Run do
       )
 
     case callback_fun.(payload) do
-      {:ok, _agent_run} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.error("failed to record agent run result: #{inspect(reason)}")
-        :ok
+      {:ok, _agent_run} -> :ok
+      {:error, reason} -> Logger.error("failed to record agent run result: #{inspect(reason)}")
     end
+
+    payload["status"]
   end
 end

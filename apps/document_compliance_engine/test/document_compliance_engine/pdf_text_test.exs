@@ -134,4 +134,25 @@ defmodule DocumentComplianceEngine.PdfTextTest do
       refute_received :page_2_transcribed
     end
   end
+
+  describe "content_type/1" do
+    test "sniffs the same magic numbers extract/1 routes on" do
+      assert PdfText.content_type("%PDF-1.4\nbody") == {:ok, "application/pdf"}
+      assert PdfText.content_type(<<0xFF, 0xD8, 0xFF, 0xE0, "body">>) == {:ok, "image/jpeg"}
+      assert PdfText.content_type(<<0x89, "PNG\r\n", 0x1A, "\n", "body">>) == {:ok, "image/png"}
+    end
+
+    test "refuses to guess a type for unrecognized bytes" do
+      # Deliberately unlike `extract/1`, which treats these as plain text —
+      # serving an unsniffable blob inline is the risk this prevents.
+      assert PdfText.content_type("VENDOR SERVICES AGREEMENT with Acme Corp.") == :error
+      assert PdfText.content_type("<html>not a document</html>") == :error
+    end
+
+    test "sniffs without touching any conversion seam" do
+      stub(pdf_to_text_fun: fn _bytes -> flunk("content_type/1 must not convert") end)
+
+      assert PdfText.content_type("%PDF-1.4\nbody") == {:ok, "application/pdf"}
+    end
+  end
 end

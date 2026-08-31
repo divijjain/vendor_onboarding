@@ -70,6 +70,17 @@ defmodule DocumentComplianceEngine.Agent.McpClient do
   end
 
   defp call_tool(url, tool_name, arguments) do
+    :telemetry.span(
+      [:document_compliance_engine, :mcp_call],
+      %{tool: tool_name},
+      fn ->
+        result = do_call_tool(url, tool_name, arguments)
+        {result, %{tool: tool_name, status: call_status(result)}}
+      end
+    )
+  end
+
+  defp do_call_tool(url, tool_name, arguments) do
     {url, host_header} = maybe_resolve_ipv6(url)
 
     with {:ok, session_id} <- initialize(url, host_header),
@@ -82,6 +93,9 @@ defmodule DocumentComplianceEngine.Agent.McpClient do
       decode_tool_result(result)
     end
   end
+
+  defp call_status({:ok, _}), do: :ok
+  defp call_status({:error, _}), do: :error
 
   # See moduledoc — Erlang's default (IPv4-only) hostname resolution
   # returns nxdomain for Fly's `.internal` hosts, and Req/Finch's own

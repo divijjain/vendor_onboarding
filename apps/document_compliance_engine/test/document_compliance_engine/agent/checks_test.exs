@@ -117,6 +117,102 @@ defmodule DocumentComplianceEngine.Agent.ChecksTest do
     assert findings =~ "Sanctions screening hit: on watchlist"
   end
 
+  describe "format and regex rules" do
+    # Values are quoted verbatim in the source so the automatic grounding
+    # check stays silent and the only check in the result is the rule's own.
+    @iban_extracted %{"invoice" => %{iban: "GB82WEST12345698765432"}}
+    @iban_documents %{"invoice" => "Remit to IBAN GB82WEST12345698765432, thanks."}
+
+    defp format_rule(validator, name \\ "iban") do
+      %{
+        "type" => "format",
+        "validator" => validator,
+        "field" => %{"role" => "invoice", "name" => name}
+      }
+    end
+
+    test "a format rule passes on a well-formed value" do
+      assert {:ok, %ValidationResult{checks: [check]}} =
+               Checks.validate_all(@iban_extracted, @iban_documents, [format_rule("iban")])
+
+      assert check.passed
+      assert check.detail == nil
+    end
+
+    test "a format rule fails a value that is the right shape but a bad checksum" do
+      extracted = %{"invoice" => %{iban: "GB82WEST12345698765433"}}
+      documents = %{"invoice" => "Remit to IBAN GB82WEST12345698765433, thanks."}
+
+      assert {:ok, %ValidationResult{checks: [check]}} =
+               Checks.validate_all(extracted, documents, [format_rule("iban")])
+
+      refute check.passed
+      assert check.detail =~ "mod-97"
+    end
+
+    test "a format rule makes no external call, so it needs no stubs to run" do
+      # Deliberately no stub_defaults/0 here — if this rule reached the LLM
+      # or an MCP server, this test would fail rather than silently pass.
+      assert {:ok, %ValidationResult{checks: [check]}} =
+               Checks.validate_all(@iban_extracted, @iban_documents, [format_rule("iban")])
+
+      assert check.passed
+    end
+
+    test "a blank field is a synthesized failure, not a pass" do
+      extracted = %{"invoice" => %{iban: "", vendor_name: "Acme Corp"}}
+      documents = %{"invoice" => "Acme Corp sent an invoice with no IBAN on it."}
+
+      assert {:ok, %ValidationResult{checks: checks}} =
+               Checks.validate_all(extracted, documents, [format_rule("iban")])
+
+      assert Enum.any?(checks, &(&1.detail =~ "was not extracted"))
+    end
+
+    test "an unknown validator name fails the run instead of silently doing nothing" do
+      assert {:error, {:unknown_format_validator, "blockchain_integrity"}} =
+               Checks.validate_all(@iban_extracted, @iban_documents, [
+                 format_rule("blockchain_integrity")
+               ])
+    end
+
+    test "a regex rule checks a document-type-specific shape" do
+      extracted = %{"invoice" => %{order_id: "A12345"}}
+      documents = %{"invoice" => "Order ID: A12345"}
+
+      rule = %{
+        "type" => "regex",
+        "pattern" => "^[A-Z][0-9]{1,6}$",
+        "field" => %{"role" => "invoice", "name" => "order_id"}
+      }
+
+      assert {:ok, %ValidationResult{checks: [check]}} =
+               Checks.validate_all(extracted, documents, [rule])
+
+      assert check.passed
+
+      mismatched = %{"invoice" => %{order_id: "banana"}}
+      mismatched_documents = %{"invoice" => "Order ID: banana"}
+
+      assert {:ok, %ValidationResult{checks: [failed]}} =
+               Checks.validate_all(mismatched, mismatched_documents, [rule])
+
+      refute failed.passed
+      assert failed.detail =~ "does not match the required pattern"
+    end
+
+    test "an uncompilable pattern fails the run rather than matching nothing" do
+      rule = %{
+        "type" => "regex",
+        "pattern" => "^[unclosed",
+        "field" => %{"role" => "invoice", "name" => "iban"}
+      }
+
+      assert {:error, {:invalid_regex_rule, "^[unclosed"}} =
+               Checks.validate_all(@iban_extracted, @iban_documents, [rule])
+    end
+  end
+
   describe "grounded_extraction_checks/2" do
     test "returns no checks when every extracted field appears in its source document" do
       assert Checks.grounded_extraction_checks(@extracted, @documents) == []

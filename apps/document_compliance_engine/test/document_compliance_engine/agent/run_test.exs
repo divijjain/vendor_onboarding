@@ -57,6 +57,35 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     assert payload["tax_id"] == "12-3456789"
   end
 
+  # PromEx's Prometheus counters/histograms are driven by this event (see
+  # `PromEx.Plugins.Agent`) — this proves the span actually fires with the
+  # tags a dashboard would group by, not just that `mix compile` accepts it.
+  test "emits an [:agent_run, :stop] telemetry event tagged with the final status",
+       %{document_paths: paths} do
+    test_pid = self()
+    handler_id = "agent-run-telemetry-test-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:document_compliance_engine, :agent_run, :stop],
+      fn _event, measurements, metadata, _config ->
+        Kernel.send(test_pid, {:telemetry, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    stub_defaults()
+    trigger(21, paths)
+
+    assert_received {:telemetry, measurements, metadata}
+    assert measurements.duration > 0
+    assert metadata.status == "approved"
+    assert metadata.document_type_slug == @document_type_slug
+    assert metadata.document_job_id == 21
+  end
+
   test "reports confidence + source_quote for non-PII fields, but never for Tax ID", %{
     document_paths: paths
   } do

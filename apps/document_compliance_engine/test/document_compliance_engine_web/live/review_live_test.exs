@@ -3,6 +3,7 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
   use Oban.Testing, repo: DocumentComplianceEngine.Repo
 
   import DocumentComplianceEngine.AccountsFixtures
+  import DocumentComplianceEngine.AgentFakes
 
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.AgentRuns.Workers.TriggerAgentRunWorker
@@ -68,6 +69,76 @@ defmodule DocumentComplianceEngineWeb.ReviewLiveTest do
     assert html =~ "Names do not match."
     assert html =~ "Approve"
     assert html =~ "Reject"
+  end
+
+  describe "document viewer" do
+    defp document_job_with_stored(owner, documents) do
+      key = "review-viewer-#{System.unique_integer([:positive])}"
+
+      document_paths =
+        Map.new(documents, fn {role, bytes} ->
+          {:ok, path} = DocumentComplianceEngine.Storage.store("#{key}/#{role}.pdf", bytes)
+          {role, path}
+        end)
+
+      on_exit(fn ->
+        document_paths |> Map.values() |> List.first() |> Path.dirname() |> File.rm_rf()
+      end)
+
+      {:ok, document_job} =
+        DocumentJobs.Repository.insert(%{
+          idempotency_key: key,
+          document_paths: document_paths,
+          document_type_slug: "vendor_contract_w9",
+          owner_user_id: owner.id,
+          organization_id: owner.organization_id
+        })
+
+      document_job
+    end
+
+    test "renders a PDF in an iframe pointed at the document route", %{conn: conn, owner: owner} do
+      # Must clear PdfText's 20-char "meaningful text" bar, or the empty
+      # text layer sends this down the vision-transcription fallback.
+      stub(pdf_to_text_fun: fn _bytes -> {:ok, "contract text from the PDF text layer"} end)
+
+      document_job = document_job_with_stored(owner, %{"contract" => "%PDF-1.4\nbody"})
+
+      {:ok, _view, html} = live(conn, ~p"/document_jobs/#{document_job.id}")
+
+      assert html =~ ~s(<iframe)
+      assert html =~ "/document_jobs/#{document_job.id}/documents/contract"
+      # The transcript stays available, demoted below the document itself.
+      assert html =~ "contract text from the PDF text layer"
+      assert html =~ "Extracted text"
+    end
+
+    test "renders an image document in an img tag", %{conn: conn, owner: owner} do
+      stub(vision_transcribe_fun: fn _bytes, _mime -> {:ok, "transcribed w9"} end)
+
+      png = <<0x89, "PNG\r\n", 0x1A, "\n", "body">>
+      document_job = document_job_with_stored(owner, %{"w9" => png})
+
+      {:ok, _view, html} = live(conn, ~p"/document_jobs/#{document_job.id}")
+
+      assert html =~ ~s(<img)
+      assert html =~ "/document_jobs/#{document_job.id}/documents/w9"
+      assert html =~ "transcribed w9"
+    end
+
+    test "renders no viewer element for unsniffable bytes, only the text", %{
+      conn: conn,
+      owner: owner
+    } do
+      document_job = document_job_with_stored(owner, %{"contract" => "plain text contract"})
+
+      {:ok, _view, html} = live(conn, ~p"/document_jobs/#{document_job.id}")
+
+      # Asserted against the document route rather than the tag names —
+      # the app layout has markup of its own.
+      refute html =~ "/document_jobs/#{document_job.id}/documents/contract"
+      assert html =~ "plain text contract"
+    end
   end
 
   test "shows confidence and source-quote grounding per extracted field", %{

@@ -66,6 +66,9 @@ config :document_compliance_engine, :s3,
 # Don't actually run jobs in the test suite — assert on enqueueing instead.
 config :document_compliance_engine, Oban, testing: :manual
 
+# See config.exs's comment on the PromEx block — its poller isn't Sandbox-safe.
+config :document_compliance_engine, DocumentComplianceEngine.PromEx, disabled: true
+
 # Deterministic by default — tests that care about audit sampling set this
 # to 1.0 for the duration of that test (see MaybeSampleForAudit's moduledoc).
 config :document_compliance_engine, :audit_sample_rate, 0.0

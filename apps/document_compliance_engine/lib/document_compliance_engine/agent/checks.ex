@@ -1,12 +1,18 @@
 defmodule DocumentComplianceEngine.Agent.Checks do
   @moduledoc """
   Agent 2: interprets a document type's `validation_rules` against the
-  extracted data. Two rule types:
+  extracted data. Four rule types:
 
     - `entity_match` — an LLM judgment comparing two named fields (e.g.
       the contract's and W-9's company names)
     - `mcp_tool` — calls one of the two known MCP tools
       (`validate_tax_id`/`screen_vendor`) against one named field
+    - `format` — a pure, deterministic well-formedness check on one named
+      field (`FormatValidators`), e.g. `iban`'s mod-97 checksum. Free and
+      offline, so a field can carry one alongside any other rule.
+    - `regex` — the same idea with a document-type-supplied pattern, for a
+      field whose shape is specific to that document type rather than a
+      general format worth naming a validator for
 
   The two tools themselves stay a fixed, known pair — only which
   document/field feeds them varies by document type, so their
@@ -44,6 +50,7 @@ defmodule DocumentComplianceEngine.Agent.Checks do
       project is generally skeptical of taking at face value on its own.
   """
 
+  alias DocumentComplianceEngine.Agent.FormatValidators
   alias DocumentComplianceEngine.Agent.McpClient
   alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
   alias DocumentComplianceEngine.Agent.ValidationResult
@@ -318,6 +325,77 @@ defmodule DocumentComplianceEngine.Agent.Checks do
            detail: if(flagged, do: "Sanctions screening hit: #{reason}")
          }}
       end
+    end
+  end
+
+  # Unlike the rules above, these two reach nothing external, so there's no
+  # blank-guard-before-the-call reason here — a blank field is still a
+  # synthesized failure rather than a silent pass, because "the field we
+  # were told to format-check never arrived" is itself a finding.
+  defp run_rule(
+         %{"type" => "format", "validator" => validator, "field" => field} = rule,
+         extracted
+       ) do
+    value = field_value(extracted, field)
+
+    if blank?(value) do
+      {:ok,
+       %{
+         rule: rule,
+         passed: false,
+         detail: "Cannot check #{validator} format — the field was not extracted."
+       }}
+    else
+      case FormatValidators.validate(validator, value) do
+        :ok ->
+          {:ok, %{rule: rule, passed: true, detail: nil}}
+
+        {:error, :unknown_validator} ->
+          # A document type naming a validator that doesn't exist is a config
+          # bug. Failing the run surfaces it immediately; passing or failing
+          # the check silently would let a rule the operator believes is
+          # enforcing something do nothing at all.
+          {:error, {:unknown_format_validator, validator}}
+
+        {:error, detail} ->
+          {:ok, %{rule: rule, passed: false, detail: detail}}
+      end
+    end
+  end
+
+  defp run_rule(%{"type" => "regex", "pattern" => pattern, "field" => field} = rule, extracted) do
+    value = field_value(extracted, field)
+
+    with {:ok, compiled} <- compile_pattern(pattern) do
+      cond do
+        blank?(value) ->
+          {:ok,
+           %{
+             rule: rule,
+             passed: false,
+             detail: "Cannot check pattern #{pattern} — the field was not extracted."
+           }}
+
+        Regex.match?(compiled, String.trim(value)) ->
+          {:ok, %{rule: rule, passed: true, detail: nil}}
+
+        true ->
+          {:ok,
+           %{
+             rule: rule,
+             passed: false,
+             detail: "#{inspect(value)} does not match the required pattern #{pattern}."
+           }}
+      end
+    end
+  end
+
+  # An uncompilable pattern is a config bug, same as an unknown validator
+  # name — surfaced loudly rather than quietly matching nothing.
+  defp compile_pattern(pattern) do
+    case Regex.compile(pattern) do
+      {:ok, compiled} -> {:ok, compiled}
+      {:error, _reason} -> {:error, {:invalid_regex_rule, pattern}}
     end
   end
 

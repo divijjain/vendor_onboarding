@@ -1,7 +1,8 @@
 defmodule DocumentComplianceEngineWeb.Router do
   use DocumentComplianceEngineWeb, :router
 
-  import DocumentComplianceEngineWeb.UserAuth, only: [fetch_current_user: 2]
+  import DocumentComplianceEngineWeb.UserAuth,
+    only: [fetch_current_user: 2, require_authenticated_user: 2]
 
   pipeline :browser do
     plug :accepts, ["html"]
@@ -19,6 +20,14 @@ defmodule DocumentComplianceEngineWeb.Router do
 
   pipeline :webhook do
     plug DocumentComplianceEngineWeb.Plugs.VerifyWebhookSignature
+  end
+
+  # Controller-side equivalent of the `live_session`'s `:ensure_authenticated`
+  # on_mount hook — on_mount doesn't run for plain controller routes. Named
+  # differently from the imported `require_authenticated_user/2` plug it
+  # wraps — Phoenix's `pipeline/2` can't share a name with an import.
+  pipeline :require_auth do
+    plug :require_authenticated_user
   end
 
   scope "/", DocumentComplianceEngineWeb do
@@ -48,6 +57,14 @@ defmodule DocumentComplianceEngineWeb.Router do
       ] do
       live "/organizations/new", CreateOrganizationLive
     end
+  end
+
+  scope "/", DocumentComplianceEngineWeb do
+    pipe_through [:browser, :require_auth]
+
+    # Serves original document bytes for ReviewLive's viewer. Organization
+    # scoping is enforced in the controller's query, not here.
+    get "/document_jobs/:id/documents/:role", DocumentController, :show
   end
 
   scope "/webhooks", DocumentComplianceEngineWeb do

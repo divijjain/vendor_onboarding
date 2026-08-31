@@ -9,7 +9,8 @@ defmodule DocumentComplianceEngine.DocumentJobs do
   alias DocumentComplianceEngine.DocumentJobs.Actions.{
     IngestWebhook,
     ListWithLatestRun,
-    ReadDocuments
+    ReadDocuments,
+    ReadRawDocument
   }
 
   alias DocumentComplianceEngine.DocumentJobs.Repository
@@ -33,6 +34,7 @@ defmodule DocumentComplianceEngine.DocumentJobs do
   defdelegate update_status(id, status), to: Repository
   defdelegate ingest_webhook(raw_payload), to: IngestWebhook, as: :call
   defdelegate read_documents(document_job), to: ReadDocuments, as: :call
+  defdelegate read_raw_document(document_job, role), to: ReadRawDocument, as: :call
 
   defdelegate backfill_organization_id_for_owner(owner_user_id, organization_id),
     to: Repository

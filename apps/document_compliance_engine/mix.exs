@@ -75,6 +75,8 @@ defmodule DocumentComplianceEngine.MixProject do
       {:swoosh, "~> 1.16"},
       {:req, "~> 0.5"},
       {:aws_signature, "~> 0.3"},
+      {:prom_ex, "~> 1.11"},
+      {:plug_cowboy, "~> 2.7"},
       {:oban, "~> 2.19"},
       {:cloak_ecto, "~> 1.3"},
       {:telemetry_metrics, "~> 1.0"},

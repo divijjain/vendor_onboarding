@@ -42,7 +42,12 @@ defmodule DocumentComplianceEngine.SystemHealth do
     }
   end
 
-  defp oban_queue_depth do
+  # Public so `PromEx.Plugins.Agent` can reuse it for the Prometheus gauge —
+  # keeps "only `SystemHealth` reads Oban's job table directly" true even
+  # with a second consumer, instead of a duplicate `Repo.aggregate` query
+  # living in the PromEx plugin too.
+  @spec oban_queue_depth() :: non_neg_integer()
+  def oban_queue_depth do
     Oban.Job
     |> where(state: "available")
     |> Repo.aggregate(:count)
