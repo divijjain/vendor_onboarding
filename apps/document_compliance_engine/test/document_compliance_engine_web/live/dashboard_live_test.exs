@@ -198,6 +198,44 @@ defmodule DocumentComplianceEngineWeb.DashboardLiveTest do
     assert owner_id == owner.id
   end
 
+  test "auto-detect submits no document type at all, leaving the job for the classifier",
+       %{conn: conn, owner: owner} do
+    {:ok, view, _html} = live(conn, ~p"/document_jobs")
+
+    view
+    |> form("#manual-upload-form", %{document_type_slug: "auto"})
+    |> render_change()
+
+    upload =
+      file_input(view, "#manual-upload-form", :document, [
+        %{name: "mystery.txt", content: "RECEIPT\nTotal: 12.00\nThank you", type: "text/plain"}
+      ])
+
+    assert render_upload(upload, "mystery.txt") =~ "mystery.txt"
+
+    html =
+      view
+      |> form("#manual-upload-form", %{document_type_slug: "auto"})
+      |> render_submit()
+
+    assert html =~ "submitted"
+
+    # Ingested with no declared type — "auto" is a form value, never a slug
+    # that reaches the payload or the row.
+    assert [document_job] =
+             DocumentJobs.list_document_jobs(owner.organization_id)
+             |> Enum.filter(&(&1.document_type_slug == nil))
+
+    assert document_job.document_paths |> Map.keys() == ["document"]
+  end
+
+  test "the upload form offers auto-detect alongside the explicitly-roled types",
+       %{conn: conn} do
+    {:ok, _view, html} = live(conn, ~p"/document_jobs")
+
+    assert html =~ "Auto-detect the document type"
+  end
+
   test "submitting the manual upload form without every required file shows an error",
        %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/document_jobs")

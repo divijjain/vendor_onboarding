@@ -29,8 +29,10 @@ LLM judge. Everything with an objective right answer is checked deterministicall
 1. **Deterministic checks** (no LLM, free, and the same code path that gates the real pipeline):
    does every extracted field appear verbatim in its own source document
    (`grounded_extraction_checks/3`, any document type)? Does the Tax ID match the W-9 text
-   exactly? Does the output conform to the document type's `extraction_schema`? These produce
-   the hallucination-rate number — it's a string-containment check, not a model's opinion.
+   exactly? Does each value conform to the type its field declares in the document type's
+   `extraction_schema` — `declared_type_checks/3`, e.g. `invoice.due_date` really parsing as a
+   date? These produce the hallucination-rate number — it's a string-containment check, not a
+   model's opinion.
 2. **LLM-as-judge checks** (for what's genuinely ambiguous): does an entity-name pairing still
    hold under formatting differences ("J. Smith" vs "John Smith")? Is a drafted explanation for
    a halted run actually grounded in the real findings, or is it padding? Both are scored by
@@ -38,8 +40,84 @@ LLM judge. Everything with an objective right answer is checked deterministicall
 
 ## Corpus
 
-79 fixtures across two structurally different document types — grown specifically so the
+108 fixtures across nine structurally different document types — grown specifically so the
 thinnest buckets aren't one failure away from a meaningless swing (see below).
+
+The **registry** those fixtures run against is nine seeded document types —
+`vendor_contract_w9`, `invoice`, `receipt`, `purchase_order`, `payroll_statement`,
+`bank_details`, `certificate_of_insurance`, `w8ben`, `business_registration` — and
+**every one of them now has fixtures**. That matters for the classification numbers
+below: the classifier picks between all nine, not between the handful a given fixture
+could plausibly be.
+
+The three most recent types were added for what they exercise rather than for the count.
+Before them, five of eight field types and nine of twelve format validators had no user
+anywhere in the registry: `certificate_of_insurance` is the first document that can
+*expire*, `w8ben` the first that carries a VAT ID, `business_registration` the first with
+email, phone and postal-address fields.
+
+### `bank_details` — 5 fixtures
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean | 2 | happy path, real checksum-valid published test IBANs |
+| Invalid IBAN | 2 | the mod-97 checksum specifically — these differ from the clean pair by a single check digit, so they are the right country, right length and right shape, and a pattern-based "IBAN check" passes all four |
+| Sanctions hit | 1 | the same watchlisted name as the invoice bucket, arriving as payment routing details |
+
+### `purchase_order` — 4 fixtures
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean | 2 | happy path |
+| Ambiguous dates | 1 | whether the *field descriptions* do any work: two `date` fields labelled "Raised" and "Required By" (neither field name appears in the document) plus a third date as a distractor |
+| Sanctions hit | 1 | true-positive flagging on the supplier |
+
+### `receipt` — 4 fixtures
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean | 2 | happy path |
+| Malformed | 1 | a smudged thermal total (`1?.5O`) — present and copied verbatim, so the *declared type* is what catches it, on a type with no rule that would |
+| Sanctions hit | 1 | true-positive flagging on the merchant |
+
+### `payroll_statement` — 5 fixtures
+
+The type with **no `validation_rules` at all**, which makes it the clearest test of what
+the automatic checks catch on their own.
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean | 2 | happy path with nothing external called |
+| Gross/net | 1 | states expected field values: both figures are verbatim present, so a swap is approved *and* fully grounded, and only naming the right answer catches it |
+| Malformed | 1 | garbled figures caught by the declared type |
+| Single missing field | 1 | **a pinned blind spot, expected `approved`** — see below |
+
+### `certificate_of_insurance` — 4 fixtures
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean | 2 | happy path, cover currently in force |
+| Expired | 1 | the finding no amount of reading the document produces: every field correct, well-formed and grounded, and the cover lapsed a fortnight ago |
+| Sanctions hit | 1 | true-positive flagging on the insured |
+
+Dates here are computed relative to the day the harness runs, not written as literals. A
+committed fixture asserting "valid until 2027-06-01" is a fixture that silently becomes a
+failing one in June 2027 — the one kind of corpus rot a time-dependent rule guarantees.
+
+### `w8ben` — 4 fixtures
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean | 2 | happy path, valid country-prefixed VAT IDs |
+| Invalid VAT | 1 | right country prefix, wrong body (`DE12345`) — the per-jurisdiction shape a generic "two letters then digits" check passes |
+| Sanctions hit | 1 | true-positive flagging on the foreign entity |
+
+### `business_registration` — 3 fixtures
+
+| Bucket | Count | Tests |
+|---|---|---|
+| Clean | 2 | happy path, with email/phone/website fields |
+| Bad address | 1 | the `postal_address` validator's only real job, tested for what it claims rather than what its name suggests |
 
 ### `vendor_contract_w9` — 55 fixtures
 
@@ -124,7 +202,7 @@ actual model/tool-server response, not a fake standing in for one.
 |---|---|
 | `vendor_contract_w9` / clean | 20/20 |
 | `vendor_contract_w9` / mismatch | 15/15 |
-| `vendor_contract_w9` / formatting | **11/12** |
+| `vendor_contract_w9` / formatting | **11/12** (see the note on `formatting-07` below) |
 | `vendor_contract_w9` / malformed | 8/8 |
 | `invoice` / clean | 6/6 |
 | `invoice` / sanctions hit | 2/2 |
@@ -136,18 +214,158 @@ actual model/tool-server response, not a fake standing in for one.
 | `invoice` (scanned) / malformed | 1/1 |
 | `invoice` (scanned) / layout-diverse | 2/2 |
 | `invoice` (scanned) / photo-realistic | 2/2 |
+| `bank_details` / clean | 2/2 |
+| `bank_details` / invalid IBAN | 2/2 |
+| `bank_details` / sanctions hit | 1/1 |
+| `purchase_order` / clean | 2/2 |
+| `purchase_order` / ambiguous dates | 1/1 |
+| `purchase_order` / sanctions hit | 1/1 |
+| `receipt` / clean | 2/2 |
+| `receipt` / malformed | 1/1 |
+| `receipt` / sanctions hit | 1/1 |
+| `payroll_statement` / clean | 2/2 |
+| `payroll_statement` / gross-net | 1/1 |
+| `payroll_statement` / malformed | 1/1 |
+| `payroll_statement` / single missing field | 1/1 |
+| `certificate_of_insurance` / clean | 2/2 |
+| `certificate_of_insurance` / expired | 1/1 |
+| `certificate_of_insurance` / sanctions hit | 1/1 |
+| `w8ben` / clean | 2/2 |
+| `w8ben` / invalid VAT | 1/1 |
+| `w8ben` / sanctions hit | 1/1 |
+| `business_registration` / clean | 2/2 |
+| `business_registration` / bad address | 1/1 |
 
-**78/79 fixtures aside, the headline hallucination-rate number** — the deterministic groundedness
-check across every extracted field, every fixture, both document types — is **0%**: no field the
-pipeline reported as extracted failed to appear verbatim (with a relevant shape-signal keyword
-present somewhere in its source) in its own source document, across all 79 fixtures.
+**107/108 decisions aside, the headline hallucination-rate number** — the deterministic groundedness
+check across every extracted field, every fixture, all nine document types — is **0%**: no field
+the pipeline reported as extracted failed to appear verbatim (with a relevant shape-signal
+keyword present somewhere in its source) in its own source document, across all 108 fixtures.
+
+### Confidence calibration
+
+The corpus now contains 433 real field confidences (up from 288), and for the first time
+the minimum is **0.00** rather than 0.90: `receipt-malformed-01`'s smudged total is
+extracted verbatim, is grounded, and the model reports no confidence in it. That is the
+first document in this corpus that is *garbled but copyable*, as opposed to simply missing
+a field — a missing field returns nil and never enters this population, which is why the
+earlier calibration found nothing below 0.90 to look at.
+
+It doesn't settle the threshold. `payroll-malformed-01`'s equally garbled figures came back
+at 1.0, so the signal catches one mangled value and misses another of the same kind. That is
+better evidence for treating self-reported confidence as complementary rather than primary
+than the previous "it has never fired at all" finding was.
+
+### Field-value accuracy
+
+Grounding proves a value came *from* the document; it cannot prove it landed on the right
+field. A purchase order whose `order_date` and `delivery_date` are swapped is approved and
+fully grounded, because both values are verbatim present. Fixtures may therefore state the
+exact values extraction should produce, scored deterministically:
+
+| Measure | Result |
+|---|---|
+| Fixtures stating expected values | 2 (`po-dates-01`, `payroll-gross-net-01`) |
+| Correct | **2/2** |
+
+Deliberately opt-in and deliberately reported as a fraction of the fixtures that state
+values, not as a corpus-wide accuracy number — one fixture is a mechanism with a first user,
+not a benchmark claim. It exists because the ambiguous-dates fixture was otherwise incapable
+of failing for the reason it was written.
+
+**Re-run in full twice on 2026-09-01**, once after `extraction_schema` fields gained declared
+types and `Checks` started checking values against them, and again after fields and document
+types gained semantic descriptions (which changed the extraction prompt for both document
+types, so the previous numbers could no longer be assumed to describe it). Every number in this
+section is from the last of those runs: **107/108 decisions, 0% hallucination across all 108,
+field-value accuracy 2/2, entity-match judge 0.98 (n=47), groundedness judge 0.98 (n=47)**.
+
+Two things that run is worth being precise about:
+
+- **`formatting-07` went both ways across four runs on the same code** — failed, passed,
+  passed, failed. That fixture ("The Wilson Group" vs "Wilson Group LLC") sits in the
+  entity-matcher's deliberately ambiguous band, and nothing in this change touched the
+  entity-match path. It is the clearest evidence in this document that a single-fixture bucket
+  movement is not a result, in either direction: had the corpus been re-run once and stopped at
+  the second run, "12/12, improved" would have been an available and entirely false claim.
+- **The typed-value check produced zero false positives** across all 24 `invoice` fixtures,
+  including the 8 scanned ones where a real `gpt-4o-mini` extraction returns amounts like
+  `"$1,275.00"`. Not a freebie: `invoice.amount` was first typed `number`, which rejects
+  `"$1,275.00"` outright — the corpus caught it, and the fix was a `monetary_amount` validator
+  that models how money is actually written, not a loosened check.
+
+**A blind spot the corpus found, now pinned rather than papered over.** A
+`payroll_statement` fixture with exactly one unreadable field was written expecting review
+and came back approved. The diagnosis is general, not specific to that fixture: blank values
+belong to the completeness check, which only fires above 50% of a role's fields missing — one
+field in five never reaches it — and that type deliberately configures no rules of its own.
+The fixture was rewritten to test what it meant to, and a **second** fixture
+(`payroll_statement / single missing field`) now pins the gap as `approved`, labelled in the
+corpus as the behaviour that exists rather than the behaviour that's wanted. A future change
+to the completeness rule shows up there as a deliberate change instead of a surprise.
+
+**A harness bug that was inflating failure, not hiding it.** At 108 fixtures the harness's
+fixed concurrency of 5 started hitting the provider's tokens-per-minute ceiling, and both
+tasks counted a rate-limited fixture as a *wrong answer*: one run reported "103/108"
+classification accuracy for what was five HTTP 429s, another "83/108" decisions. Both now
+exclude errored fixtures from the accuracy number and list them separately, and both accept
+`--concurrency`. An eval harness that reports infrastructure failure as model failure is the
+same class of bug as the silently-dropped judge call below, in the opposite direction, and
+got the same treatment.
+
+**And one regression the corpus caught before it shipped.** The first description written for
+`tax_id` said the value was "written as two digits, a hyphen, then seven digits". The re-run
+immediately flagged `malformed-03` — a W-9 that deliberately states `123456789` with no hyphen —
+coming back as `12-3456789`, ungrounded: the model had reformatted the value to match the
+description, overriding the prompt's own "copy exactly as written" instruction. The rule that
+came out of it (a description states *meaning*, never *format* — format belongs to the declared
+type and to `format`/`regex` rules, which check a value without telling the model what to
+produce) is now in CLAUDE.md, and two other descriptions written the same way were rewritten
+before they could do the same. This is the second time the corpus has caught a
+plausible-looking change that quietly degraded extraction, which is the argument for running it
+on every change rather than only when accuracy is the point of the change.
+
+See CONTEXT.md's 2026-09-01 entries.
+
+### Classification accuracy
+
+Separate harness (`mix eval.classify`), because it answers a separate question: given a
+document and *no* declared type, does the pipeline pick the right one out of the whole
+registry? Every one of the same 79 fixtures is run with its `document_type_slug`
+withheld, against all six seeded types. Scored deterministically — whether a document
+got its own type back is an objective fact, so there is no judge here.
+
+| Measure | Result |
+|---|---|
+| Correctly classified | **108/108**, against all nine candidate types |
+| Confidence when correctly placed | 0.75–1.00 (n=105, avg 0.98) |
+| Confidence when correctly declined (the wrong-type bucket) | 0.00 (n=3) |
+| Misclassified | **0** |
+| Resolved with **no LLM call at all** | **75/108 (69%)**, by the deterministic shape-signal pre-filter |
+
+**The margin under the threshold has gone to zero, and that is reported rather than tuned
+away.** Growing the corpus to 108 and the registry to nine dropped the lowest confidence on
+a *correct* placement from 0.80 to exactly 0.75 — the threshold itself — on
+`scanned-malformed-01`, the deliberately blurred scan. It still passed, and that document
+halts for extraction reasons regardless, so nothing was misrouted. But the honest reading is
+that this number's evidence got *weaker* as the corpus grew, not stronger. It was
+deliberately not retuned in the same breath as discovering it: zero misclassifications in
+108 means the risk the threshold guards against has still never once been observed, and the
+case that would actually move it is a clean, unambiguous document scoring at or below 0.75.
+
+The wrong-type bucket is scored inverted on purpose: a résumé is *correctly* classified
+when the classifier declines to place it. Those three fixtures are the only evidence
+that the confidence threshold is set anywhere useful — a corpus where every document
+belongs to some type could justify any threshold at all. The gap between the two
+populations (0.20 vs 0.80) is what `Agent.Classification`'s 0.75 threshold sits in, and
+the 0.05 margin below the lowest correct placement is thin enough to state rather than
+round off.
 
 LLM-judge tier (cross-provider, `claude-sonnet-5` scoring `gpt-4o-mini`'s calls):
 
 | Judge metric | Score | n |
 |---|---|---|
 | Entity-match correctness | **0.98** | 47 — every `vendor_contract_w9` fixture with a known expected match/mismatch |
-| Explanation groundedness | **1.00** | 36 — every fixture across both document types that actually halted with an explanation |
+| Explanation groundedness | **0.98** | 47 — every fixture across all document types that actually halted with an explanation; one further judge call failed on a transport timeout and is reported as a failure rather than dropped from the average (see the harness bug below) |
 
 ### Two bugs found and fixed, one miss left standing
 
@@ -187,9 +405,12 @@ keyword each happen to land. `invoice (scanned)/layout-diverse` is now a clean 2
 
 **3. Left standing: a genuinely ambiguous entity-match call.** `formatting-07` ("The Wilson
 Group" vs "Wilson Group LLC") landed in the entity-matcher's ambiguous band and `gpt-4o-mini`'s
-judgment call this run said "different entities." This is not a bug — it's exactly the kind of
-real, debatable model disagreement the 12-fixture formatting bucket exists to surface rather than
-hide, and it's reported here instead of re-run until it disappeared.
+judgment call on the run this section was first written said "different entities." This is not a
+bug — it's exactly the kind of real, debatable model disagreement the 12-fixture formatting
+bucket exists to surface rather than hide, and it was reported here instead of re-run until it
+disappeared. On the 2026-09-01 re-runs it went the other way and the bucket read 12/12. Both
+outcomes are the same finding: this pair is genuinely on the line, and which side of it a given
+run lands on is not evidence of anything having been fixed.
 
 See CONTEXT.md's dated entries for both fixes' full detail, including the exact before/after
 changesets and the regression tests that lock each one in.

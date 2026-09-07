@@ -11,22 +11,33 @@ defmodule Mix.Tasks.Eval.Run do
   needs ANTHROPIC_API_KEY and is skipped without it.
 
       mix eval.run
+      mix eval.run --concurrency 2
+
+  `--concurrency` bounds how many fixtures are in flight at once (default
+  5). The corpus outgrew that default at ~100 fixtures: five concurrent
+  runs of multi-call documents is enough to hit a provider tokens-per-minute
+  ceiling, and a rate-limited fixture reports as an errored run, which is
+  indistinguishable at a glance from a pipeline failure. Lower it when a
+  run comes back with adapter errors rather than assuming the numbers moved.
   """
 
   use Mix.Task
 
+  alias DocumentComplianceEngine.Agent.Evals.Fixtures
   alias DocumentComplianceEngine.Agent.Evals.Run
 
   @requirements ["app.start"]
 
   @impl Mix.Task
-  def run(_args) do
+  def run(args) do
     ensure_openai_key!()
 
-    results = Run.run_all()
+    {opts, _rest, _invalid} = OptionParser.parse(args, strict: [concurrency: :integer])
+    results = Run.run_all(Fixtures.all(), Keyword.take(opts, [:concurrency]))
 
     print_table(results)
     print_buckets(results)
+    print_expected_fields(results)
     print_judge(results)
     print_confidence_calibration(results)
   end
@@ -54,7 +65,8 @@ defmodule Mix.Tasks.Eval.Run do
         String.pad_trailing("expected", 14) <>
         String.pad_trailing("entity_match", 14) <>
         String.pad_trailing("tax_id_ok", 11) <>
-        String.pad_trailing("grounded", 10) <> "error"
+        String.pad_trailing("grounded", 10) <>
+        String.pad_trailing("fields", 8) <> "error"
     )
 
     Enum.each(results, fn r ->
@@ -66,7 +78,9 @@ defmodule Mix.Tasks.Eval.Run do
           String.pad_trailing(r.fixture.expected_decision, 14) <>
           String.pad_trailing(inspect(r.entity_match), 14) <>
           String.pad_trailing(inspect(r.tax_id_verbatim_ok), 11) <>
-          String.pad_trailing(inspect(r.fields_grounded), 10) <> truncate(r.error)
+          String.pad_trailing(inspect(r.fields_grounded), 10) <>
+          String.pad_trailing(inspect(r.expected_fields_ok), 8) <>
+          truncate(r.error || Enum.join(r.field_mismatches || [], "; "))
       )
     end)
   end
@@ -84,12 +98,50 @@ defmodule Mix.Tasks.Eval.Run do
   defp print_buckets(results) do
     IO.puts("")
 
-    results
+    {errored, scored} = Enum.split_with(results, & &1.error)
+
+    scored
     |> Run.bucket_accuracy()
     |> Enum.sort()
     |> Enum.each(fn {{slug, bucket}, %{total: total, correct: correct}} ->
       IO.puts("#{slug}/#{bucket}: decision correct #{correct}/#{total}")
     end)
+
+    correct = Enum.count(scored, &(to_string(&1.decision) == &1.fixture.expected_decision))
+    IO.puts("\nDecisions: #{correct}/#{length(scored)}")
+
+    # Excluded from the accuracy numbers rather than counted as wrong
+    # decisions: a fixture whose run never completed has no decision to be
+    # right or wrong about. Folding the two together reads as an accuracy
+    # collapse when it is a rate limit.
+    if errored != [] do
+      IO.puts("#{length(errored)} fixture(s) errored and are excluded from that number:")
+
+      for r <- errored do
+        IO.puts("  #{r.fixture.id}: #{truncate(r.error)}")
+      end
+    end
+  end
+
+  # Only fixtures that state expected values are counted — a corpus-wide
+  # "field accuracy" number over a corpus where most fixtures state none
+  # would be a bigger claim than the data supports.
+  defp print_expected_fields(results) do
+    scored = Enum.reject(results, &is_nil(&1.expected_fields_ok))
+
+    IO.puts("")
+
+    if scored == [] do
+      IO.puts("--- Field-value accuracy: no fixture states expected values ---")
+    else
+      correct = Enum.count(scored, & &1.expected_fields_ok)
+      IO.puts("--- Field-value accuracy (fixtures stating expected values) ---")
+      IO.puts("  #{correct}/#{length(scored)}")
+
+      for r <- scored, not r.expected_fields_ok do
+        IO.puts("  #{r.fixture.id}: #{Enum.join(r.field_mismatches, "; ")}")
+      end
+    end
   end
 
   defp print_judge(results) do

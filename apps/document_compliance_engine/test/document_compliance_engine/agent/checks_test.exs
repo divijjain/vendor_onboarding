@@ -411,6 +411,196 @@ defmodule DocumentComplianceEngine.Agent.ChecksTest do
     end
   end
 
+  describe "not_expired rule" do
+    @expiry_rule %{
+      "type" => "not_expired",
+      "field" => %{"role" => "coi", "name" => "expiry_date"}
+    }
+
+    defp expiry_check(value, today) do
+      extracted = %{"coi" => %{expiry_date: value}}
+      documents = %{"coi" => "CERTIFICATE OF INSURANCE. Expires: #{value}"}
+
+      assert {:ok, result} =
+               Checks.validate_all(extracted, documents, [@expiry_rule], today: today)
+
+      Enum.find(result.checks, &(&1.rule["type"] == "not_expired"))
+    end
+
+    test "passes for a date in the future" do
+      assert %{passed: true} = expiry_check("2027-03-14", ~D[2026-09-01])
+    end
+
+    test "passes on the expiry date itself — a certificate is valid until it lapses" do
+      assert %{passed: true} = expiry_check("2026-09-01", ~D[2026-09-01])
+    end
+
+    test "fails for a date in the past, saying how far past" do
+      check = expiry_check("2026-08-01", ~D[2026-09-01])
+
+      refute check.passed
+      assert check.detail =~ "Expired"
+      assert check.detail =~ "31 day(s) before today"
+      assert check.detail =~ "2026-09-01"
+    end
+
+    test "the clock is injected, so a fixture doesn't rot into a failure" do
+      # The same value, judged from two different days.
+      assert %{passed: true} = expiry_check("2026-12-31", ~D[2026-09-01])
+      assert %{passed: false} = expiry_check("2026-12-31", ~D[2027-01-01])
+    end
+
+    test "reports an ambiguous date as undecidable rather than picking a reading" do
+      check = expiry_check("01/02/2027", ~D[2026-09-01])
+
+      refute check.passed
+      assert check.detail =~ "not a date that can be read one way only"
+    end
+
+    test "a missing date is a finding, not a pass" do
+      extracted = %{"coi" => %{expiry_date: nil}}
+
+      assert {:ok, result} =
+               Checks.validate_all(extracted, %{"coi" => "x"}, [@expiry_rule],
+                 today: ~D[2026-09-01]
+               )
+
+      assert [check] = Enum.filter(result.checks, &(&1.rule["type"] == "not_expired"))
+      refute check.passed
+      assert check.detail =~ "was not extracted"
+    end
+
+    test "defaults to the real today when no clock is supplied" do
+      # Nothing to stub: a date far enough in the past is expired whenever
+      # this test happens to run.
+      extracted = %{"coi" => %{expiry_date: "2001-01-01"}}
+      documents = %{"coi" => "expires 2001-01-01"}
+
+      assert {:ok, result} = Checks.validate_all(extracted, documents, [@expiry_rule])
+      assert [check] = Enum.filter(result.checks, &(&1.rule["type"] == "not_expired"))
+      refute check.passed
+    end
+  end
+
+  describe "declared_type_checks/3" do
+    @invoice_schema %{
+      "invoice" => %{
+        "vendor_name" => %{"type" => "string"},
+        "amount" => %{"type" => "monetary_amount"},
+        "due_date" => %{"type" => "date"}
+      }
+    }
+
+    test "passes silently when every typed value is well-formed" do
+      extracted = %{
+        "invoice" => %{vendor_name: "Acme Corp", amount: "$1,275.00", due_date: "2026-09-01"}
+      }
+
+      assert Checks.declared_type_checks(extracted, @invoice_schema) == []
+    end
+
+    test "flags a value that isn't well-formed for its declared type" do
+      extracted = %{
+        "invoice" => %{vendor_name: "Acme Corp", amount: "twelve hundred", due_date: "2026-09-01"}
+      }
+
+      assert [check] = Checks.declared_type_checks(extracted, @invoice_schema)
+
+      refute check.passed
+      assert check.rule["type"] == "declared_field_type"
+      assert check.rule["declared_type"] == "monetary_amount"
+      assert check.rule["field"] == %{"role" => "invoice", "name" => :amount}
+      assert check.detail =~ "declared as monetary_amount"
+      assert check.detail =~ "twelve hundred"
+    end
+
+    test "flags every badly-typed field, not just the first" do
+      extracted = %{
+        "invoice" => %{vendor_name: "Acme", amount: "N/A", due_date: "sometime next spring"}
+      }
+
+      assert [_one, _two] = Checks.declared_type_checks(extracted, @invoice_schema)
+    end
+
+    test "a string-typed field has no shape to be wrong about" do
+      # vendor_name would fail every validator in the module; being
+      # declared free text is exactly what makes that fine.
+      extracted = %{"invoice" => %{vendor_name: "N/A"}}
+
+      assert Checks.declared_type_checks(extracted, @invoice_schema) == []
+    end
+
+    test "a blank or missing value is left to extraction_completeness_checks/1" do
+      extracted = %{"invoice" => %{amount: nil, due_date: "  "}}
+
+      assert Checks.declared_type_checks(extracted, @invoice_schema) == []
+    end
+
+    test "a role with no schema entry at all is skipped rather than crashing" do
+      extracted = %{"receipt" => %{total: "not a number"}}
+
+      assert Checks.declared_type_checks(extracted, @invoice_schema) == []
+    end
+
+    test "an explicit format rule on the same field and validator wins, so one finding not two" do
+      extracted = %{"invoice" => %{amount: "twelve hundred"}}
+
+      rule = %{
+        "type" => "format",
+        "validator" => "monetary_amount",
+        "field" => %{"role" => "invoice", "name" => "amount"}
+      }
+
+      assert Checks.declared_type_checks(extracted, @invoice_schema, [rule]) == []
+    end
+
+    test "an explicit format rule naming a different validator is additional, not a duplicate" do
+      extracted = %{"invoice" => %{amount: "twelve hundred"}}
+
+      rule = %{
+        "type" => "format",
+        "validator" => "number",
+        "field" => %{"role" => "invoice", "name" => "amount"}
+      }
+
+      assert [_check] = Checks.declared_type_checks(extracted, @invoice_schema, [rule])
+    end
+  end
+
+  describe "validate_all/4 with a declared extraction_schema" do
+    test "runs the declared-type check automatically, with no rule configured for it" do
+      stub_defaults()
+
+      extracted = %{"invoice" => %{vendor_name: "Acme Corp", amount: "twelve hundred"}}
+      documents = %{"invoice" => "INVOICE from Acme Corp. Amount Due: twelve hundred"}
+
+      assert {:ok, result} =
+               Checks.validate_all(extracted, documents, [],
+                 extraction_schema: %{
+                   "invoice" => %{
+                     "vendor_name" => %{"type" => "string"},
+                     "amount" => %{"type" => "monetary_amount"}
+                   }
+                 }
+               )
+
+      # The value is verbatim from the document, so grounding passes — this
+      # is the check catching what grounding structurally cannot.
+      assert [check] = ValidationResult.failed_checks(result)
+      assert check.rule["type"] == "declared_field_type"
+    end
+
+    test "without an extraction_schema nothing is type-checked" do
+      stub_defaults()
+
+      extracted = %{"invoice" => %{amount: "twelve hundred"}}
+      documents = %{"invoice" => "INVOICE. Amount Due: twelve hundred"}
+
+      assert {:ok, result} = Checks.validate_all(extracted, documents, [])
+      assert ValidationResult.failed_checks(result) == []
+    end
+  end
+
   describe "staged_match/2" do
     test "returns a match without needing the LLM for near-identical names" do
       assert {:ok, %EntityMatchResult{match: true}} =

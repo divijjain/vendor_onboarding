@@ -32,6 +32,7 @@ defmodule DocumentComplianceEngine.DocumentJobs do
 
   defdelegate reload_document_job_row(id, organization_id), to: ListWithLatestRun, as: :reload
   defdelegate update_status(id, status), to: Repository
+  defdelegate update_document_type(id, slug), to: Repository
   defdelegate ingest_webhook(raw_payload), to: IngestWebhook, as: :call
   defdelegate read_documents(document_job), to: ReadDocuments, as: :call
   defdelegate read_raw_document(document_job, role), to: ReadRawDocument, as: :call

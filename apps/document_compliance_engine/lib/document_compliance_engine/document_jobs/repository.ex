@@ -57,6 +57,25 @@ defmodule DocumentComplianceEngine.DocumentJobs.Repository do
 
   @spec update_status(pos_integer(), atom()) ::
           {:ok, DocumentJob.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  @doc """
+  Fills in the document type a job turned out to be, for a job ingested
+  without one. Uses the same `ingest_changeset/2` the row was created
+  with, so the FK to `document_types` is enforced on this write too.
+  """
+  @spec update_document_type(pos_integer(), String.t()) ::
+          {:ok, DocumentJob.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  def update_document_type(id, slug) do
+    case get(id) do
+      {:ok, document_job} ->
+        document_job
+        |> DocumentJob.ingest_changeset(%{document_type_slug: slug})
+        |> Repo.update()
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   def update_status(id, status) do
     with {:ok, document_job} <- get(id) do
       document_job

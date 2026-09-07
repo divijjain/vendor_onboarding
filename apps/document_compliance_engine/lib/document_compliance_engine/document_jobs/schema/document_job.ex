@@ -39,6 +39,10 @@ defmodule DocumentComplianceEngine.DocumentJobs.Schema.DocumentJob do
   `organization_id` is deliberately not in `validate_required/2` — it's
   `nil` whenever the resolved owner hasn't joined an organization yet,
   backfilled later by `DocumentJobs.backfill_organization_id_for_owner/2`.
+  `document_type_slug` isn't either, for the same reason: a job ingested
+  by a caller who didn't say what they were sending starts unclassified
+  and is filled in once the agent has worked it out. The foreign key
+  still applies, so a non-null value is always a real document type.
   """
   def ingest_changeset(document_job, attrs) do
     document_job
@@ -49,7 +53,7 @@ defmodule DocumentComplianceEngine.DocumentJobs.Schema.DocumentJob do
       :owner_user_id,
       :organization_id
     ])
-    |> validate_required([:idempotency_key, :document_paths, :document_type_slug, :owner_user_id])
+    |> validate_required([:idempotency_key, :document_paths, :owner_user_id])
     |> unique_constraint(:idempotency_key)
     |> foreign_key_constraint(:document_type_slug)
   end

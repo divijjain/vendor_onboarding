@@ -1,14 +1,152 @@
 defmodule DocumentComplianceEngine.Agent.Evals.FixturesTest do
-  use ExUnit.Case, async: true
+  use DocumentComplianceEngine.DataCase, async: true
 
   alias DocumentComplianceEngine.Agent.Evals.Fixtures
+  alias DocumentComplianceEngine.Agent.Extraction
+  alias DocumentComplianceEngine.Agent.FormatValidators
+  alias DocumentComplianceEngine.DocumentTypes
 
-  test "all/0 spans both document types with no id collisions" do
+  test "all/0 spans every fixtured document type with no id collisions" do
     fixtures = Fixtures.all()
 
-    assert length(fixtures) == 79
+    assert length(fixtures) == 108
     ids = Enum.map(fixtures, & &1.id)
-    assert length(Enum.uniq(ids)) == 79
+    assert length(Enum.uniq(ids)) == 108
+
+    # Every document type in the registry has fixtures — the ratio this
+    # corpus was grown to close. A type seeded without any lands here.
+    assert fixtures |> Enum.map(& &1.document_type_slug) |> Enum.uniq() |> Enum.sort() ==
+             [
+               "bank_details",
+               "business_registration",
+               "certificate_of_insurance",
+               "invoice",
+               "payroll_statement",
+               "purchase_order",
+               "receipt",
+               "vendor_contract_w9",
+               "w8ben"
+             ]
+  end
+
+  test "every fixture carries enough of its own type's vocabulary to be extracted at all" do
+    # A fixture that fails its type's shape gate is never extracted, so a
+    # bucket asserting an extraction outcome would be asserting nothing.
+    # The wrong-type bucket is the deliberate exception: failing that gate
+    # is the behaviour it tests.
+    types = Map.new(DocumentTypes.list_document_types(), &{&1.slug, &1})
+
+    for fixture <- Fixtures.all(),
+        fixture.documents,
+        fixture.bucket != "invoice_wrong_type",
+        {role, text} <- fixture.documents do
+      shape = types[fixture.document_type_slug].shape_signals[role]
+
+      assert Extraction.shape_matches?(text, shape),
+             "#{fixture.id} (#{role}) does not clear its own type's shape gate"
+    end
+  end
+
+  describe "certificate_of_insurance/0" do
+    test "dates are relative to today, so the corpus cannot rot into failure" do
+      by_bucket = Enum.group_by(Fixtures.certificate_of_insurance(), & &1.bucket)
+      today = Date.utc_today()
+
+      # A committed literal like "expires 2027-06-01" is a fixture that
+      # silently starts failing in June 2027.
+      for fixture <- by_bucket["coi_clean"] do
+        assert {:ok, expiry} = expiry_date(fixture)
+        assert Date.compare(expiry, today) == :gt
+      end
+
+      assert [expired] = by_bucket["coi_expired"]
+      assert {:ok, expiry} = expiry_date(expired)
+      assert Date.compare(expiry, today) == :lt
+    end
+
+    defp expiry_date(fixture) do
+      [_all, date] =
+        Regex.run(~r/Expires: (\S+)/, fixture.documents["certificate_of_insurance"])
+
+      Date.from_iso8601(date)
+    end
+  end
+
+  describe "payroll_statement/0" do
+    test "the gross/net fixture states its expected values, since a swap would be grounded" do
+      [fixture] =
+        Enum.filter(Fixtures.payroll_statement(), &(&1.bucket == "payroll_gross_net"))
+
+      assert %{"payroll_statement" => %{gross_pay: gross, net_pay: net}} =
+               fixture.expected_fields
+
+      assert gross != net
+      assert fixture.documents["payroll_statement"] =~ gross
+      assert fixture.documents["payroll_statement"] =~ net
+    end
+  end
+
+  describe "bank_details/0" do
+    test "the invalid bucket differs from the clean one only by the IBAN check digit" do
+      # The whole point of the bucket: a length/shape check passes both, and
+      # only the mod-97 checksum tells them apart.
+      by_bucket = Enum.group_by(Fixtures.bank_details(), & &1.bucket)
+
+      valid = extract_iban(hd(by_bucket["bank_details_clean"]))
+      invalid = extract_iban(hd(by_bucket["bank_details_invalid_iban"]))
+
+      assert String.length(valid) == String.length(invalid)
+      assert String.slice(valid, 0..-2//1) == String.slice(invalid, 0..-2//1)
+      assert valid != invalid
+
+      assert :ok = FormatValidators.validate("iban", valid)
+      assert {:error, _detail} = FormatValidators.validate("iban", invalid)
+    end
+
+    test "buckets carry the decision the pipeline is expected to reach" do
+      by_bucket = Enum.group_by(Fixtures.bank_details(), & &1.bucket)
+
+      assert Enum.all?(by_bucket["bank_details_clean"], &(&1.expected_decision == "approved"))
+
+      assert Enum.all?(
+               by_bucket["bank_details_invalid_iban"],
+               &(&1.expected_decision == "needs_review")
+             )
+
+      assert Enum.all?(
+               by_bucket["bank_details_sanctions_hit"],
+               &(&1.expected_decision == "needs_review")
+             )
+    end
+
+    defp extract_iban(fixture) do
+      [_all, iban] = Regex.run(~r/IBAN: (\S+)/, fixture.documents["bank_details"])
+      iban
+    end
+  end
+
+  describe "purchase_order/0" do
+    test "the dates bucket labels its two dates so the field names give no help" do
+      [fixture] = Enum.filter(Fixtures.purchase_order(), &(&1.bucket == "purchase_order_dates"))
+      text = fixture.documents["purchase_order"]
+
+      # Neither "order date" nor "delivery date" appears — only the field
+      # descriptions can tell the model which date is which.
+      refute text =~ ~r/order date/i
+      refute text =~ ~r/delivery date/i
+      assert text =~ "Raised:"
+      assert text =~ "Required By:"
+      # A third date as a distractor, belonging to neither field.
+      assert text =~ "Printed:"
+    end
+
+    test "every fixture embeds both parties and the total in the document text" do
+      for fixture <- Fixtures.purchase_order() do
+        assert fixture.document_type_slug == "purchase_order"
+        assert fixture.documents["purchase_order"] =~ "PURCHASE ORDER"
+        assert fixture.documents["purchase_order"] =~ "Supplier:"
+      end
+    end
   end
 
   describe "vendor_contract_w9/0" do

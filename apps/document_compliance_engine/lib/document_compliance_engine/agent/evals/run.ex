@@ -34,7 +34,7 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
   """
 
   alias DocumentComplianceEngine.Agent.Evals.{Deterministic, Fixtures, Judge}
-  alias DocumentComplianceEngine.Agent.{Checks, DocumentReactor}
+  alias DocumentComplianceEngine.Agent.{Checks, Classification, DocumentReactor}
   alias DocumentComplianceEngine.DocumentTypes
   alias DocumentComplianceEngine.PdfText
 
@@ -46,6 +46,8 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       :entity_match,
       :tax_id_verbatim_ok,
       :fields_grounded,
+      :expected_fields_ok,
+      :field_mismatches,
       :field_confidences,
       :explanation,
       :findings,
@@ -80,12 +82,15 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
 
     case build_documents(fixture) do
       {:ok, documents} ->
+        # The fixture declares its own document type, so classification
+        # short-circuits on it exactly as a caller-supplied slug does in
+        # production: these fixtures measure extraction and validation, and
+        # feeding the classifier one candidate would measure nothing.
+        # Classification has its own harness — see `Evals.Classification`.
         inputs = %{
           document_type_slug: fixture.document_type_slug,
           documents: documents,
-          extraction_schema: document_type.extraction_schema,
-          validation_rules: document_type.validation_rules,
-          shape_signals: document_type.shape_signals,
+          document_types: Classification.candidates([document_type]),
           human_decision: nil
         }
 
@@ -131,6 +136,10 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       entity_match: if(fixture.expected_entity_match != nil, do: true),
       tax_id_verbatim_ok: tax_id_verbatim_ok(documents, tax_id),
       fields_grounded: fields_grounded?(final.extracted, documents, document_type),
+      expected_fields_ok:
+        Deterministic.expected_fields_ok?(final.extracted, fixture.expected_fields),
+      field_mismatches:
+        Deterministic.expected_field_mismatches(final.extracted, fixture.expected_fields),
       field_confidences:
         field_confidences(final.extracted, final.extraction_metadata, documents, document_type)
     }
@@ -159,6 +168,9 @@ defmodule DocumentComplianceEngine.Agent.Evals.Run do
       entity_match: entity_match_check && entity_match_check.passed,
       tax_id_verbatim_ok: tax_id_verbatim_ok(documents, tax_id),
       fields_grounded: fields_grounded?(extracted, documents, document_type),
+      expected_fields_ok: Deterministic.expected_fields_ok?(extracted, fixture.expected_fields),
+      field_mismatches:
+        Deterministic.expected_field_mismatches(extracted, fixture.expected_fields),
       field_confidences: field_confidences(extracted, metadata, documents, document_type),
       explanation: explanation,
       findings: validation && Checks.describe_findings(validation)

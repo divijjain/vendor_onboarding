@@ -260,6 +260,92 @@ defmodule DocumentComplianceEngine.Agent.RunTest do
     assert checkpoint.status == :resumed
   end
 
+  test "a resumed checkpoint keeps its row but drops its payload", %{document_paths: paths} do
+    stub_defaults(
+      extract: fn
+        "w9", _schema, _text -> {:ok, w9(%{company_name: "Totally Different LLC"})}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
+
+    trigger(31, paths)
+    assert_received {:callback, _needs_review}
+
+    # Before: the row holds the serialized reactor and the full text of
+    # every document in the job — which on a W-9 run includes a Tax ID.
+    assert {:ok, paused} = Repository.get_by_thread_id("document_job-31")
+    assert is_binary(paused.reactor_state)
+    assert paused.inputs["documents"]["w9"] =~ "12-3456789"
+
+    Run.resume(31, "document_job-31", "rejected")
+    assert_received {:callback, _resumed}
+
+    assert {:ok, purged} = Repository.get_by_thread_id("document_job-31")
+    # The record that a pause happened survives; the payload does not.
+    assert purged.status == :resumed
+    assert purged.explanation != nil
+    assert purged.reactor_state == nil
+    assert purged.inputs == %{}
+  end
+
+  test "resuming an already-resumed checkpoint fails cleanly instead of crashing", %{
+    document_paths: paths
+  } do
+    stub_defaults(
+      extract: fn
+        "w9", _schema, _text -> {:ok, w9(%{company_name: "Totally Different LLC"})}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
+
+    trigger(32, paths)
+    assert_received {:callback, _needs_review}
+
+    Run.resume(32, "document_job-32", "approved")
+    assert_received {:callback, _first}
+
+    # A second decision on the same thread used to reach
+    # `binary_to_term(nil)` once the payload was dropped.
+    Run.resume(32, "document_job-32", "approved")
+
+    assert_received {:callback, payload}
+    assert payload["status"] == "failed"
+    assert payload["explanation"] =~ "already resumed"
+  end
+
+  test "a halted checkpoint stores the winning type's config, not every candidate's", %{
+    document_paths: paths
+  } do
+    stub_defaults(
+      extract: fn
+        "w9", _schema, _text -> {:ok, w9(%{company_name: "Totally Different LLC"})}
+        role, schema, text -> extract(role, schema, text)
+      end
+    )
+
+    trigger(33, paths)
+    assert_received {:callback, _needs_review}
+
+    assert {:ok, checkpoint} = Repository.get_by_thread_id("document_job-33")
+    by_slug = Map.new(checkpoint.inputs["document_types"], &{&1["slug"], &1})
+
+    # The winner keeps everything the resumed run could need.
+    winner = by_slug["vendor_contract_w9"]
+    assert winner["extraction_schema"] != nil
+    assert winner["validation_rules"] != nil
+
+    # Every other candidate keeps only what classification reads, so the
+    # row records which alternatives were considered without carrying five
+    # unused extraction schemas.
+    for {slug, candidate} <- by_slug, slug != "vendor_contract_w9" do
+      assert candidate["slug"]
+      assert candidate["description"]
+      assert Map.has_key?(candidate, "shape_signals")
+      refute Map.has_key?(candidate, "extraction_schema")
+      refute Map.has_key?(candidate, "validation_rules")
+    end
+  end
+
   test "sends a failed callback when a document is missing" do
     stub_defaults()
 

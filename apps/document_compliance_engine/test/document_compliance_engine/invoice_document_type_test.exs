@@ -88,6 +88,44 @@ defmodule DocumentComplianceEngine.InvoiceDocumentTypeTest do
            }
   end
 
+  test "halts for review when a value is malformed for its declared field type" do
+    # End-to-end proof that the seeded document type's declared types reach
+    # validation: `invoice.amount` is declared `monetary_amount` in
+    # `document_types`, no `validation_rules` entry mentions it, and the
+    # value below is verbatim from the document (so grounding passes) —
+    # the declared type is the only thing that can catch it.
+    stub_agent(
+      agent_extract: fn "invoice", _schema, _text ->
+        {:ok,
+         %{
+           vendor_name: "Acme Corp",
+           invoice_number: "INV-1001",
+           amount: "twelve hundred",
+           due_date: "2026-09-01"
+         }}
+      end,
+      agent_screen_vendor: fn _name -> {:ok, %{flagged: false, reason: nil}} end,
+      agent_draft_explanation: fn findings -> "Explanation: #{findings}" end
+    )
+
+    document_job =
+      ingest_invoice("""
+      INVOICE
+      Vendor: Acme Corp
+      Invoice Number: INV-1001
+      Amount: twelve hundred
+      Due Date: 2026-09-01
+      """)
+
+    assert {:ok, _agent_run} = AgentRuns.trigger_agent_run(document_job.id)
+
+    assert {:ok, updated_job} = DocumentJobs.get_document_job(document_job.id)
+    assert updated_job.status == :needs_review
+
+    assert {:ok, updated_run} = AgentRuns.get_latest_for_document_job(document_job.id)
+    assert updated_run.explanation =~ "declared as monetary_amount"
+  end
+
   test "halts for review when the vendor hits the sanctions screen" do
     stub_agent(
       agent_extract: fn "invoice", _schema, _text ->

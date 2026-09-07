@@ -1588,6 +1588,531 @@ which carries three low/medium CVEs (cookie/link-header encoding, response split
 code paths (`cow_cookie`, `cow_link`) this metrics-only endpoint never calls, since it only ever
 serves a static Prometheus-text body.
 
+## 2026-09-01 — `extraction_schema` fields carry a declared type
+
+Prompted directly, framed against a comparable product's `TemplateField.Format`
+(Text/Number/Date/…): this app's `extraction_schema` values were the literal string
+`"string"` for every field of every document type — structurally a type slot that had
+never once held a type. Nothing could check a value's shape, because nothing declared
+what shape it was supposed to have.
+
+**What a type is, and what it deliberately isn't.** `Agent.FieldTypes` is the closed
+vocabulary: `string` (free text, the default) plus `number`, `date`, `currency`,
+`email`, `phone`, `uri`. Every non-`string` name is *also* a `FormatValidators`
+validator name — enforced by a compile-time check inside `FieldTypes`, so the two
+vocabularies can't silently drift — which is what keeps the list non-arbitrary and what
+makes deriving a format check from a declared type a lookup rather than a second table.
+Identifier schemes (EIN, IBAN, VAT ID, VIN, card number) are deliberately *not* types:
+they are claims about what a value *is*, issuer- or jurisdiction-specific, and stay
+`"string"` plus an opt-in `format`/`regex`/`mcp_tool` rule naming the sharper check.
+`tax_id` is the live example — still `"string"`, with the EIN regex pre-filter in
+`Extraction` and the `validate_tax_id` MCP rule in `Checks` doing the real work,
+untouched by this.
+
+**A declared type never becomes the wire type of an extracted value.** The
+least-obvious decision here, and the load-bearing one: Instructor is still asked for
+`:string` on every field whatever its declared type. Letting it coerce `"1,234.56"` to
+`1234.56` (or `"Sept 1, 2026"` to a `Date`) would make the value stop appearing in the
+document it came from, and `Checks.grounded_extraction_checks/3` would then report a
+correctly-extracted field as a possible hallucination — i.e. adding types the obvious
+way would quietly break the strongest anti-hallucination guarantee in the pipeline. So
+a type says *what to look for*, never *how to write it down*, and a badly-formed value
+is meant to become a failed *check* (routing to human review) rather than a rewritten
+value.
+
+**Where the type is respected, concretely** (`Extraction`): every declared type across
+the whole schema is validated up front, before any LLM call is spent on any role —
+unknown ones surface as `{:error, {:unknown_field_type, role, field, type}}`, a loud
+config bug, mirroring how `Checks` already treats an unknown `format` validator name
+rather than silently degrading the field to free text. (Checked for the whole schema,
+not per role, so an unknown type in a role the shape gate happens to skip still
+surfaces.) `prompt/2` then names each field's type inline — `amount (a number),
+due_date (a date)` — plus one instruction: the parenthesized type says what to look for,
+copy the value exactly as the document writes it, never reformatted to match. A schema
+whose fields are all `"string"` produces a **byte-identical** prompt to the pre-types
+one, deliberately: `vendor_contract_w9`'s existing eval numbers still describe it, and
+prompt drift is confined to the one document type that actually changed.
+
+**Data migration**: only `invoice` has non-text fields — `amount` → `number`,
+`due_date` → `date`, matching how its own eval fixtures actually write them
+(`"1,000.00"`, `"2026-09-01"`). Every `vendor_contract_w9` field genuinely is free text
+and stays `"string"`. Data-only and reversible — the column and the
+`role => field => type` shape are untouched — with rollback and re-apply both run
+against the test DB rather than assumed.
+
+**Not done in this pass**: `Checks` does not yet derive a format check from a declared
+type (the follow-up this was the prerequisite for), and the type does not yet tighten
+`shape_signals`' per-role gate. Both need `validate_all/5` to be handed the extraction
+schema, which it isn't at this point — that plumbing is the real content of that
+change, not a line of config. **Done same day — see the next entry**, which also
+records why the `shape_signals` half was deliberately left undone after the plumbing
+existed.
+
+**Verified**: `mix precommit` clean, 378 tests passing (15 of them new), `mix dialyzer`
+unchanged — the same 8 pre-existing findings as before the change, none in the new or
+edited modules. **Not verified**: the real eval corpus was not re-run (it needs a live
+OpenAI key), so the invoice prompt's new type hints are unproven against measured
+accuracy — re-running `mix eval.run` over the invoice buckets is the honest next step
+before assuming the existing numbers still hold for that document type.
+
+## 2026-09-01 — declared types get teeth: `Checks` checks every value against its field's type
+
+Follow-up to the entry above, same day, and the thing that one was a prerequisite for.
+`extraction_schema` now declares types, but nothing consumed them past the prompt —
+`Checks.validate_all/5` was never handed the schema at all.
+
+**Plumbing first, and a signature change worth noting.** `validate_all` took two
+trailing optional maps (`shape_signals`, `extraction_metadata`) and needed a third.
+Three positional, same-typed, all-optional maps is an argument order nobody can read
+and a mis-order nothing catches, so it became
+`validate_all(extracted, documents, validation_rules, opts \\ [])` with
+`:shape_signals`/`:extraction_metadata`/`:extraction_schema`. One production call site
+(`DocumentReactor`'s `:validate` step, which now also takes `input(:extraction_schema)`
+— the same schema `:extract` is driven by) and no test churn, since the tests almost
+all call the /3 form.
+
+**`Checks.declared_type_checks/3` is a fourth automatic check**, alongside grounding,
+completeness and low-confidence — not a `validation_rules` entry, so no document type
+can configure it away. Declaring `amount` a `monetary_amount` *is* the instruction to
+check it; needing to also remember a matching `format` rule would make the declaration
+decorative. It reuses the same `FormatValidators` a `format` rule does. Skips: a
+`"string"` field (no shape to be wrong about), a blank one (`extraction_completeness_checks/1`
+already owns "the value never arrived", and two findings for one field only pads the
+reviewer's list), and a field already covered by an explicit `format` rule naming the
+same validator (a rule naming a *different* validator is deliberately additional, not
+a duplicate).
+
+**The eval fixtures immediately caught a false positive, and the type/validator
+invariant is what made it legible.** `invoice.amount` was first typed `number`. The
+scanned fixtures write amounts as `"$1,275.00"` (the plain-text ones write
+`"1,000.00"`), and a bare number check rejects the first — `scanned-clean-01` went
+`approved` → `needs_review` in the test suite, i.e. a false "invalid" on a perfectly
+good invoice, which is the failure mode this project cares most about avoiding.
+Because `FieldTypes` requires every type name to *be* a `FormatValidators` validator
+name, the fix could not be a plausible-sounding type that quietly checked the wrong
+thing: the gap surfaced as "there is no validator for what an invoice amount actually
+is." `FormatValidators.monetary_amount` now exists (a number plus whatever the document
+puts around it — one currency symbol or code on either side, parentheses for a credit;
+deliberately not locale-aware about decimal commas, since guessing which separator is
+which is worse than a permissive pass), and the field is typed `monetary_amount`. The
+migration was amended rather than a second one stacked on top — it had not been
+committed or applied anywhere but the test DB.
+
+**Deliberately not done: type-aware `shape_signals` gating**, which the previous entry
+listed as the other half. Now that the plumbing exists it would be easy to add and it
+is still the wrong trade. To gate *before* extraction on a type, you have to ask "does
+this text contain any token that could be a date/amount?", which means tokenizing and
+running validators over n-grams — a heuristic, and precisely the class of heuristic
+this project already had to walk back once (the grounding check's fixed byte window,
+dropped after a real false positive on a legitimately-worded due date). It would also
+be strictly weaker than what the type already buys: checking the *extracted value*
+against its type is exact, needs no windowing, and happens after the model has done
+the hard part. And the measured headroom is zero — `invoice/invoice_wrong_type` is
+3/3 in the run below, caught by the existing keyword gate before extraction ever
+runs. Left undone with reasons rather than built for symmetry with the sentence that
+proposed it.
+
+**Verified against the real corpus, not just fakes** (`mix eval.run`, both
+keys live, both MCP servers up, all 79 fixtures): decision accuracy **78/79**, and the
+deterministic groundedness check **0% hallucination across all 79** — both identical to
+the numbers already in BENCHMARK.md, including the same single known miss
+(`formatting-07`). So the typed prompt introduced no regression on
+`vendor_contract_w9` (as intended — its prompt is byte-identical), and the new
+automatic type check produced **zero false positives** on 24/24 invoice fixtures
+including all 8 scanned ones, where real `gpt-4o-mini` extractions of `"$1,275.00"`-style
+amounts now pass a real check rather than a stubbed one.
+
+## 2026-09-01 — semantic descriptions, at both levels, and the field spec that made room for them
+
+Prompted directly, as the prerequisite for classification: a comparable product's
+document templates carry a semantic description written for a classifier to reason
+over, and each field carries one too. This registry had `slug` and `name` — names, not
+meanings. Nothing in the config said what a document type *is*, which is exactly the
+input a classifier needs and exactly what a field name underdetermines.
+
+**Two levels, two shapes.** `document_types.description` is a new column: a paragraph
+per type saying what the document is and what distinguishes it from its neighbours
+(the invoice description says how it differs from a purchase order and a receipt —
+written that way on purpose, since telling neighbours apart is the classifier's actual
+job). Per-field descriptions needed a structural change: `extraction_schema`'s values
+went from the bare type string to a field spec map, `%{"type" => …, "description" =>
+…}`.
+
+**That structure got one owner.** `Agent.ExtractionSchema` now owns the shape — roles,
+field specs, `type/1`, `description/1`, `validate/1` — because four modules read this
+config (`Extraction`, `Checks`, `Agent.Run`, `IngestWebhook`) and four hand-rolled
+`Map.get(spec, "type")`s is how a shape change becomes a four-site migration every
+time. `FieldTypes` kept the vocabulary and lost `validate_schema/1` to it; the
+distinction is "what types exist" versus "what shape declares one".
+
+**The bare-string form is rejected, not accepted for compatibility.** An unmigrated
+row reports `{:invalid_field_spec, role, field}`, which reads as the true diagnosis
+("this row was never migrated") rather than being silently absorbed by a compatibility
+branch that would then live in the codebase forever. The migration rewrites every
+seeded row, so nothing in this app produces the old shape.
+
+**Descriptions are written only where the name underdetermines the value** —
+`payment_terms`, `liability_clauses`, `due_date` (*which* of an invoice's dates),
+`amount` (the total payable, not a line item). `company_name` and `invoice_number` get
+none. A description that restates the field name is prompt noise on every future
+extraction, paid for on every run.
+
+**A description that states a format gets that format invented — found by the corpus,
+not by reading.** `tax_id`'s first description said "written as two digits, a hyphen,
+then seven digits". The eval re-run caught `malformed-03` (a W-9 stating `123456789`,
+deliberately hyphen-less, in the bucket that tests graceful degradation) coming back as
+`12-3456789`: the model normalised the value to match the description, overriding the
+prompt's own "copy the value exactly as the document writes it" instruction, and the
+grounding check correctly reported the result as a possible hallucination. The lesson
+generalises past this one field — *everything* a description puts in front of the model
+is an instruction, including the parts that read like context to a human. Descriptions
+now state meaning only; format belongs to the declared type and to `format`/`regex`
+rules, which check a value without telling the model what to produce. Two other
+descriptions written the same way (`bic`'s "8 or 11 characters", `payment_method`'s
+worked examples) were rewritten before they could cause the same thing. Verified fixed:
+three consecutive live extractions of that fixture now return `123456789` verbatim.
+
+**The prompt became a list.** With descriptions inline, the old comma-joined field
+sentence ran several full sentences together with no visible boundary between fields;
+fields are now one per line, `- amount: Written as a monetary amount… The total
+payable…`. This gives up the byte-identical-prompt property the previous entry
+deliberately preserved for untyped document types — worth stating plainly, because
+that property was the argument for not re-running the evals then. It was paid for with
+a full corpus re-run instead of an argument (below).
+
+## 2026-09-01 — the type library goes from two to six, as data only
+
+Prompted directly: a comparable product ships ten preconfigured document types; this
+had two. Added `receipt`, `purchase_order`, `payroll_statement` and `bank_details` in
+one migration, with **zero lines of pipeline code changed** — which is the actual
+claim being tested, not the count.
+
+Each one exercises a different part of the config surface rather than being a fourth
+copy of `invoice`:
+
+- `purchase_order` is the mirror image of `invoice` (ordering work not yet done vs.
+  billing for work already done) and the first type with two `date` fields, where the
+  field descriptions are the only thing telling `order_date` and `delivery_date` apart.
+- `payroll_statement` has **no `validation_rules` at all** — a deliberate demonstration
+  that a type can be pure extraction. The automatic checks still run; nothing external
+  does, because screening an employee's name against a sanctions watchlist would be the
+  wrong thing to do with payroll data. "No rules" is now a supported configuration
+  with a test behind it, not an unfinished one.
+- `bank_details` is where the `format`/`regex` rules earn their keep on the identifier
+  schemes `FieldTypes` deliberately excludes from the type vocabulary: `iban` runs a
+  real mod-97 checksum, `bic` a document-type-specific pattern, and both fields stay
+  typed `"string"`. The split documented two entries ago now has a seeded type
+  demonstrating it rather than only a rationale.
+
+**The test walks the registry, not a list.** `DocumentTypeLibraryTest` iterates
+`DocumentTypes.list_document_types/0` and generates each type's synthetic document from
+that type's own config — its `shape_signals` keywords, and one value per field derived
+from that field's declared type — then asserts the job auto-approves. A document type
+added later is covered the moment it is seeded, and one that isn't genuinely supported
+by the generic pipeline fails there rather than in production. Two mutation checks
+confirmed it bites rather than passing vacuously: making dates unparseable fails
+`invoice` on the declared-type check, and altering one IBAN digit fails `bank_details`
+on the mod-97 rule.
+
+## 2026-09-01 — classification: the caller no longer has to know what they're sending
+
+Prompted directly as "the headline gap". Until now `document_type_slug` arrived in the
+webhook payload, so the integrator had to already know which template applied — the
+one thing a document-understanding system is supposed to work out for itself. A
+comparable product auto-detects which template applies; this now does too.
+
+**`document_type_slug` became optional, and the column nullable.** A supplied slug is
+still honoured and never re-derived: an explicit declaration from an integrator beats
+an inference, and re-classifying it would be spending money to second-guess someone who
+already knows. It is still checked against the registry, so a typo is a loud
+`:unknown_document_type` rather than a silent misclassification. Omit it and the job is
+ingested unclassified; `HandleAgentCallback` fills the column in afterwards with what
+the run actually decided, and leaves it blank when nothing could be decided.
+
+**A real bug the first test caught**: the column still carried
+`DEFAULT 'vendor_contract_w9'` from when it was added — harmless while every row had to
+have a type, actively wrong the moment one could be omitted, because an unclassified
+insert came back already labelled a vendor contract. Exactly the confidently-wrong
+answer this feature exists to avoid, and invisible until an unclassified job existed to
+expose it. The default is dropped with the NOT NULL.
+
+**Classification is staged, like `entity_match` before it.** The free, deterministic
+pre-filter runs first: each candidate's own `shape_signals` keywords are counted against
+the text, and when *exactly one* candidate clears its own gate, that is the answer with
+no LLM call at all. It reuses `Extraction.shape_matches?/2` — the same function that
+decides whether a role is worth extracting — so a type's keywords mean the same thing
+in both directions instead of being configured twice. **This resolved 55 of 79 fixtures
+(70%) with zero LLM calls** in the measured run below.
+
+**Where the halt machinery gets reused — the design decision worth defending.** The
+obvious build is a second pause: `:classify` halts, a reviewer picks a type, resume
+consumes it. That needs its own checkpoint semantics, its own resume path, its own
+reviewer vocabulary, and a conditional step (because a rejected classification must not
+extract), all parallel to machinery that already exists. Instead, **an unconfident
+classification is an ordinary failed check.** `TypeResolution` turns "not confident",
+"couldn't classify at all" and "these documents don't match this type's roles" into a
+resolution with an *empty* `extraction_schema` plus a failed check. Extraction over no
+roles is a genuine no-op, the check flows into the same `ValidationResult` as a
+sanctions hit, and `:gate` halts the run for the same reviewer with the same audit
+record and the same approve/reject vocabulary. No new machinery, no conditional steps.
+
+A consequence worth stating: for a *low-confidence* classification the pipeline still
+extracts under the proposed type. That spends an extraction on a guess that may be
+wrong — deliberately, because the reviewer's question is "is this a purchase order?"
+and the fields pulled out under that assumption are the evidence that answers it.
+Handing them the question with none of the evidence would be cheaper and worse.
+
+**What moved from input to step.** `extraction_schema`/`validation_rules`/`shape_signals`
+used to be inputs resolved before `Reactor.run/2`. They can't be — they depend on the
+classification — so they became `:resolve_type`'s result. The *candidates*
+(`input(:document_types)`, the whole registry as string-keyed config) are still resolved
+before the run and stored in the checkpoint, which preserves the property that mattered:
+a resumed run sees exactly the candidates the halted run saw, not whatever the registry
+looks like whenever the human gets round to reviewing. The earlier CLAUDE.md note about
+resolving config outside Reactor is amended, not violated.
+
+**Role mapping is explicit about what it won't guess.** A caller who names their
+uploads `contract`/`w9` already agrees with the type's roles and is passed through. A
+caller who doesn't know what they're sending can't know the role names either, so a
+single upload is mapped onto a single-role type's role whatever key it arrived under.
+Anything else — two uploads, three roles, mismatched names — is reported as a failed
+check rather than paired up by guesswork, because silently pairing the wrong file with
+the wrong role produces a confidently wrong extraction instead of an honest question.
+
+**Measured, with a new eval tier** (`mix eval.classify`, `Evals.Classification`): all 79
+existing fixtures, each with its declared type withheld, against all six seeded types.
+Scored deterministically — whether a document got its own type back is an objective
+fact, not a judgement call, so no LLM judge. The wrong-type bucket is scored inverted: a
+résumé is *correctly* classified when the classifier declines to place it.
+
+- **79/79 correct.** Every typed fixture got its own type; all three wrong-type fixtures
+  were declined.
+- **Confidence separation**: correctly placed fixtures scored 0.80-1.00 (n=76, avg 0.98);
+  correctly declined ones scored 0.00-0.20 (n=3). Nothing was misclassified.
+- **Threshold 0.75** sits in that gap, deliberately nearer the correct side than the 0.50
+  midpoint: a borderline case sent to a human costs review time, while a confidently
+  wrong type extracts and validates entirely the wrong fields. The 0.05 margin below the
+  lowest correct placement is thin, and is recorded as thin — one sparse-invoice fixture
+  sets that floor.
+
+**Reachable by a person, not only by an integrator.** The dashboard's upload form gained
+an "Auto-detect the document type" option that submits a payload with no
+`document_type_slug` at all — the same thing an integrator omitting it does, not a magic
+slug ingestion would have to know about. That form previously hardcoded one entry per
+document type and knew about two of them; auto-detect is also what makes the other four
+seeded types uploadable without touching that module again.
+
+**The extraction corpus was re-run in full afterwards** (`mix eval.run`, both keys live,
+both MCP servers up): **79/79 decisions, 0% hallucination across all 79, entity-match
+judge 1.00 (n=47), groundedness judge 1.00 (n=35)**. Worth stating plainly: the
+`formatting-07` miss that BENCHMARK.md had recorded as standing passed on this run,
+taking that bucket to 12/12 — that is *not* a fix to claim, since it is the deliberately
+ambiguous entity-match pair and nothing here touched the entity-match path. It went the
+other way on a different run, which is what a borderline case does.
+
+## 2026-09-01 — closing two gaps the type-library and classification work opened
+
+Both prompted directly, after an honest accounting of what the day's work traded away:
+four of the six seeded document types had no accuracy evidence at all, and the
+checkpoint had quietly become the place where the whole registry gets stored twice.
+
+### Eval fixtures for two of the four new types (corpus 79 → 88)
+
+Picked for what they exercise rather than for coverage arithmetic:
+
+- **`bank_details`** (5 fixtures) is the only type whose rules do real algorithmic work.
+  The `bank_details_invalid_iban` bucket is the point: its IBANs differ from the clean
+  bucket's by exactly one check digit, so they are the right country, the right length
+  and the right shape, and *only* the ISO 13616 mod-97 checksum separates them. A
+  pattern-based "IBAN check" waves all four through. Real published test IBANs, not
+  invented plausible-looking strings.
+- **`purchase_order`** (4 fixtures) is where the field descriptions get tested rather
+  than asserted. Its `purchase_order_dates` fixture labels its two dates "Raised" and
+  "Required By" — neither field name appears in the document — and adds a third date
+  ("Printed") as a distractor. Nothing but the semantic descriptions on `order_date`
+  and `delivery_date` can tell the model which is which.
+
+**Both new types run clean** (`mix eval.run`, 88 fixtures): every `bank_details` and
+`purchase_order` bucket correct, and **88/88 grounded** across the whole corpus. Overall
+decisions **87/88** — the one miss is `formatting-07` again, which has now gone both ways
+across four runs on unchanged code (fail, pass, pass, fail). That is worth more than the
+fixture is: two runs earlier this session it read 12/12, and stopping there would have
+made "improved to 12/12" an available and entirely false claim. Judges: entity-match
+0.98 (n=47), groundedness 0.99 (n=40). Classification with types withheld
+(`mix eval.classify`): **88/88**, placed 0.80-1.00 (n=85), declined 0.00 (n=3),
+**59/88 resolved with no LLM call**.
+
+### The dates bucket couldn't fail, so the harness gained field-value scoring
+
+Writing that fixture exposed a real hole in the benchmark: `purchase_order_dates` is
+scored on its *decision*, and swapping `order_date` with `delivery_date` produces an
+approved run in which both values are still verbatim present in the document — so
+decision accuracy and the groundedness check both pass a straight swap. The fixture
+would have looked like evidence while being incapable of failing for the reason it
+exists.
+
+So `Fixture` gained an optional `expected_fields`, and the harness a deterministic
+`expected_fields_ok?/2` (plus a mismatch list, because a bare `false` isn't actionable).
+Opt-in per fixture and reported over only the fixtures that state values — a
+corpus-wide "field accuracy" number, when almost no fixture states an expected value,
+would be a bigger claim than the data supports. Verified separately against the live
+model: three consecutive extractions map Raised→`order_date`, Required By→`delivery_date`,
+and ignore the Printed distractor.
+
+**A bug in that new check, caught by its own test**: `expected_field_mismatches/2` was
+written as a comprehension with `actual = Map.get(...)` as a filter clause, which reads
+a `nil` as falsy and drops the row — silently hiding the *missing field entirely* case,
+the most interesting mismatch there is. Second time today that Elixir's
+assignment-as-filter has been the subtle bit; the version in `Checks` survives because
+it pairs the assignment with an explicit `is_binary/1` guard, and this one now avoids
+the construct altogether.
+
+### The checkpoint: measured first, then two changes
+
+The concern was that `input(:document_types)` puts the whole registry in every halted
+run's checkpoint. Measuring a real halt (invoice fixture, 141 bytes of document text)
+gave a more useful picture than the concern did:
+
+| Term | Size |
+|---|---|
+| `reactor_state` (serialized reactor) | 13,948 bytes |
+| `inputs` jsonb | 7,667 bytes — of which candidates are 7,463 |
+| the document itself | 141 bytes |
+
+Two findings, only one of which was the one being looked for.
+
+**1. The candidate list is stored twice** — once in the `inputs` column and once inside
+the serialized reactor's own context — at ~1.2KB per document type. Halved on the copy
+we control: the *winning* candidate is stored whole, every other one keeps only
+`slug`/`name`/`description`/`shape_signals`. That is not a lossy compromise but exactly
+what each role reads — `Classification` never reads anything else from a candidate, and
+`TypeResolution` only ever looks up the winner — so both steps would behave identically
+if they ever re-ran, and the row still records which alternatives the run chose among,
+which is the part worth keeping for an audit. 7,667 → 4,214 bytes at six types.
+
+**2. The bigger finding, which wasn't the one being investigated: resumed checkpoints
+were never cleaned up.** A checkpoint kept its serialized reactor and its `inputs` —
+including the **full text of every document in the job** — permanently, for a run that
+had already finished. On a `vendor_contract_w9` run that text contains the W-9's Tax ID
+in plaintext, in a jsonb column that, unlike `agent_runs.tax_id`, is not encrypted.
+CLAUDE.md's "never add a plaintext Tax ID column" rule was being honoured in the
+business tables and quietly undone here. Nothing reads either column once the run is
+over: the outcome is on `agent_runs`, and the reviewer's decision plus the evidence they
+saw are on `review_decisions`.
+
+`Repository.purge_payload/1` now drops both columns after a resumed run finishes,
+keeping the row (thread_id, timestamps, explanation, status) as the record that a pause
+happened. Three details that matter:
+
+- **After the run, never before.** A crash between deserializing and finishing must
+  leave something to resume from, so the purge is the last thing `do_resume/3` does.
+- **`reactor_state` had to become nullable** (its own migration), and NULL there now
+  means exactly one thing: resumed and purged.
+- **A second decision on the same thread used to reach `binary_to_term(nil)`.** It is
+  now a clean, logged "already resumed" failure — the double-resume path was reachable
+  before this and simply never exercised.
+
+Still open, and stated rather than fixed: an *awaiting_review* checkpoint holds document
+text in plaintext for as long as the review takes. Encrypting that column (Cloak, as
+`agent_runs.tax_id` already does) is the real fix; retention was the cheap half.
+
+## 2026-09-01 — nine document types, all of them with evidence
+
+Prompted directly, and the sequencing was the point: fixtures for the two types that had
+none, *then* three new types with fixtures written alongside them, rather than seeding
+more config and calling the count the deliverable. The registry is nine and the corpus
+is 108; every seeded type now has fixtures.
+
+**`receipt` and `payroll_statement` got fixtures first** (8 between them), closing the
+ratio that the previous entry admitted to: four of six types were breadth with no
+accuracy evidence behind them.
+
+**Three new types, each chosen for what it exercises**, not for the count. Before this,
+five of eight field types and nine of twelve format validators had no user anywhere in
+the registry — config surface that existed and was never once interpreted:
+
+- **`certificate_of_insurance`** needed a rule kind that didn't exist. A COI that was
+  valid when it was filed and has since lapsed is a real compliance finding that no
+  amount of reading the document produces, so `Checks` gained `not_expired` — the only
+  rule whose answer depends on *when it runs*.
+- **`w8ben`** (the W-9's foreign-vendor sibling) is the first user of the `vat_id`
+  validator, which had existed unused since `FormatValidators` was written.
+- **`business_registration`** is the first user of the `email`, `phone` and `uri` field
+  types and the `postal_address` validator.
+
+All three are documents a business genuinely collects from a new vendor, which is the
+domain this project is actually about — a bank statement or a driving licence would be
+breadth borrowed from a general document-processing product, and two of the obvious
+candidates (bank statement, delivery note) are blocked on repeating-row extraction
+anyway. Unused field types are down from five to two; all five rule kinds are now in use.
+
+**`not_expired` needed a clock, and a parser that refuses to guess.** The clock is
+injected (`validate_all/4`'s `:today`), because a fixture asserting "expires next year"
+is a fixture that silently starts failing the year after it was written — the COI
+fixtures compute their dates relative to the run date for the same reason.
+`FormatValidators.parse_date/1` is deliberately stricter than the `"date"` *validator*:
+`01/02/2027` passes the format check because a real date exists either way round, but it
+cannot be resolved to *one* date without knowing the writer's locale, and guessing would
+decide whether a policy had expired. Ambiguous dates are reported as undecidable.
+
+### Three things the corpus caught that reading wouldn't have
+
+**1. A blind spot in the automatic checks, now pinned as a fixture.** The first
+`payroll_malformed` fixture made one field unreadable and expected review; it came back
+approved. The diagnosis is real and general: blank values belong to
+`extraction_completeness_checks/1`, which only fires above 50% missing, so one field in
+five never reaches it — and `payroll_statement` deliberately has no rules of its own. The
+fixture was rewritten to test what it meant to (garbled-but-present figures, caught by
+the declared-type check), and a **second** fixture, `payroll_single_missing_field`, now
+pins the blind spot as `approved` with a comment saying plainly that this is the
+behaviour that exists, not the behaviour that's wanted. A future change to the
+completeness rule will show up there as a deliberate change instead of a surprise.
+
+**2. The registry-driven library test caught its own staleness.** It had been generating
+each type's synthetic document from a hardcoded keyword blob written when there were six
+types; the three new ones failed it immediately. Fixed by deriving the document from each
+type's own `shape_signals` and its fields' declared types — a hardcoded vocabulary is a
+second place to update per seeded type, and forgetting to is indistinguishable from the
+pipeline not supporting the type. Re-verified by mutation: a bad VAT ID fails `w8ben`, a
+past date fails `certificate_of_insurance`.
+
+**3. Rate limits were being reported as accuracy failures.** A 108-fixture corpus at the
+harness's fixed concurrency of 5 hits the provider's tokens-per-minute ceiling, and both
+`mix eval.run` and `mix eval.classify` counted a rate-limited fixture as a *wrong answer*
+— one run reported "103/108" for what was five HTTP 429s, another "83/108". Both tasks
+now exclude errored fixtures from the accuracy number and list them separately, and both
+take `--concurrency`. An eval harness that reports infrastructure failure as model
+failure is exactly the class of bug this project has already fixed once on the judge tier
+(the silently-dropped judge call), and it deserved the same treatment.
+
+**The low-confidence check has data for the first time, and it is equivocal.** The
+2026-08-23 calibration entry above found that across all 288 real field confidences in the
+then-corpus, every single one was 0.90 or higher — nothing ever fell below
+`low_confidence_checks/2`'s 0.7 threshold, so the check had never fired once. The corpus is
+now 433 confidences and the minimum is **0.00**: `receipt-malformed-01`'s smudged total
+(`"1?.5O"`) is extracted verbatim, is grounded, and the model reports no confidence in it at
+all. That's the first time this corpus has contained the thing the check was written for — a
+garbled-but-copyable value, as opposed to an *absent* field, which returns nil and never
+enters the population.
+
+It is not a vindication, though. `payroll-malformed-01`'s equally garbled figures
+(`"2,9O0.OO"`, `"2,178.O3"`) came back at confidence **1.0**. So the signal fires on one
+mangled value and misses another of the same kind, which is better evidence for the
+"complementary, not primary" stance the check was given than the previous "never fires at
+all" finding was. The threshold still hasn't been shown to sit anywhere in particular; what
+has changed is that there is now a corpus capable of testing it.
+
+**Classification, with types withheld against all nine candidates: 108/108.** The number
+that matters more is underneath it: the lowest confidence on a *correct* placement fell
+from 0.80 to **exactly 0.75, the threshold itself** (`scanned-malformed-01`, the
+deliberately blurred scan). It still passed, and that document halts for extraction
+reasons regardless, so nothing was misrouted — but the margin under the threshold is now
+zero rather than 0.05, and the honest reading is that this number's evidence got *weaker*
+as the corpus grew, not stronger. Deliberately not retuned in the same breath as
+discovering it: zero misclassifications in 108 means the risk the threshold guards
+against has still never once been observed, and the case that would actually move it is a
+clean, unambiguous document scoring at or below 0.75.
+
 ## Decided architecture (do not re-litigate without reason)
 
 ### High-level flow

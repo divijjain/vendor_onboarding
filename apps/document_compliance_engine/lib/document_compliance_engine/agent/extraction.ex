@@ -2,16 +2,35 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   @moduledoc """
   Agent 1: one structured-output LLM call per document role, with the
   fields to extract driven by the document type's `extraction_schema`
-  (a map of field name => Ecto type, e.g. `%{"company_name" => "string"}`)
-  instead of a hardcoded response model per document type. Roles are
-  extracted concurrently (`Task.async_stream`) to preserve the wall-clock
-  behavior of what used to be two separate, independent Reactor steps.
+  (a map of field name => declared type, e.g.
+  `%{"amount" => "number", "vendor_name" => "string"}`) instead of a
+  hardcoded response model per document type. Roles are extracted
+  concurrently (`Task.async_stream`) to preserve the wall-clock behavior
+  of what used to be two separate, independent Reactor steps.
 
   Uses Instructor's schemaless-Ecto response models (a plain
   `%{field_atom => type_atom}` map, not a compiled `Ecto.Schema` module) so
   the response shape can be built at runtime from `document_types` config.
 
   Overridable via application config so tests never need a real OpenAI key.
+
+  **How a declared field type is respected** (see `FieldTypes` for the
+  vocabulary and for why the identifier schemes deliberately aren't in it):
+
+    - `extract_all/3` validates every declared type across the whole schema
+      *before* any LLM call is spent, so an unknown type is a loud config
+      error rather than a field silently treated as free text.
+    - `prompt/2` names each field's type inline, and tells the model that
+      the type says what to look for and never how to write it down.
+    - The Instructor response model stays `:string` for every field
+      regardless of the declared type. That is the load-bearing part: this
+      module extracts values *verbatim* so `Checks.grounded_extraction_checks/3`
+      can prove each one against the source text by substring match, and a
+      value Instructor coerced (`"1,234.56"` to `1234.56`, `"Sept 1, 2026"`
+      to a `Date`) no longer appears in the document it came from — it
+      would be reported as a possible hallucination. Turning a well-typed
+      value into a *failed check* rather than a rewritten one is
+      `Checks`' job, off the same declared type.
 
   `tax_id` gets a regex pre-filter ahead of the LLM call (see
   `maybe_regex_extract/2`): an EIN has a genuinely rigid, unambiguous format
@@ -82,6 +101,9 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
 
   require Logger
 
+  alias DocumentComplianceEngine.Agent.ExtractionSchema
+  alias DocumentComplianceEngine.Agent.FieldTypes
+
   @tax_id_pattern ~r/\b\d{2}-\d{7}\b/
   @not_present_sentinel "NOT_PRESENT"
 
@@ -89,32 +111,37 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
 
   @spec extract_all(
           %{String.t() => String.t()},
-          %{String.t() => %{String.t() => String.t()}},
+          ExtractionSchema.t(),
           %{String.t() => map()}
         ) ::
           {:ok, %{String.t() => map()}, %{String.t() => %{atom() => field_metadata()}}}
           | {:error, term()}
   def extract_all(documents, extraction_schema, shape_signals \\ %{}) do
-    extraction_schema
-    |> Task.async_stream(
-      fn {role, field_types} ->
-        case Map.fetch(documents, role) do
-          {:ok, text} ->
-            {role, extract_or_skip(role, field_types, text, shape_signals[role])}
+    # Checked here rather than per role: an unknown type in a role the shape
+    # gate happens to skip is the same config bug, and this is the last point
+    # before any LLM call is spent on any role.
+    with :ok <- ExtractionSchema.validate(extraction_schema) do
+      extraction_schema
+      |> Task.async_stream(
+        fn {role, field_types} ->
+          case Map.fetch(documents, role) do
+            {:ok, text} ->
+              {role, extract_or_skip(role, field_types, text, shape_signals[role])}
 
-          :error ->
-            {role, {:error, {:missing_document, role}}}
-        end
-      end,
-      timeout: :infinity
-    )
-    |> Enum.reduce_while({:ok, %{}, %{}}, fn
-      {:ok, {role, {:ok, fields, metadata}}}, {:ok, facc, macc} ->
-        {:cont, {:ok, Map.put(facc, role, fields), Map.put(macc, role, metadata)}}
+            :error ->
+              {role, {:error, {:missing_document, role}}}
+          end
+        end,
+        timeout: :infinity
+      )
+      |> Enum.reduce_while({:ok, %{}, %{}}, fn
+        {:ok, {role, {:ok, fields, metadata}}}, {:ok, facc, macc} ->
+          {:cont, {:ok, Map.put(facc, role, fields), Map.put(macc, role, metadata)}}
 
-      {:ok, {_role, {:error, reason}}}, _acc ->
-        {:halt, {:error, reason}}
-    end)
+        {:ok, {_role, {:error, reason}}}, _acc ->
+          {:halt, {:error, reason}}
+      end)
+    end
   end
 
   defp extract_or_skip(role, field_types, text, shape) do
@@ -123,10 +150,10 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
     else
       not_attempted = %{confidence: nil, source_quote: nil}
 
-      fields = Map.new(field_types, fn {field, _type} -> {String.to_atom(field), nil} end)
+      fields = Map.new(field_types, fn {field, _spec} -> {String.to_atom(field), nil} end)
 
       metadata =
-        Map.new(field_types, fn {field, _type} -> {String.to_atom(field), not_attempted} end)
+        Map.new(field_types, fn {field, _spec} -> {String.to_atom(field), not_attempted} end)
 
       {:ok, fields, metadata}
     end
@@ -150,7 +177,7 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
 
   defp normalize(text), do: text |> String.downcase() |> String.replace(~r/\s+/, " ")
 
-  @spec extract(String.t(), %{String.t() => String.t()}, String.t()) ::
+  @spec extract(String.t(), ExtractionSchema.field_specs(), String.t()) ::
           {:ok, map(), %{atom() => field_metadata()}} | {:error, term()}
   def extract(role, field_types, text) do
     case maybe_regex_extract(field_types, text) do
@@ -178,8 +205,8 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   multiple matches is ambiguous — never guess, fall through to the LLM
   for the whole field).
   """
-  @spec maybe_regex_extract(%{String.t() => String.t()}, String.t()) ::
-          {:resolved, atom(), String.t(), %{String.t() => String.t()}} | :unresolved
+  @spec maybe_regex_extract(ExtractionSchema.field_specs(), String.t()) ::
+          {:resolved, atom(), String.t(), ExtractionSchema.field_specs()} | :unresolved
   def maybe_regex_extract(field_types, text) do
     if Map.has_key?(field_types, "tax_id") do
       case Regex.scan(@tax_id_pattern, text) do
@@ -213,12 +240,16 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
     end
   end
 
+  # The declared type is deliberately *not* the Ecto type asked of
+  # Instructor — every field is requested as a `:string` whatever it was
+  # declared as, so the value stays verbatim and provable against the
+  # source. See the moduledoc.
   defp to_response_model(field_types) do
-    Map.new(field_types, fn {field, "string"} -> {String.to_atom(field), :string} end)
+    Map.new(field_types, fn {field, _spec} -> {String.to_atom(field), :string} end)
   end
 
   defp to_metadata_response_model(field_types) do
-    Enum.reduce(field_types, %{}, fn {field, "string"}, acc ->
+    Enum.reduce(field_types, %{}, fn {field, _spec}, acc ->
       atom = String.to_atom(field)
 
       acc
@@ -231,10 +262,26 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   defp confidence_key(field), do: :"#{field}_confidence"
   defp quote_key(field), do: :"#{field}_source_quote"
 
-  defp prompt(role, field_types) do
-    fields = field_types |> Map.keys() |> Enum.join(", ")
+  @doc """
+  The extraction prompt for one role. Public because the declared field
+  types are respected here and nowhere else in the request — the type hint
+  and the don't-reformat instruction are the behavior, so they're worth
+  asserting on directly.
 
-    "Extract the following fields from this #{role} document, verbatim as written: #{fields}. " <>
+  Fields are rendered one per line rather than comma-joined: a semantic
+  description is a whole sentence, and several of them inlined into one
+  paragraph run together into something with no visible boundaries between
+  fields. (This did produce a byte-identical prompt to the pre-types one
+  for a document type that declared nothing — a property deliberately
+  given up once every seeded type carried real descriptions, and paid for
+  with a full eval re-run rather than an argument.)
+  """
+  @spec prompt(String.t(), ExtractionSchema.field_specs()) :: String.t()
+  def prompt(role, field_types) do
+    "Extract the following fields from this #{role} document, verbatim as written.\n" <>
+      field_list(field_types) <>
+      "\n" <>
+      typed_note(field_types) <>
       "For each field named <field>, also provide <field>_confidence (a number from 0.0 to " <>
       "1.0 for how confident you are the value is correct and actually present in the " <>
       "document) and <field>_source_quote (the exact verbatim sentence or phrase from the " <>
@@ -243,6 +290,41 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
       "\"#{@not_present_sentinel}\" for the field itself AND for its <field>_source_quote " <>
       "(never an empty string for either), and use 0.0 for its <field>_confidence — never " <>
       "guess or infer a value from unrelated content.\n\n"
+  end
+
+  defp field_list(field_types) do
+    Enum.map_join(field_types, "", fn {field, spec} ->
+      case annotations(spec) do
+        [] -> "- #{field}\n"
+        parts -> "- #{field}: #{Enum.join(parts, " ")}\n"
+      end
+    end)
+  end
+
+  # Type hint first (what kind of value), then the description (which value
+  # of that kind) — narrowest to widest, the order the field is actually
+  # located in the document.
+  defp annotations(spec) do
+    [type_sentence(spec), ExtractionSchema.description(spec)] |> Enum.reject(&is_nil/1)
+  end
+
+  defp type_sentence(spec) do
+    case type_hint(spec) do
+      nil -> nil
+      hint -> "Written as #{hint}."
+    end
+  end
+
+  defp type_hint(spec), do: spec |> ExtractionSchema.type() |> FieldTypes.describe()
+
+  defp typed_note(field_types) do
+    if Enum.any?(field_types, fn {_field, spec} -> type_hint(spec) end) do
+      "\"Written as ...\" says what kind of value to look for in the document — copy that " <>
+        "value exactly as the document writes it, never reformatted, converted or normalized " <>
+        "to match it. "
+    else
+      ""
+    end
   end
 
   defp complete(role, field_types, text) do
@@ -316,7 +398,7 @@ defmodule DocumentComplianceEngine.Agent.Extraction do
   end
 
   defp split_metadata(raw, field_types) do
-    Enum.reduce(field_types, {%{}, %{}}, fn {field, "string"}, {fields, metadata} ->
+    Enum.reduce(field_types, {%{}, %{}}, fn {field, _spec}, {fields, metadata} ->
       atom = String.to_atom(field)
 
       entry = %{

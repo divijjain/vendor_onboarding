@@ -7,11 +7,11 @@ defmodule DocumentComplianceEngine.Agent.DocumentReactorTest do
 
   @extraction_schema %{
     "contract" => %{
-      "company_name" => "string",
-      "payment_terms" => "string",
-      "liability_clauses" => "string"
+      "company_name" => %{"type" => "string"},
+      "payment_terms" => %{"type" => "string"},
+      "liability_clauses" => %{"type" => "string"}
     },
-    "w9" => %{"company_name" => "string", "tax_id" => "string"}
+    "w9" => %{"company_name" => %{"type" => "string"}, "tax_id" => %{"type" => "string"}}
   }
 
   @validation_rules [
@@ -42,17 +42,46 @@ defmodule DocumentComplianceEngine.Agent.DocumentReactorTest do
     "w9" => "Form W-9. Name of entity: Acme Corp. EIN: 12-3456789."
   }
 
+  # The reactor takes candidate document *types* now, not one type's
+  # resolved config: `:classify` picks among them and `:resolve_type`
+  # reads the winner's config. These tests supply the caller's slug, so
+  # classification short-circuits and every assertion below still measures
+  # what it always did.
+  defp candidate(overrides \\ %{}) do
+    Map.merge(
+      %{
+        "slug" => "vendor_contract_w9",
+        "name" => "Vendor contract + W-9 bundle",
+        "description" => "A vendor contract paired with the vendor's IRS Form W-9.",
+        "extraction_schema" => @extraction_schema,
+        "validation_rules" => @validation_rules,
+        "shape_signals" => %{}
+      },
+      overrides
+    )
+  end
+
   defp base_inputs(overrides) do
+    {candidate_overrides, input_overrides} =
+      Map.split(overrides, [:extraction_schema, :validation_rules, :shape_signals])
+
+    slug = Map.get(overrides, :document_type_slug, "vendor_contract_w9")
+
+    candidates = [
+      candidate_overrides
+      |> Map.new(fn {key, value} -> {to_string(key), value} end)
+      |> Map.put("slug", slug)
+      |> candidate()
+    ]
+
     Map.merge(
       %{
         document_type_slug: "vendor_contract_w9",
         documents: @documents,
-        extraction_schema: @extraction_schema,
-        validation_rules: @validation_rules,
-        shape_signals: %{},
+        document_types: candidates,
         human_decision: nil
       },
-      overrides
+      input_overrides
     )
   end
 
@@ -146,10 +175,10 @@ defmodule DocumentComplianceEngine.Agent.DocumentReactorTest do
                },
                extraction_schema: %{
                  "invoice" => %{
-                   "vendor_name" => "string",
-                   "invoice_number" => "string",
-                   "amount" => "string",
-                   "due_date" => "string"
+                   "vendor_name" => %{"type" => "string"},
+                   "invoice_number" => %{"type" => "string"},
+                   "amount" => %{"type" => "string"},
+                   "due_date" => %{"type" => "string"}
                  }
                },
                validation_rules: [
@@ -187,10 +216,10 @@ defmodule DocumentComplianceEngine.Agent.DocumentReactorTest do
                },
                extraction_schema: %{
                  "invoice" => %{
-                   "vendor_name" => "string",
-                   "invoice_number" => "string",
-                   "amount" => "string",
-                   "due_date" => "string"
+                   "vendor_name" => %{"type" => "string"},
+                   "invoice_number" => %{"type" => "string"},
+                   "amount" => %{"type" => "string"},
+                   "due_date" => %{"type" => "string"}
                  }
                },
                shape_signals: %{

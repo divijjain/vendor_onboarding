@@ -42,6 +42,22 @@ defmodule DocumentComplianceEngine.Agent.Checkpoint.Schema.RunCheckpoint do
     |> unique_constraint(:thread_id)
   end
 
+  @doc """
+  Changeset for dropping a finished checkpoint's payload while keeping the
+  row. A resumed run's `reactor_state`/`inputs` have no operational value
+  left — the outcome is on `agent_runs`, the human's decision and the
+  evidence they saw are on `review_decisions` — but they are the two
+  largest columns here and `inputs` holds the full text of every document
+  in the job, which on a `vendor_contract_w9` run includes the W-9's Tax
+  ID in plaintext. Keeping the row (thread_id, timestamps, explanation,
+  status) preserves the fact that a pause happened and when; keeping its
+  payload only retains document contents indefinitely for a run that is
+  over.
+  """
+  def purge_changeset(checkpoint) do
+    change(checkpoint, reactor_state: nil, inputs: %{})
+  end
+
   @doc "Changeset for marking a checkpoint resumed."
   def status_changeset(checkpoint, status) do
     change(checkpoint, status: status)

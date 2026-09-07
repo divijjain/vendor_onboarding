@@ -37,6 +37,20 @@ defmodule DocumentComplianceEngine.Agent.Checkpoint.Repository do
     end
   end
 
+  @doc """
+  Drops a finished checkpoint's payload, keeping the row as a record that
+  the pause happened. Deliberately called *after* a resumed run finishes,
+  never before: a crash between deserializing and finishing would
+  otherwise leave a paused run with nothing to resume from.
+  """
+  @spec purge_payload(RunCheckpoint.t()) ::
+          {:ok, RunCheckpoint.t()} | {:error, Ecto.Changeset.t()}
+  def purge_payload(checkpoint) do
+    checkpoint
+    |> RunCheckpoint.purge_changeset()
+    |> Repo.update()
+  end
+
   @spec mark_resumed(RunCheckpoint.t()) :: {:ok, RunCheckpoint.t()} | {:error, Ecto.Changeset.t()}
   def mark_resumed(checkpoint) do
     checkpoint

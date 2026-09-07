@@ -5,12 +5,20 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
 
   @health_refresh_interval :timer.seconds(5)
 
-  # Which document type each upload role belongs to, and its label — the
-  # dashboard's manual-test upload only knows about the two document types
-  # that exist today. Mirrors the same "known roles get dedicated handling,
-  # nothing generic" tradeoff `Agent.Run.@known_roles` already makes; full
-  # N-document-type upload genericity is out of scope for a manual-test tool.
+  # Which document type each upload role belongs to, and its label. The
+  # multi-document `vendor_contract_w9` bundle needs its two roles named
+  # explicitly, since which file is the contract and which is the W-9 is
+  # not something anything can infer.
+  #
+  # Everything else goes through `@auto_slug`: one file, no declared type,
+  # and `Agent.Classification` works out which of the six seeded types it
+  # is. That is what keeps this form from needing a hardcoded entry per
+  # document type — a new type added as a data migration is uploadable
+  # here the day it is seeded, without touching this module.
+  @auto_slug "auto"
+
   @upload_roles [
+    {:document, @auto_slug, "Document"},
     {:contract, "vendor_contract_w9", "Contract document"},
     {:w9, "vendor_contract_w9", "W-9 document"},
     {:invoice, "invoice", "Invoice document"}
@@ -100,11 +108,8 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
 
     case consume_documents(socket, roles) do
       {:ok, documents} ->
-        %{
-          "document_type_slug" => slug,
-          "documents" => documents,
-          "owner_email" => socket.assigns.current_user.email
-        }
+        %{"documents" => documents, "owner_email" => socket.assigns.current_user.email}
+        |> put_declared_type(slug)
         |> Jason.encode!()
         |> DocumentJobs.ingest_webhook()
         |> handle_ingest_result(socket)
@@ -166,15 +171,24 @@ defmodule DocumentComplianceEngineWeb.DashboardLive do
     for {ref, ^slug, label} <- @upload_roles, do: {ref, label}
   end
 
+  # "Auto-detect" means the payload carries no `document_type_slug` at all —
+  # the same thing an integrator omitting it does, not a magic slug value
+  # that ingestion would then have to know about.
+  defp put_declared_type(payload, @auto_slug), do: payload
+  defp put_declared_type(payload, slug), do: Map.put(payload, "document_type_slug", slug)
+
   defp presence(""), do: nil
   defp presence(value), do: value
 
   @upload_slugs @upload_roles |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
 
   defp upload_type_options(document_types) do
-    document_types
-    |> Enum.filter(&(&1.slug in @upload_slugs))
-    |> Enum.map(&{&1.name, &1.slug})
+    named =
+      document_types
+      |> Enum.filter(&(&1.slug in @upload_slugs))
+      |> Enum.map(&{&1.name, &1.slug})
+
+    [{"Auto-detect the document type", @auto_slug} | named]
   end
 
   defp upload_error_message(:too_large), do: "File is too large"

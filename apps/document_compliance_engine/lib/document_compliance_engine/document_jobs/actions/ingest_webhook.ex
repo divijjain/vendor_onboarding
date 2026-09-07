@@ -2,9 +2,23 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.IngestWebhook do
   @moduledoc """
   Idempotency check, document-type resolution, document storage, row
   creation, and job enqueue for an incoming webhook payload. Payload shape
-  is `{"document_type_slug": ..., "documents": {role => base64, ...}, "owner_email": ...}` —
-  the `documents` map's keys must exactly match the resolved document
-  type's `extraction_schema` roles. `owner_email` is required on every
+  is `{"document_type_slug": ..., "documents": {role => base64, ...}, "owner_email": ...}`.
+
+  **`document_type_slug` is optional.** When it is supplied, it must name a
+  real document type and the `documents` map's keys must exactly match
+  that type's `extraction_schema` roles — the same contract as before,
+  because a caller who declares a type is claiming to know its shape.
+  When it is omitted, the job is ingested unclassified: the roles cannot
+  be checked here (there is nothing yet to check them against), and
+  `Agent.Classification` works out the type during the run, with
+  `Agent.TypeResolution` mapping the uploaded documents onto that type's
+  roles. The column is filled in afterwards by `HandleAgentCallback`.
+
+  Classification deliberately does *not* happen here. Ingestion is a
+  webhook request: its job is to be idempotent, durable and fast, then
+  hand off to Oban. Reading and transcribing documents to run a model over
+  them is exactly the multi-second work that has never been allowed on
+  this process. `owner_email` is required on every
   call site (the real webhook, the MCP `trigger_run` tool, and the
   dashboard's manual-upload form, which injects the signed-in user's own
   email) — it's resolved to a `User` via `Accounts.get_or_create_user_by_email/1`
@@ -34,15 +48,14 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.IngestWebhook do
       {:error, :duplicate}
     else
       with {:ok, document_type_slug, documents, owner_email} <- decode_payload(raw_payload),
-           {:ok, document_type} <- fetch_document_type(document_type_slug),
-           :ok <- validate_roles(documents, document_type.extraction_schema),
+           {:ok, resolved_slug} <- resolve_document_type(document_type_slug, documents),
            {:ok, owner} <- get_or_create_owner(owner_email),
            {:ok, document_paths} <- store_documents(idempotency_key, documents),
            {:ok, document_job} <-
              Repository.insert(%{
                idempotency_key: idempotency_key,
                document_paths: document_paths,
-               document_type_slug: document_type.slug,
+               document_type_slug: resolved_slug,
                owner_user_id: owner.id,
                organization_id: owner.organization_id
              }) do
@@ -53,17 +66,25 @@ defmodule DocumentComplianceEngine.DocumentJobs.Actions.IngestWebhook do
   end
 
   defp decode_payload(raw_payload) do
-    with {:ok,
-          %{
-            "document_type_slug" => slug,
-            "documents" => documents,
-            "owner_email" => owner_email
-          }}
+    with {:ok, %{"documents" => documents, "owner_email" => owner_email} = payload}
          when is_map(documents) and is_binary(owner_email) <- Jason.decode(raw_payload),
+         true <- documents != %{},
          {:ok, decoded} <- decode_documents(documents) do
-      {:ok, slug, decoded, owner_email}
+      {:ok, payload["document_type_slug"], decoded, owner_email}
     else
       _ -> {:error, :invalid_payload}
+    end
+  end
+
+  # An unclassified job has no type to validate its roles against — that
+  # check moves into the run, where `TypeResolution` does it against the
+  # type the classifier picked.
+  defp resolve_document_type(nil, _documents), do: {:ok, nil}
+
+  defp resolve_document_type(slug, documents) do
+    with {:ok, document_type} <- fetch_document_type(slug),
+         :ok <- validate_roles(documents, document_type.extraction_schema) do
+      {:ok, document_type.slug}
     end
   end
 

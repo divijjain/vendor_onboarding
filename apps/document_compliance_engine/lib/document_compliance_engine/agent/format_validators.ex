@@ -20,6 +20,13 @@ defmodule DocumentComplianceEngine.Agent.FormatValidators do
 
   The rest are honestly weaker and are named for what they actually do:
 
+    - `monetary_amount` is `number` plus the way money is actually written
+      on a document: an optional currency symbol or code on either side,
+      and parentheses for a credit. Real invoices in this project's own
+      scanned eval fixtures write `"$1,275.00"` where the plain-text ones
+      write `"1,000.00"`, and a bare `number` check rejects the first —
+      a false "invalid" on a perfectly good invoice, which is the failure
+      mode this module cares most about avoiding.
     - `email`, `uri`, `phone`, `vat_id` are *structural* checks. A
       syntactically valid email address may not be deliverable and this
       never finds out; `vat_id` checks the country-prefixed shape, not the
@@ -94,8 +101,8 @@ defmodule DocumentComplianceEngine.Agent.FormatValidators do
   @vin_weights [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
 
   @validators ~w(
-    date number email phone iban vat_id postal_address currency uri
-    credit_card vin
+    date number monetary_amount email phone iban vat_id postal_address
+    currency uri credit_card vin
   )
 
   @doc "Every validator name a `\"format\"` rule may name."
@@ -114,18 +121,44 @@ defmodule DocumentComplianceEngine.Agent.FormatValidators do
     trimmed = String.trim(value)
 
     case validator do
-      "date" -> check(date?(trimmed), trimmed, "a valid date")
-      "number" -> check(number?(trimmed), trimmed, "a valid number")
-      "email" -> check(email?(trimmed), trimmed, "a valid email address")
-      "phone" -> check(phone?(trimmed), trimmed, "a valid phone number")
-      "iban" -> check(iban?(trimmed), trimmed, "a valid IBAN (mod-97 checksum)")
-      "vat_id" -> check(vat_id?(trimmed), trimmed, "a valid VAT ID")
-      "postal_address" -> check(postal_address?(trimmed), trimmed, "a plausible postal address")
-      "currency" -> check(currency?(trimmed), trimmed, "a valid currency")
-      "uri" -> check(uri?(trimmed), trimmed, "a valid URI")
-      "credit_card" -> check(credit_card?(trimmed), trimmed, "a valid card number (Luhn)")
-      "vin" -> check(vin?(trimmed), trimmed, "a valid VIN (ISO 3779 check digit)")
-      _unknown -> {:error, :unknown_validator}
+      "date" ->
+        check(date?(trimmed), trimmed, "a valid date")
+
+      "number" ->
+        check(number?(trimmed), trimmed, "a valid number")
+
+      "monetary_amount" ->
+        check(monetary_amount?(trimmed), trimmed, "a valid monetary amount")
+
+      "email" ->
+        check(email?(trimmed), trimmed, "a valid email address")
+
+      "phone" ->
+        check(phone?(trimmed), trimmed, "a valid phone number")
+
+      "iban" ->
+        check(iban?(trimmed), trimmed, "a valid IBAN (mod-97 checksum)")
+
+      "vat_id" ->
+        check(vat_id?(trimmed), trimmed, "a valid VAT ID")
+
+      "postal_address" ->
+        check(postal_address?(trimmed), trimmed, "a plausible postal address")
+
+      "currency" ->
+        check(currency?(trimmed), trimmed, "a valid currency")
+
+      "uri" ->
+        check(uri?(trimmed), trimmed, "a valid URI")
+
+      "credit_card" ->
+        check(credit_card?(trimmed), trimmed, "a valid card number (Luhn)")
+
+      "vin" ->
+        check(vin?(trimmed), trimmed, "a valid VIN (ISO 3779 check digit)")
+
+      _unknown ->
+        {:error, :unknown_validator}
     end
   end
 
@@ -136,11 +169,94 @@ defmodule DocumentComplianceEngine.Agent.FormatValidators do
 
   # --- date -----------------------------------------------------------------
 
+  @months ~w(january february march april may june july august september october november december)
+
   # Parseability only. A slash-separated date is tried both day-first and
   # month-first and accepted if *either* is a real calendar date — this
   # checks that a date exists, deliberately not which locale wrote it.
   defp date?(value) do
     iso8601?(value) or slash_or_dash_date?(value) or textual_month_date?(value)
+  end
+
+  @doc """
+  Resolves a date string to an actual `Date`, for the callers that need to
+  *compare* one rather than confirm it exists (`Checks`' `not_expired`
+  rule).
+
+  Deliberately stricter than `"date"` validation, and the difference is the
+  point: `01/02/2027` passes `validate("date", …)` because a real calendar
+  date exists either way round, but it cannot be resolved to *one* date
+  without knowing whether the writer was British or American. Guessing
+  would silently decide whether a policy expired in January or February, so
+  an ambiguous value is `:error` here and the rule reports it as
+  undecidable rather than picking a reading. Unambiguous slash dates (where
+  one component is > 12, or the two readings coincide) resolve fine, as do
+  ISO-8601 and textual-month forms.
+  """
+  @spec parse_date(String.t()) :: {:ok, Date.t()} | :error
+  def parse_date(value) when is_binary(value) do
+    value = String.trim(value)
+
+    with :error <- parse_iso8601(value),
+         :error <- parse_slash_or_dash(value) do
+      parse_textual_month(value)
+    end
+  end
+
+  defp parse_iso8601(value) do
+    case Date.from_iso8601(value) do
+      {:ok, date} -> {:ok, date}
+      {:error, _reason} -> :error
+    end
+  end
+
+  defp parse_slash_or_dash(value) do
+    case Regex.run(~r|^(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})$|, value) do
+      [_all, a, b, c] ->
+        [a, b, c] = Enum.map([a, b, c], &String.to_integer/1)
+
+        # year-first, then the two ambiguous readings of day/month.
+        candidates =
+          [new_date(a, b, c), new_date(c, b, a), new_date(c, a, b)]
+          |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
+
+        case candidates do
+          [date] -> {:ok, date}
+          _none_or_ambiguous -> :error
+        end
+
+      nil ->
+        :error
+    end
+  end
+
+  defp new_date(year, month, day) when year > 31 do
+    case Date.new(year, month, day) do
+      {:ok, date} -> date
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp new_date(_year, _month, _day), do: nil
+
+  defp parse_textual_month(value) do
+    downcased = String.downcase(value)
+
+    with month when not is_nil(month) <- month_number(downcased),
+         [day] <- Regex.scan(~r/\b(\d{1,2})\b/, value) |> Enum.map(&List.last/1) |> Enum.take(1),
+         [year] <- Regex.scan(~r/\b(\d{4})\b/, value) |> Enum.map(&List.last/1) |> Enum.take(1),
+         {:ok, date} <- Date.new(String.to_integer(year), month, String.to_integer(day)) do
+      {:ok, date}
+    else
+      _unparseable -> :error
+    end
+  end
+
+  defp month_number(downcased) do
+    Enum.find_value(Enum.with_index(@months, 1), fn {month, index} ->
+      if String.contains?(downcased, String.slice(month, 0, 3)), do: index
+    end)
   end
 
   defp iso8601?(value) do
@@ -157,8 +273,6 @@ defmodule DocumentComplianceEngine.Agent.FormatValidators do
         false
     end
   end
-
-  @months ~w(january february march april may june july august september october november december)
 
   defp textual_month_date?(value) do
     downcased = String.downcase(value)
@@ -179,6 +293,49 @@ defmodule DocumentComplianceEngine.Agent.FormatValidators do
     cleaned = value |> String.replace(",", "") |> String.replace(" ", "")
 
     match?({_parsed, ""}, Float.parse(cleaned)) or match?({_parsed, ""}, Integer.parse(cleaned))
+  end
+
+  # --- monetary_amount ------------------------------------------------------
+
+  # A number wearing whatever a document puts around it: one currency
+  # symbol or code on either side, and `(1,200.00)` for a credit. Nothing
+  # locale-aware beyond that — a decimal comma is deliberately not
+  # interpreted, since guessing at `1.200,00` would mean guessing which
+  # separator is which, and a permissive pass beats a wrong rejection here.
+  defp monetary_amount?(value) do
+    value |> strip_parens() |> strip_currency() |> number?()
+  end
+
+  defp strip_parens(value) do
+    case Regex.run(~r/^\((.+)\)$/, value) do
+      [_all, inner] -> String.trim(inner)
+      nil -> value
+    end
+  end
+
+  defp strip_currency(value) do
+    upcased = String.upcase(value)
+
+    affix =
+      Enum.find(@currency_symbols, &affix?(value, &1)) ||
+        Enum.find(@currency_codes, &affix?(upcased, &1))
+
+    case affix do
+      nil -> value
+      affix -> value |> strip_affix(affix) |> String.trim()
+    end
+  end
+
+  defp affix?(value, affix) do
+    String.starts_with?(value, affix) or String.ends_with?(value, affix)
+  end
+
+  defp strip_affix(value, affix) do
+    if String.starts_with?(String.upcase(value), affix) do
+      String.slice(value, String.length(affix)..-1//1)
+    else
+      String.slice(value, 0..(String.length(value) - String.length(affix) - 1)//1)
+    end
   end
 
   # --- email / uri / phone --------------------------------------------------

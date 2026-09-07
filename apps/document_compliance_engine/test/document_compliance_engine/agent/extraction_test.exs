@@ -6,8 +6,11 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
   alias DocumentComplianceEngine.Agent.Extraction
 
   @extraction_schema %{
-    "contract" => %{"company_name" => "string", "payment_terms" => "string"},
-    "w9" => %{"company_name" => "string", "tax_id" => "string"}
+    "contract" => %{
+      "company_name" => %{"type" => "string"},
+      "payment_terms" => %{"type" => "string"}
+    },
+    "w9" => %{"company_name" => %{"type" => "string"}, "tax_id" => %{"type" => "string"}}
   }
 
   test "extracts every role and converts each field schema to an atom-keyed response model" do
@@ -44,7 +47,10 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
 
     assert {:ok, extracted, metadata} =
              Extraction.extract_all(%{"contract" => "c"}, %{
-               "contract" => %{"company_name" => "string", "payment_terms" => "string"}
+               "contract" => %{
+                 "company_name" => %{"type" => "string"},
+                 "payment_terms" => %{"type" => "string"}
+               }
              })
 
     assert extracted["contract"].company_name == "Acme Corp"
@@ -81,7 +87,7 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
       }
 
       schema = %{
-        "invoice" => %{"vendor_name" => "string", "amount" => "string"}
+        "invoice" => %{"vendor_name" => %{"type" => "string"}, "amount" => %{"type" => "string"}}
       }
 
       assert {:ok, extracted, metadata} =
@@ -113,7 +119,7 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
       assert {:ok, extracted, _metadata} =
                Extraction.extract_all(
                  %{"invoice" => "INVOICE\nVendor: Acme Corp"},
-                 %{"invoice" => %{"vendor_name" => "string"}},
+                 %{"invoice" => %{"vendor_name" => %{"type" => "string"}}},
                  shape_signals
                )
 
@@ -126,11 +132,118 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
       assert {:ok, extracted, _metadata} =
                Extraction.extract_all(
                  %{"contract" => "anything at all"},
-                 %{"contract" => %{"company_name" => "string"}},
+                 %{"contract" => %{"company_name" => %{"type" => "string"}}},
                  %{}
                )
 
       assert extracted["contract"] == %{company_name: "Acme"}
+    end
+  end
+
+  describe "declared field types" do
+    @typed_schema %{
+      "invoice" => %{
+        "vendor_name" => %{"type" => "string"},
+        "amount" => %{"type" => "number"},
+        "due_date" => %{"type" => "date"}
+      }
+    }
+
+    test "a declared type never changes the wire type asked of the model" do
+      test_pid = self()
+
+      stub_defaults(
+        extract: fn role, response_model, _text ->
+          send(test_pid, {:called, role, response_model})
+          {:ok, Map.new(response_model, fn {field, _type} -> {field, "value"} end)}
+        end
+      )
+
+      assert {:ok, extracted, _metadata} =
+               Extraction.extract_all(%{"invoice" => "INVOICE"}, @typed_schema)
+
+      # Every field is still requested as a string and comes back verbatim —
+      # a coerced number/date would stop matching the source document and be
+      # reported as a possible hallucination by Checks. See the moduledoc.
+      assert_received {:called, "invoice",
+                       %{vendor_name: :string, amount: :string, due_date: :string}}
+
+      assert extracted["invoice"] == %{vendor_name: "value", amount: "value", due_date: "value"}
+    end
+
+    test "an unknown field type fails the run before any LLM call is spent" do
+      test_pid = self()
+
+      stub_defaults(extract: fn role, _schema, _text -> send(test_pid, {:called, role}) end)
+
+      schema = %{
+        "invoice" => %{"vendor_name" => %{"type" => "string"}, "amount" => %{"type" => "monies"}}
+      }
+
+      assert {:error, {:unknown_field_type, "invoice", "amount", "monies"}} =
+               Extraction.extract_all(%{"invoice" => "INVOICE"}, schema)
+
+      refute_received {:called, "invoice"}
+    end
+
+    test "an unknown type is caught even in a role the shape gate would skip" do
+      shape_signals = %{"invoice" => %{"keywords" => ["invoice"], "min_matches" => 1}}
+      schema = %{"invoice" => %{"amount" => %{"type" => "monies"}}}
+
+      stub_defaults()
+
+      assert {:error, {:unknown_field_type, "invoice", "amount", "monies"}} =
+               Extraction.extract_all(
+                 %{"invoice" => "not an invoice at all"},
+                 schema,
+                 shape_signals
+               )
+    end
+  end
+
+  describe "prompt/2" do
+    test "names each field's declared type and forbids reformatting to match it" do
+      prompt =
+        Extraction.prompt("invoice", %{
+          "amount" => %{"type" => "number"},
+          "due_date" => %{"type" => "date"}
+        })
+
+      assert prompt =~ "- amount: Written as a number."
+      assert prompt =~ "- due_date: Written as a date."
+      assert prompt =~ "copy that value exactly as the document writes it"
+    end
+
+    test "carries each field's semantic description into the prompt" do
+      prompt =
+        Extraction.prompt("invoice", %{
+          "amount" => %{
+            "type" => "monetary_amount",
+            "description" => "The total payable, not a line item."
+          },
+          "vendor_name" => %{"description" => "The business being paid, not the buyer."}
+        })
+
+      # Type first, then meaning — and a field may carry a description
+      # with no type worth naming, which is the `vendor_name` case.
+      assert prompt =~
+               "- amount: Written as a monetary amount, with any currency symbol the " <>
+                 "document writes. The total payable, not a line item."
+
+      assert prompt =~ "- vendor_name: The business being paid, not the buyer."
+    end
+
+    test "an unannotated field is listed bare, with no empty annotation left dangling" do
+      prompt =
+        Extraction.prompt("w9", %{
+          "company_name" => %{"type" => "string"},
+          "tax_id" => %{"type" => "string"}
+        })
+
+      assert prompt =~ "- company_name\n"
+      assert prompt =~ "- tax_id\n"
+      # Nothing said about types, because nothing was declared worth saying.
+      refute prompt =~ "Written as"
     end
   end
 
@@ -247,7 +360,7 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
   end
 
   describe "maybe_regex_extract/2" do
-    @field_types %{"company_name" => "string", "tax_id" => "string"}
+    @field_types %{"company_name" => %{"type" => "string"}, "tax_id" => %{"type" => "string"}}
 
     test "resolves tax_id and removes it from the remaining fields when it appears exactly once" do
       text = "FORM W-9\n1. Name of entity: Acme Corp\n2. EIN: 12-3456789\n"
@@ -255,7 +368,7 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
       assert {:resolved, :tax_id, "12-3456789", remaining} =
                Extraction.maybe_regex_extract(@field_types, text)
 
-      assert remaining == %{"company_name" => "string"}
+      assert remaining == %{"company_name" => %{"type" => "string"}}
     end
 
     test "is unresolved when the pattern doesn't appear" do
@@ -269,7 +382,10 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
 
     test "is unresolved when the schema has no tax_id field at all" do
       assert :unresolved =
-               Extraction.maybe_regex_extract(%{"company_name" => "string"}, "EIN: 12-3456789")
+               Extraction.maybe_regex_extract(
+                 %{"company_name" => %{"type" => "string"}},
+                 "EIN: 12-3456789"
+               )
     end
   end
 
@@ -308,7 +424,7 @@ defmodule DocumentComplianceEngine.Agent.ExtractionTest do
 
       assert {:ok, %{tax_id: "12-3456789"},
               %{tax_id: %{confidence: 1.0, source_quote: "12-3456789"}}} =
-               Extraction.extract("w9", %{"tax_id" => "string"}, text)
+               Extraction.extract("w9", %{"tax_id" => %{"type" => "string"}}, text)
 
       refute_received {:called, "w9"}
     end

@@ -13,13 +13,20 @@ defmodule DocumentComplianceEngine.Agent.Checks do
     - `regex` — the same idea with a document-type-supplied pattern, for a
       field whose shape is specific to that document type rather than a
       general format worth naming a validator for
+    - `not_expired` — the only rule whose answer depends on *when it runs*:
+      an extracted date must not be in the past. A certificate of insurance
+      that was valid when it was filed and has since lapsed is a real
+      compliance finding, and no amount of reading the document alone
+      produces it. `today` is injectable via `validate_all/4`'s `:today`
+      option, so a fixture that expires "next year" doesn't quietly become
+      a failing fixture the year after it was written
 
   The two tools themselves stay a fixed, known pair — only which
   document/field feeds them varies by document type, so their
   human-readable failure messages stay hardcoded per tool rather than
   generated generically.
 
-  `validate_all/5` also runs three automatic checks on every extracted
+  `validate_all/4` also runs four automatic checks on every extracted
   field, unconditionally — none is one of `validation_rules`, so none
   can be configured away per document type:
 
@@ -48,8 +55,19 @@ defmodule DocumentComplianceEngine.Agent.Checks do
       `grounded_extraction_checks/3`, not a replacement for it — a
       model's self-reported confidence is exactly the kind of claim this
       project is generally skeptical of taking at face value on its own.
+    - `declared_type_checks/3` — a value that isn't well-formed for the
+      type its document type declared for the field (`extraction_schema`,
+      `Agent.FieldTypes`). This is where a declared type gets its teeth:
+      `Extraction` deliberately returns every value verbatim whatever its
+      declared type, precisely so the value stays provable against the
+      source document, which leaves *checking* the value's shape to this
+      module. It runs the same `FormatValidators` a `format` rule does —
+      a declared type is exactly "this field always carries that check",
+      without a per-document-type rule entry to remember.
   """
 
+  alias DocumentComplianceEngine.Agent.ExtractionSchema
+  alias DocumentComplianceEngine.Agent.FieldTypes
   alias DocumentComplianceEngine.Agent.FormatValidators
   alias DocumentComplianceEngine.Agent.McpClient
   alias DocumentComplianceEngine.Agent.Schemas.EntityMatchResult
@@ -85,23 +103,37 @@ defmodule DocumentComplianceEngine.Agent.Checks do
   %{findings}
   """
 
-  @spec validate_all(%{String.t() => map()}, %{String.t() => String.t()}, [map()], map(), map()) ::
+  @doc """
+  Runs every automatic check plus this document type's configured
+  `validation_rules` against one run's extracted fields.
+
+  The three pieces of run context the automatic checks need — `:shape_signals`,
+  `:extraction_metadata` and `:extraction_schema` — are options rather than
+  further positional arguments: each is optional, each defaults to "no such
+  config", and a fourth and fifth trailing map would make every call site
+  unreadable at exactly the point where getting the order wrong is silent
+  (they are all plain maps).
+  """
+  @spec validate_all(%{String.t() => map()}, %{String.t() => String.t()}, [map()], keyword()) ::
           {:ok, ValidationResult.t()} | {:error, term()}
-  def validate_all(
-        extracted,
-        documents,
-        validation_rules,
-        shape_signals \\ %{},
-        extraction_metadata \\ %{}
-      ) do
+  def validate_all(extracted, documents, validation_rules, opts \\ []) do
+    shape_signals = Keyword.get(opts, :shape_signals, %{})
+    extraction_metadata = Keyword.get(opts, :extraction_metadata, %{})
+    extraction_schema = Keyword.get(opts, :extraction_schema, %{})
+    # The one rule that needs to know what day it is. Injectable so a
+    # fixture's "expires next year" doesn't quietly become "expired" the
+    # year after it was written.
+    today = Keyword.get(opts, :today, Date.utc_today())
+
     automatic =
       grounded_extraction_checks(extracted, documents, shape_signals) ++
         extraction_completeness_checks(extracted) ++
-        low_confidence_checks(extracted, extraction_metadata)
+        low_confidence_checks(extracted, extraction_metadata) ++
+        declared_type_checks(extracted, extraction_schema, validation_rules)
 
     validation_rules
     |> Enum.reduce_while({:ok, automatic}, fn rule, {:ok, acc} ->
-      case run_rule(rule, extracted) do
+      case run_rule(rule, extracted, today) do
         {:ok, check} -> {:cont, {:ok, [check | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -247,6 +279,75 @@ defmodule DocumentComplianceEngine.Agent.Checks do
     end
   end
 
+  @doc """
+  Deterministic (no LLM, no network, no clock) check that every extracted
+  value is well-formed for the type its document type declared for it in
+  `extraction_schema` — the check that gives a declared type teeth.
+
+  Runs against every typed field, whether or not `validation_rules`
+  happens to name it: declaring `amount` a `number` *is* the instruction to
+  check it, and having to also remember a matching `format` rule entry
+  would make the declaration decorative. A field declared `"string"` has no
+  shape to be wrong about and is skipped, as is a blank one
+  (`extraction_completeness_checks/1` owns "the value never arrived", and
+  reporting the same field twice for two reasons would only pad the
+  reviewer's list).
+
+  A field that *does* carry an explicit `format` rule naming the same
+  validator is skipped here, so a document type that both declares the
+  type and configures the rule reports one finding rather than two
+  near-identical ones. A `format` rule naming a *different* validator is
+  left alone — that's a deliberately additional check, not a duplicate.
+
+  This asks a different question from `grounded_extraction_checks/3`, and
+  neither subsumes the other — see `FormatValidators`' moduledoc: a
+  hallucinated-but-well-formed date passes here and fails grounding; a
+  verbatim typo in the source passes grounding and fails here.
+  """
+  @spec declared_type_checks(%{String.t() => map()}, map(), [map()]) :: [ValidationResult.check()]
+  def declared_type_checks(extracted, extraction_schema, validation_rules \\ []) do
+    explicit = explicitly_format_checked(validation_rules)
+
+    for {role, fields} <- extracted,
+        field_specs = ExtractionSchema.fields(extraction_schema, role),
+        {field, value} <- fields,
+        is_binary(value),
+        not blank?(value),
+        declared = ExtractionSchema.type(field_specs[Atom.to_string(field)]),
+        validator = FieldTypes.format_validator(declared),
+        is_binary(validator),
+        not MapSet.member?(explicit, {role, Atom.to_string(field), validator}),
+        detail <- type_error(validator, value) do
+      %{
+        rule: %{
+          "type" => "declared_field_type",
+          "field" => %{"role" => role, "name" => field},
+          "declared_type" => declared
+        },
+        passed: false,
+        detail: "Extracted #{field} for #{role} is declared as #{declared} — #{detail}"
+      }
+    end
+  end
+
+  # A list, not a `case`, so it can be the comprehension's last generator:
+  # `[]` for a value that passes, one detail for one that doesn't.
+  # `:unknown_validator` is unreachable — `FieldTypes` only ever hands back
+  # a validator name `FormatValidators` declares, checked at compile time.
+  defp type_error(validator, value) do
+    case FormatValidators.validate(validator, value) do
+      :ok -> []
+      {:error, detail} when is_binary(detail) -> [detail]
+    end
+  end
+
+  defp explicitly_format_checked(validation_rules) do
+    for %{"type" => "format", "validator" => validator, "field" => field} <- validation_rules,
+        %{"role" => role, "name" => name} = field,
+        into: MapSet.new(),
+        do: {role, name, validator}
+  end
+
   defp normalize_text(text) do
     text |> String.downcase() |> String.replace(~r/\s+/, " ") |> String.trim()
   end
@@ -259,7 +360,7 @@ defmodule DocumentComplianceEngine.Agent.Checks do
   # cleanly halting to `:needs_review`. A blank field is itself a valid,
   # synthesized check failure — not something that should ever reach an
   # external call.
-  defp run_rule(%{"type" => "entity_match", "fields" => [a, b]} = rule, extracted) do
+  defp run_rule(%{"type" => "entity_match", "fields" => [a, b]} = rule, extracted, _today) do
     value_a = field_value(extracted, a)
     value_b = field_value(extracted, b)
 
@@ -284,7 +385,8 @@ defmodule DocumentComplianceEngine.Agent.Checks do
 
   defp run_rule(
          %{"type" => "mcp_tool", "tool" => "validate_tax_id", "field" => field} = rule,
-         extracted
+         extracted,
+         _today
        ) do
     value = field_value(extracted, field)
 
@@ -309,7 +411,8 @@ defmodule DocumentComplianceEngine.Agent.Checks do
 
   defp run_rule(
          %{"type" => "mcp_tool", "tool" => "screen_vendor", "field" => field} = rule,
-         extracted
+         extracted,
+         _today
        ) do
     value = field_value(extracted, field)
 
@@ -334,7 +437,8 @@ defmodule DocumentComplianceEngine.Agent.Checks do
   # were told to format-check never arrived" is itself a finding.
   defp run_rule(
          %{"type" => "format", "validator" => validator, "field" => field} = rule,
-         extracted
+         extracted,
+         _today
        ) do
     value = field_value(extracted, field)
 
@@ -363,7 +467,33 @@ defmodule DocumentComplianceEngine.Agent.Checks do
     end
   end
 
-  defp run_rule(%{"type" => "regex", "pattern" => pattern, "field" => field} = rule, extracted) do
+  # The only rule that depends on when it is run. A certificate that was
+  # valid when it was filed and has since lapsed is a real compliance
+  # finding, and it is not one any amount of looking at the document alone
+  # can produce.
+  defp run_rule(%{"type" => "not_expired", "field" => field} = rule, extracted, today) do
+    value = field_value(extracted, field)
+
+    cond do
+      blank?(value) ->
+        {:ok,
+         %{rule: rule, passed: false, detail: "Cannot check expiry — the date was not extracted."}}
+
+      true ->
+        case FormatValidators.parse_date(String.trim(value)) do
+          {:ok, date} -> {:ok, expiry_check(rule, date, today, value)}
+          # Undecidable, not invalid: see `FormatValidators.parse_date/1` on
+          # why an ambiguous slash date is reported rather than read one way.
+          :error -> {:ok, %{rule: rule, passed: false, detail: undecidable_detail(value)}}
+        end
+    end
+  end
+
+  defp run_rule(
+         %{"type" => "regex", "pattern" => pattern, "field" => field} = rule,
+         extracted,
+         _today
+       ) do
     value = field_value(extracted, field)
 
     with {:ok, compiled} <- compile_pattern(pattern) do
@@ -388,6 +518,25 @@ defmodule DocumentComplianceEngine.Agent.Checks do
            }}
       end
     end
+  end
+
+  defp expiry_check(rule, date, today, value) do
+    if Date.compare(date, today) == :lt do
+      %{
+        rule: rule,
+        passed: false,
+        detail:
+          "Expired: #{inspect(value)} is #{Date.diff(today, date)} day(s) before today " <>
+            "(#{Date.to_iso8601(today)})."
+      }
+    else
+      %{rule: rule, passed: true, detail: nil}
+    end
+  end
+
+  defp undecidable_detail(value) do
+    "Cannot tell whether #{inspect(value)} has passed — it is not a date that can be read " <>
+      "one way only, and guessing which reading was meant would decide the answer."
   end
 
   # An uncompilable pattern is a config bug, same as an unknown validator

@@ -122,7 +122,12 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
       # actually exercises the vision-transcription path rather than
       # assuming it works from a hand-picked demo.
       documents: nil,
-      image_paths: nil
+      image_paths: nil,
+      # Opt-in, per fixture: the exact values extraction should produce,
+      # for cases where the right answer is the thing under test and the
+      # pipeline's reaction to it isn't enough to tell. See
+      # `Deterministic.expected_fields_ok?/2`.
+      expected_fields: nil
     ]
 
     @type t :: %__MODULE__{
@@ -132,12 +137,24 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
             documents: %{String.t() => String.t()} | nil,
             image_paths: %{String.t() => Path.t()} | nil,
             expected_decision: String.t(),
-            expected_entity_match: boolean() | nil
+            expected_entity_match: boolean() | nil,
+            expected_fields: %{String.t() => %{atom() => String.t()}} | nil
           }
   end
 
   @spec all() :: [Fixture.t()]
-  def all, do: vendor_contract_w9() ++ invoice() ++ scanned()
+  def all do
+    vendor_contract_w9() ++
+      invoice() ++
+      scanned() ++
+      bank_details() ++
+      purchase_order() ++
+      receipt() ++
+      payroll_statement() ++
+      certificate_of_insurance() ++
+      w8ben() ++
+      business_registration()
+  end
 
   @spec vendor_contract_w9() :: [Fixture.t()]
   def vendor_contract_w9 do
@@ -550,4 +567,623 @@ defmodule DocumentComplianceEngine.Agent.Evals.Fixtures do
   end
 
   defp scanned_path(filename), do: Path.join(@scanned_dir, filename)
+
+  # --- bank_details: the two rule types that do real algorithmic work ----------
+  #
+  # This type was seeded with the rest of the library and had no fixtures —
+  # a breadth claim with no accuracy evidence behind it. These exist for the
+  # part of it that isn't shared with any other type: a `format` rule running
+  # the ISO 13616 mod-97 checksum, and a `regex` rule on the BIC. The invalid
+  # bucket is the one that matters, because a right-shaped IBAN with a wrong
+  # check digit is exactly what a naive length/pattern check waves through.
+
+  # Standard published test IBANs — real, checksum-valid values, not invented
+  # strings that happen to look plausible.
+  @valid_bank_accounts [
+    {"Harborview Logistics Ltd", "Barclays Bank", "GB82WEST12345698765432", "BARCGB22"},
+    {"Alpine Instruments GmbH", "Deutsche Bank", "DE89370400440532013000", "DEUTDEFF"}
+  ]
+
+  # Same IBANs with a single altered check digit: right country, right length,
+  # right shape, wrong number. Only the mod-97 checksum tells them apart.
+  @invalid_bank_accounts [
+    {"Cedar Point Supplies", "Barclays Bank", "GB82WEST12345698765433", "BARCGB22"},
+    {"Northgate Machining", "Deutsche Bank", "DE89370400440532013001", "DEUTDEFF"}
+  ]
+
+  @spec bank_details() :: [Fixture.t()]
+  def bank_details do
+    clean =
+      @valid_bank_accounts
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{holder, bank, iban, bic}, i} ->
+        %Fixture{
+          id: "bank-clean-#{pad(i)}",
+          bucket: "bank_details_clean",
+          document_type_slug: "bank_details",
+          documents: %{"bank_details" => bank_details_text(holder, bank, iban, bic)},
+          expected_decision: "approved"
+        }
+      end)
+
+    invalid =
+      @invalid_bank_accounts
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{holder, bank, iban, bic}, i} ->
+        %Fixture{
+          id: "bank-bad-iban-#{pad(i)}",
+          bucket: "bank_details_invalid_iban",
+          document_type_slug: "bank_details",
+          documents: %{"bank_details" => bank_details_text(holder, bank, iban, bic)},
+          expected_decision: "needs_review"
+        }
+      end)
+
+    # The same watchlisted name the invoice sanctions bucket uses, arriving on
+    # a different document type — payment details for a sanctioned entity is
+    # the most consequential version of that hit.
+    sanctioned = [
+      %Fixture{
+        id: "bank-sanctions-01",
+        bucket: "bank_details_sanctions_hit",
+        document_type_slug: "bank_details",
+        documents: %{
+          "bank_details" =>
+            bank_details_text(
+              "Rogue Exports LLC",
+              "Barclays Bank",
+              "GB82WEST12345698765432",
+              "BARCGB22"
+            )
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    clean ++ invalid ++ sanctioned
+  end
+
+  defp bank_details_text(holder, bank, iban, bic) do
+    """
+    VENDOR BANK DETAILS
+
+    Please route all payments to the account below.
+
+    Account holder: #{holder}
+    Bank details: #{bank}
+    IBAN: #{iban}
+    BIC/SWIFT: #{bic}
+    """
+  end
+
+  # --- purchase_order: the bucket that tests whether descriptions do anything -
+  #
+  # `order_date` and `delivery_date` are both `date`-typed and both present on
+  # every one of these documents; nothing about the field *names* says which
+  # is which when the document labels them "Raised" and "Required By". The
+  # only thing that disambiguates them is the semantic description on each
+  # field. That claim was made when descriptions were added and never
+  # measured — the `dates` bucket below is the measurement.
+
+  @purchase_orders [
+    {"Northwind Buyers Inc.", "Acme Corp", "PO-4501", "2026-09-01", "2026-09-30", "12,400.00"},
+    {"Lakeside Manufacturing", "Summit Peak Freight LLC", "PO-4502", "2026-08-15", "2026-09-15",
+     "3,150.00"}
+  ]
+
+  @spec purchase_order() :: [Fixture.t()]
+  def purchase_order do
+    clean =
+      @purchase_orders
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{buyer, supplier, po, ordered, delivery, total}, i} ->
+        %Fixture{
+          id: "po-clean-#{pad(i)}",
+          bucket: "purchase_order_clean",
+          document_type_slug: "purchase_order",
+          documents: %{
+            "purchase_order" => purchase_order_text(buyer, supplier, po, ordered, delivery, total)
+          },
+          expected_decision: "approved"
+        }
+      end)
+
+    # Same content, but the two dates are labelled in a way that gives the
+    # field names no help at all, and a third date (the print date) is added
+    # as a distractor. Correct extraction here is evidence the descriptions
+    # are doing work; a wrong one is caught by grounding, not by this
+    # expectation, so the bucket is honest either way.
+    dates =
+      [
+        {"Fairview Trading Co.", "Blue Ridge Logistics Inc.", "PO-4503", "2026-07-02",
+         "2026-08-20", "8,900.00"}
+      ]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{buyer, supplier, po, ordered, delivery, total}, i} ->
+        %Fixture{
+          id: "po-dates-#{pad(i)}",
+          bucket: "purchase_order_dates",
+          document_type_slug: "purchase_order",
+          documents: %{
+            "purchase_order" =>
+              ambiguous_date_purchase_order_text(buyer, supplier, po, ordered, delivery, total)
+          },
+          # The point of this bucket: both dates are verbatim present, so a
+          # swap is approved *and* fully grounded. Only naming the right
+          # answer catches it.
+          expected_fields: %{
+            "purchase_order" => %{order_date: ordered, delivery_date: delivery}
+          },
+          expected_decision: "approved"
+        }
+      end)
+
+    sanctioned = [
+      %Fixture{
+        id: "po-sanctions-01",
+        bucket: "purchase_order_sanctions_hit",
+        document_type_slug: "purchase_order",
+        documents: %{
+          "purchase_order" =>
+            purchase_order_text(
+              "Northwind Buyers Inc.",
+              "North Star Trading Co",
+              "PO-4504",
+              "2026-09-01",
+              "2026-10-01",
+              "5,000.00"
+            )
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    clean ++ dates ++ sanctioned
+  end
+
+  defp purchase_order_text(buyer, supplier, po, ordered, delivery, total) do
+    """
+    PURCHASE ORDER
+
+    PO Number: #{po}
+    Buyer: #{buyer}
+    Supplier: #{supplier}
+    Ship To: #{buyer}, 14 Commerce Way
+
+    Order Date: #{ordered}
+    Delivery Date: #{delivery}
+
+    Order Total: #{total}
+    """
+  end
+
+  defp ambiguous_date_purchase_order_text(buyer, supplier, po, ordered, delivery, total) do
+    """
+    PURCHASE ORDER  ·  #{po}
+
+    Buyer: #{buyer}
+    Supplier: #{supplier}
+    Ship To: #{buyer}, 14 Commerce Way
+
+    Raised: #{ordered}
+    Required By: #{delivery}
+    Printed: 2026-07-03
+
+    Order Total: #{total}
+    """
+  end
+
+  # --- receipt ----------------------------------------------------------------
+
+  @spec receipt() :: [Fixture.t()]
+  def receipt do
+    clean =
+      [
+        {"Harbour Street Cafe", "18.40", "2026-08-14", "VISA ending 4242"},
+        {"Northgate Stationers", "126.95", "2026-08-21", "Cash"}
+      ]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{merchant, total, date, method}, i} ->
+        %Fixture{
+          id: "receipt-clean-#{pad(i)}",
+          bucket: "receipt_clean",
+          document_type_slug: "receipt",
+          documents: %{"receipt" => receipt_text(merchant, total, date, method)},
+          expected_decision: "approved"
+        }
+      end)
+
+    # A smudged thermal receipt: the total is present and legible enough to
+    # copy, but is not a monetary amount. `receipt` declares that field
+    # `monetary_amount`, so the declared-type check is what catches it —
+    # this type configures no rule that would.
+    garbled = [
+      %Fixture{
+        id: "receipt-malformed-01",
+        bucket: "receipt_malformed",
+        document_type_slug: "receipt",
+        documents: %{
+          "receipt" => receipt_text("Riverside Hardware", "1?.5O", "2026-08-03", "Card")
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    sanctioned = [
+      %Fixture{
+        id: "receipt-sanctions-01",
+        bucket: "receipt_sanctions_hit",
+        document_type_slug: "receipt",
+        documents: %{
+          "receipt" => receipt_text("Rogue Exports LLC", "310.00", "2026-08-09", "Bank transfer")
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    clean ++ garbled ++ sanctioned
+  end
+
+  defp receipt_text(merchant, total, date, method) do
+    """
+    #{String.upcase(merchant)}
+    SALES RECEIPT
+
+    Date of purchase: #{date}
+
+    Subtotal: 15.33
+    Tax: 3.07
+    Total: #{total}
+
+    Paid by: #{method}
+
+    Thank you for your custom.
+    """
+  end
+
+  # --- payroll_statement ------------------------------------------------------
+  #
+  # The type with no `validation_rules` at all, which makes it the clearest
+  # test of the automatic checks: everything below is caught (or not) by
+  # grounding, completeness and declared types alone.
+
+  @spec payroll_statement() :: [Fixture.t()]
+  def payroll_statement do
+    clean =
+      [
+        {"Bramble & Co Ltd", "J. Okafor", "2026-08-31", "4,200.00", "3,118.44"},
+        {"Kestrel Manufacturing", "P. Lindqvist", "2026-07-31", "3,750.00", "2,806.12"}
+      ]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{employer, employee, period_end, gross, net}, i} ->
+        %Fixture{
+          id: "payroll-clean-#{pad(i)}",
+          bucket: "payroll_clean",
+          document_type_slug: "payroll_statement",
+          documents: %{
+            "payroll_statement" => payslip_text(employer, employee, period_end, gross, net)
+          },
+          expected_decision: "approved"
+        }
+      end)
+
+    # Both figures are monetary amounts, both are verbatim present, and a
+    # swap is approved and fully grounded — the same blind spot the
+    # purchase-order dates fixture exists for, on a different type. Only
+    # `expected_fields` can catch it.
+    gross_net = [
+      %Fixture{
+        id: "payroll-gross-net-01",
+        bucket: "payroll_gross_net",
+        document_type_slug: "payroll_statement",
+        documents: %{
+          "payroll_statement" =>
+            payslip_text("Alderway Services", "R. Mensah", "2026-08-31", "5,010.00", "3,642.75")
+        },
+        expected_fields: %{
+          "payroll_statement" => %{gross_pay: "5,010.00", net_pay: "3,642.75"}
+        },
+        expected_decision: "approved"
+      }
+    ]
+
+    # A smudged scan where the figures came through as characters rather
+    # than numbers. The values are present and get copied verbatim, so the
+    # declared-type check (`monetary_amount`) is what catches them — on a
+    # type that configures no rules of its own at all.
+    malformed = [
+      %Fixture{
+        id: "payroll-malformed-01",
+        bucket: "payroll_malformed",
+        document_type_slug: "payroll_statement",
+        documents: %{
+          "payroll_statement" =>
+            payslip_text("Thornbury Group", "A. Silva", "2026-08-31", "2,9O0.OO", "2,178.O3")
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    # Pinned deliberately as `approved`, and it is a **known blind spot,
+    # not a desirable outcome**: exactly one field is unreadable, the model
+    # honestly reports it absent, and nothing catches that. Blank values
+    # belong to `extraction_completeness_checks/1`, which only fires above
+    # 50% missing — one field in five never reaches it — and this type has
+    # no rule that would look. Found by this corpus when the fixture above
+    # was first written this way and came back approved. It stays as a
+    # regression test for the behaviour that exists, so that a future change
+    # to the completeness rule shows up here as a deliberate change rather
+    # than a surprise. See CONTEXT.md's dated entry.
+    single_missing = [
+      %Fixture{
+        id: "payroll-partial-01",
+        bucket: "payroll_single_missing_field",
+        document_type_slug: "payroll_statement",
+        documents: %{
+          "payroll_statement" =>
+            payslip_text("Thornbury Group", "A. Silva", "--/--/----", "2,900.00", "2,178.03")
+        },
+        expected_decision: "approved"
+      }
+    ]
+
+    clean ++ gross_net ++ malformed ++ single_missing
+  end
+
+  defp payslip_text(employer, employee, period_end, gross, net) do
+    """
+    #{employer}
+    PAYSLIP
+
+    Employee: #{employee}
+    Pay Period ending: #{period_end}
+
+    Earnings
+      Gross Pay: #{gross}
+
+    Deductions
+      Income tax: 812.00
+      Pension: 190.00
+
+    Net Pay: #{net}
+    """
+  end
+
+  # --- certificate_of_insurance -----------------------------------------------
+  #
+  # Dates are computed relative to the day the harness runs, not written as
+  # literals. A committed fixture asserting "valid until 2027-06-01" is a
+  # fixture that silently becomes a failing one in June 2027 — the one kind
+  # of corpus rot a time-dependent rule guarantees if the corpus pretends
+  # time doesn't move.
+
+  @spec certificate_of_insurance() :: [Fixture.t()]
+  def certificate_of_insurance do
+    today = Date.utc_today()
+    starts = Date.to_iso8601(Date.add(today, -30))
+    expires = Date.to_iso8601(Date.add(today, 335))
+    lapsed = Date.to_iso8601(Date.add(today, -14))
+
+    clean =
+      [
+        {"Fenwick Contracting Ltd", "Sterling Mutual", "POL-88213", "2,000,000.00"},
+        {"Ardent Facilities Group", "Northern Underwriters", "POL-90471", "5,000,000.00"}
+      ]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{insured, insurer, policy, cover}, i} ->
+        %Fixture{
+          id: "coi-clean-#{pad(i)}",
+          bucket: "coi_clean",
+          document_type_slug: "certificate_of_insurance",
+          documents: %{
+            "certificate_of_insurance" =>
+              coi_text(insured, insurer, policy, cover, starts, expires)
+          },
+          expected_decision: "approved"
+        }
+      end)
+
+    # The finding no amount of reading the document produces: everything on
+    # it is correct, well-formed and grounded, and the cover ran out a
+    # fortnight ago.
+    expired = [
+      %Fixture{
+        id: "coi-expired-01",
+        bucket: "coi_expired",
+        document_type_slug: "certificate_of_insurance",
+        documents: %{
+          "certificate_of_insurance" =>
+            coi_text(
+              "Meadow Lane Logistics",
+              "Sterling Mutual",
+              "POL-77410",
+              "1,000,000.00",
+              Date.to_iso8601(Date.add(today, -379)),
+              lapsed
+            )
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    sanctioned = [
+      %Fixture{
+        id: "coi-sanctions-01",
+        bucket: "coi_sanctions_hit",
+        document_type_slug: "certificate_of_insurance",
+        documents: %{
+          "certificate_of_insurance" =>
+            coi_text(
+              "North Star Trading Co",
+              "Northern Underwriters",
+              "POL-31228",
+              "1,500,000.00",
+              starts,
+              expires
+            )
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    clean ++ expired ++ sanctioned
+  end
+
+  defp coi_text(insured, insurer, policy, cover, starts, expires) do
+    """
+    CERTIFICATE OF INSURANCE
+
+    Insurer: #{insurer}
+    Insured: #{insured}
+    Policy Number: #{policy}
+
+    Coverage: General liability
+    Liability limit: #{cover}
+
+    Effective from: #{starts}
+    Expires: #{expires}
+
+    This certificate is issued as a matter of information only.
+    """
+  end
+
+  # --- w8ben ------------------------------------------------------------------
+
+  @spec w8ben() :: [Fixture.t()]
+  def w8ben do
+    clean =
+      [
+        {"Lindqvist Verkstad AB", "Sweden", "SE556677889901", "2026-08-02"},
+        {"Bergmann Werkzeuge GmbH", "Germany", "DE123456789", "2026-07-19"}
+      ]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{entity, country, vat, signed}, i} ->
+        %Fixture{
+          id: "w8ben-clean-#{pad(i)}",
+          bucket: "w8ben_clean",
+          document_type_slug: "w8ben",
+          documents: %{"w8ben" => w8ben_text(entity, country, vat, signed)},
+          expected_decision: "approved"
+        }
+      end)
+
+    # Right country prefix, wrong body: `DE` VAT numbers are nine digits.
+    # The `vat_id` validator knows the per-jurisdiction shape; a generic
+    # "two letters then digits" check would pass this.
+    invalid_vat = [
+      %Fixture{
+        id: "w8ben-invalid-vat-01",
+        bucket: "w8ben_invalid_vat",
+        document_type_slug: "w8ben",
+        documents: %{
+          "w8ben" => w8ben_text("Kappel Industrie GmbH", "Germany", "DE12345", "2026-08-11")
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    sanctioned = [
+      %Fixture{
+        id: "w8ben-sanctions-01",
+        bucket: "w8ben_sanctions_hit",
+        document_type_slug: "w8ben",
+        documents: %{
+          "w8ben" => w8ben_text("Rogue Exports LLC", "Cyprus", "CY12345678X", "2026-08-05")
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    clean ++ invalid_vat ++ sanctioned
+  end
+
+  defp w8ben_text(entity, country, vat, signed) do
+    """
+    FORM W-8BEN-E
+    Certificate of Status of Beneficial Owner for United States Tax Withholding
+
+    1. Name of organization that is the beneficial owner: #{entity}
+    2. Country of residence: #{country}
+    3. VAT registration number: #{vat}
+
+    The beneficial owner claims foreign status under the applicable tax treaty.
+
+    Signed on: #{signed}
+    """
+  end
+
+  # --- business_registration --------------------------------------------------
+
+  @spec business_registration() :: [Fixture.t()]
+  def business_registration do
+    clean =
+      [
+        {"Halewood Components Ltd", "SC418822", "Scotland", "12 Dockside Road, Glasgow G51 2QT",
+         "accounts@halewood-components.co.uk", "+44 141 555 0182",
+         "https://halewood-components.co.uk"},
+        {"Aster Print Works Limited", "10992431", "England and Wales",
+         "4 Bellmount Way, Leeds LS17 8RQ", "hello@asterprint.co.uk", "+44 113 555 0119",
+         "https://asterprint.co.uk"}
+      ]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{name, number, jurisdiction, address, email, phone, site}, i} ->
+        %Fixture{
+          id: "reg-clean-#{pad(i)}",
+          bucket: "business_registration_clean",
+          document_type_slug: "business_registration",
+          documents: %{
+            "business_registration" =>
+              registration_text(name, number, jurisdiction, address, email, phone, site)
+          },
+          expected_decision: "approved"
+        }
+      end)
+
+    # An address that is a fragment rather than an address — the
+    # `postal_address` validator's only real job, and the weakest check in
+    # `FormatValidators`, tested for what it actually claims rather than
+    # what its name suggests.
+    bad_address = [
+      %Fixture{
+        id: "reg-bad-address-01",
+        bucket: "business_registration_bad_address",
+        document_type_slug: "business_registration",
+        documents: %{
+          "business_registration" =>
+            registration_text(
+              "Cobalt Survey Services Ltd",
+              "11238844",
+              "England and Wales",
+              "Suite 4",
+              "office@cobaltsurvey.co.uk",
+              "+44 20 7555 0143",
+              "https://cobaltsurvey.co.uk"
+            )
+        },
+        expected_decision: "needs_review"
+      }
+    ]
+
+    clean ++ bad_address
+  end
+
+  defp registration_text(name, number, jurisdiction, address, email, phone, site) do
+    """
+    CERTIFICATE OF INCORPORATION
+    Companies Registry — #{jurisdiction}
+
+    This is to certify that
+
+      #{name}
+
+    is incorporated under the Companies Act and is in good standing.
+
+    Registration number: #{number}
+    Registered office: #{address}
+
+    Contact email: #{email}
+    Telephone: #{phone}
+    Website: #{site}
+    """
+  end
 end

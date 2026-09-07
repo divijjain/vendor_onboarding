@@ -25,6 +25,7 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallback do
   def call(%{"document_job_id" => document_job_id} = params) do
     with {:ok, agent_run} <- Repository.get_latest_for_document_job(document_job_id),
          {:ok, updated} <- Repository.update_result(agent_run, result_attrs(params)),
+         :ok <- record_classified_type(document_job_id, params),
          {:ok, document_job} <- DocumentJobs.update_status(document_job_id, updated.status) do
       :ok = MaybeSampleForAudit.call(updated)
 
@@ -35,6 +36,24 @@ defmodule DocumentComplianceEngine.AgentRuns.Actions.HandleAgentCallback do
       )
 
       {:ok, updated}
+    end
+  end
+
+  # A job ingested without a `document_type_slug` gets the one the agent
+  # classified it as written back here, so the dashboard, the audit trail
+  # and any re-run all see what this document actually turned out to be.
+  # Only ever fills a blank: a caller-declared type is never overwritten
+  # by an inference, and a run that couldn't classify leaves it blank
+  # rather than guessing.
+  defp record_classified_type(document_job_id, params) do
+    with slug when is_binary(slug) <- params["document_type_slug"],
+         {:ok, %{document_type_slug: nil}} <- DocumentJobs.get_document_job(document_job_id) do
+      case DocumentJobs.update_document_type(document_job_id, slug) do
+        {:ok, _document_job} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      _already_typed_or_unclassified -> :ok
     end
   end
 

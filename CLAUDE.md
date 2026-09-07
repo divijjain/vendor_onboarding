@@ -34,7 +34,9 @@ BEAM node (they collide). Always `cd apps/<name>` first — see CONTEXT.md's
 dated entry on the umbrella restructuring.
 
 The Phoenix side is three contexts: `DocumentJobs` owns the ingestion record
-and aggregate status (`document_jobs` table, `document_type_slug`),
+and aggregate status (`document_jobs` table, `document_type_slug` — nullable
+now: a caller that doesn't declare a type gets one from `Agent.Classification`
+during the run, written back by `HandleAgentCallback`),
 `AgentRuns` owns each run's extracted/validated output as its own row
 (`agent_runs` table, `belongs_to :document_job`) so re-runs keep history
 instead of overwriting columns, and `DocumentTypes` (`document_types` table)
@@ -42,7 +44,7 @@ is a small config registry of known document types — what a job's
 `document_type_slug` refers to, and each type's `extraction_schema`/
 `validation_rules`, which `Agent.Run` resolves before invoking the reactor
 and the agent pipeline now genuinely interprets (`Extraction.extract_all/2`,
-`Checks.validate_all/2`) rather than hardcoding one document's fields.
+`Checks.validate_all/4`) rather than hardcoding one document's fields.
 `thread_id` lives on the `agent_runs` row and is what lets a human approval
 in LiveView resume a specific paused agent run. Don't re-litigate the
 context split without a real reason. See CONTEXT.md's dated entries:
@@ -102,7 +104,8 @@ apps/
     mix.exs                       # own deps/build/config/lockfile, self-contained
     lib/document_compliance_engine/
       document_jobs/               # ingestion context (was `onboardings/` — see CONTEXT.md)
-      document_types/              # document-type config registry — slug, name, extraction_schema,
+      document_types/              # document-type config registry (9 seeded types) — slug, name,
+                                    # description, extraction_schema,
                                     # validation_rules; resolved by Agent.Run and interpreted by
                                     # Extraction/Checks — genuinely read by the agent pipeline
       agent_runs/                  # agent-run context — workers/actions call Agent.Run directly
@@ -113,8 +116,17 @@ apps/
                                     # no table; reads Oban's table directly + AgentRuns' public API
       agent/                       # the agent brain, a plain module tree, NOT a separate app
         document_reactor.ex         # the pipeline, as Reactor steps (document-type-generic)
+        classification.ex           # picks the document type when the caller didn't say
+        type_resolution.ex          # classification -> the schema/rules this run uses
+        extraction_schema.ex        # owns the extraction_schema config shape
+        field_types.ex              # the declared-type vocabulary
+        format_validators.ex        # pure format/integrity checks a type or rule names
         schemas/                    # Ecto embedded schemas for structured LLM output
-        checks.ex                   # interprets validation_rules: entity-match + the two MCP tools
+        checks.ex                   # interprets validation_rules: entity-match, the two MCP tools,
+                                    # format/regex, and not_expired (the one rule whose answer
+                                    # depends on when it runs — clock injected via :today);
+                                    # plus the automatic checks no config can turn off, incl. each
+                                    # value against its field's declared type (field_types.ex)
         mcp_client.ex               # JSON-RPC-over-HTTP client for the tool servers
         run.ex                      # trigger/resume, reports via AgentRuns.handle_agent_callback/1
         checkpoint/                  # schema + repository for the halted-run checkpoint
@@ -137,6 +149,35 @@ business-domain migrations" true even with one shared Repo.
   caches a halted step's `{:halt, value}` as its final result and never re-runs it, so
   the human's decision must be consumed by a *downstream* step. Merging them compiles
   fine and silently returns the stale halt value instead of the reviewer's decision.
+- **The extraction schema is a step result now, not an input.** `:classify` picks a
+  document type and `:resolve_type` reads its config, so `extraction_schema`/
+  `validation_rules`/`shape_signals` come from `result(:resolve_type)`. The
+  *candidates* (`input(:document_types)`, the whole registry) are still resolved
+  before `Reactor.run/2` and stored in the checkpoint, so a resumed run sees exactly
+  the candidates the halted run saw.
+- **Not knowing the document type is a failed check, not control flow.** An
+  unconfident classification, an unclassifiable document, or documents that don't
+  match the chosen type's roles all resolve to an *empty* `extraction_schema` plus a
+  failed check. Extraction over no roles is a real no-op, and the check halts the run
+  at the existing `:gate`. Don't add a second pause mechanism or a conditional step.
+- **A field `description` states meaning, never format.** A description saying what a
+  value should look like ("two digits, a hyphen, seven digits") gets the model to
+  *produce* that shape, overriding the verbatim instruction and turning a correctly
+  extracted malformed value into an ungrounded one. Measured, not theoretical — see
+  CONTEXT.md's 2026-09-01 descriptions entry. Shape belongs to the declared type and
+  to `format`/`regex` rules.
+- **A field's declared type in `extraction_schema` is never the Instructor wire type.**
+  `Agent.FieldTypes` types (`number`, `date`, …) drive the extraction prompt only; every
+  field is still requested as a `:string` and returned verbatim. Coercing the value
+  (`"1,234.56"` to `1234.56`) makes it stop appearing in its source document, and
+  `Checks.grounded_extraction_checks/3` then reports a correct extraction as a
+  hallucination. Ill-formed values are meant to fail a *check*, not be rewritten.
+- **A resumed checkpoint's payload is dropped once the run finishes** (`purge_payload/1`,
+  called *after* `Reactor.run`, never before — a crash mid-resume must leave something to
+  resume from). `reactor_state: nil` means "resumed and purged", and resuming such a
+  checkpoint is a clean failure, not a `binary_to_term(nil)`. The row stays as the record
+  that a pause happened; keeping its payload would retain full document text — Tax ID
+  included, unencrypted — forever, for a run that is over.
 - **Resume requires every original input re-supplied**, not just the new one — that's why
   the checkpoint row stores `inputs` (including `documents`/`extraction_schema`/
   `validation_rules`, not just the decision) alongside the serialized reactor.
@@ -169,6 +210,8 @@ business-domain migrations" true even with one shared Repo.
 
 - Every webhook ingestion computes a hash of the raw payload and checks it against the
   unique `idempotency_key` index **before** creating a row or writing to storage
+- Classification never happens in the webhook process — ingestion stays fast and
+  idempotent, and the agent classifies inside the Oban job like every other LLM call
 - Tax ID is stored via an encrypted Ecto type — never add a plaintext Tax ID column or
   log the raw Tax ID value
 

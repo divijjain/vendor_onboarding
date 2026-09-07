@@ -17,6 +17,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
   require Logger
 
   alias DocumentComplianceEngine.Agent.Checkpoint.Repository
+  alias DocumentComplianceEngine.Agent.Classification
   alias DocumentComplianceEngine.Agent.DocumentReactor
   alias DocumentComplianceEngine.AgentRuns
   alias DocumentComplianceEngine.DocumentTypes
@@ -53,14 +54,11 @@ defmodule DocumentComplianceEngine.Agent.Run do
   end
 
   defp do_trigger(document_job_id, document_type_slug, document_paths) do
-    with {:ok, document_type} <- fetch_document_type(document_type_slug),
-         {:ok, documents} <- read_documents(document_paths, document_type.extraction_schema) do
+    with {:ok, documents} <- read_documents(document_paths) do
       inputs = %{
         document_type_slug: document_type_slug,
         documents: documents,
-        extraction_schema: document_type.extraction_schema,
-        validation_rules: document_type.validation_rules,
-        shape_signals: document_type.shape_signals,
+        document_types: candidates(),
         human_decision: nil
       }
 
@@ -70,6 +68,16 @@ defmodule DocumentComplianceEngine.Agent.Run do
     else
       {:error, reason} -> fail(document_job_id, reason)
     end
+  end
+
+  # The whole registry, as the string-keyed config the reactor's inputs
+  # (and therefore the checkpoint's jsonb `inputs`) carry. Read once here
+  # rather than inside a step, for the same reason the resolved schema
+  # used to be: it is static config, and a resumed run must see exactly
+  # the candidates the original run saw, not whatever the registry looks
+  # like whenever the human gets round to reviewing.
+  defp candidates do
+    Classification.candidates(DocumentTypes.list_document_types())
   end
 
   @spec resume(pos_integer(), String.t(), String.t()) :: :ok
@@ -92,6 +100,13 @@ defmodule DocumentComplianceEngine.Agent.Run do
 
   defp do_resume(document_job_id, thread_id, decision) do
     case Repository.get_by_thread_id(thread_id) do
+      # A checkpoint whose payload has been purged is one that already ran
+      # to completion (see `Repository.purge_payload/1`). Reported as a
+      # failed resume rather than reaching `binary_to_term(nil)`, which is
+      # what a second decision on the same thread used to do.
+      {:ok, %{reactor_state: nil}} ->
+        {fail(document_job_id, "checkpoint for thread_id #{thread_id} was already resumed"), nil}
+
       {:ok, checkpoint} ->
         reactor = :erlang.binary_to_term(checkpoint.reactor_state)
         inputs = resume_inputs(checkpoint, decision)
@@ -103,6 +118,10 @@ defmodule DocumentComplianceEngine.Agent.Run do
           |> Reactor.run(inputs, %{})
           |> handle_result(document_job_id, inputs)
 
+        # After the run, never before: a crash mid-resume must leave
+        # something to resume from.
+        Repository.purge_payload(checkpoint)
+
         {status, inputs.document_type_slug}
 
       {:error, :not_found} ->
@@ -110,23 +129,17 @@ defmodule DocumentComplianceEngine.Agent.Run do
     end
   end
 
-  defp fetch_document_type(slug) do
-    case DocumentTypes.get_document_type_by_slug(slug) do
-      nil -> {:error, "unknown document type: #{slug}"}
-      document_type -> {:ok, document_type}
-    end
-  end
-
-  defp read_documents(document_paths, extraction_schema) do
-    extraction_schema
-    |> Map.keys()
-    |> Enum.reduce_while({:ok, %{}}, fn role, {:ok, acc} ->
-      with path when not is_nil(path) <- document_paths[role],
-           {:ok, bytes} <- Storage.read(path),
+  # Reads every uploaded document, under whatever key it was uploaded with.
+  # This used to iterate the resolved type's roles, which is no longer
+  # possible: the type isn't known until the documents have been read and
+  # classified. `TypeResolution` re-keys them onto the chosen type's roles
+  # afterwards.
+  defp read_documents(document_paths) do
+    Enum.reduce_while(document_paths, {:ok, %{}}, fn {role, path}, {:ok, acc} ->
+      with {:ok, bytes} <- Storage.read(path),
            {:ok, text} <- PdfText.extract(bytes) do
         {:cont, {:ok, Map.put(acc, role, text)}}
       else
-        nil -> {:halt, {:error, "missing document path: #{role}"}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
@@ -136,9 +149,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
     %{
       document_type_slug: checkpoint.inputs["document_type_slug"],
       documents: checkpoint.inputs["documents"],
-      extraction_schema: checkpoint.inputs["extraction_schema"],
-      validation_rules: checkpoint.inputs["validation_rules"],
-      shape_signals: checkpoint.inputs["shape_signals"] || %{},
+      document_types: checkpoint.inputs["document_types"] || [],
       human_decision: decision
     }
   end
@@ -146,14 +157,20 @@ defmodule DocumentComplianceEngine.Agent.Run do
   defp handle_result({:ok, result}, document_job_id, _inputs) do
     report(
       Map.merge(
-        %{"document_job_id" => document_job_id, "status" => result.status},
+        %{
+          "document_job_id" => document_job_id,
+          "status" => result.status,
+          # What the run actually ran as, which for a job ingested without
+          # a type is the classifier's answer — see `HandleAgentCallback`.
+          "document_type_slug" => result.document_type_slug
+        },
         extracted_payload(result.extracted, result.extraction_metadata)
       )
     )
   end
 
   defp handle_result({:halted, reactor}, document_job_id, inputs) do
-    {extracted, extraction_metadata, explanation} = halted_details(reactor)
+    {extracted, extraction_metadata, explanation, classified_slug} = halted_details(reactor)
     thread_id = thread_id_for(document_job_id)
 
     # thread_id is deterministic per document_job_id, so a fresh halt always
@@ -173,9 +190,7 @@ defmodule DocumentComplianceEngine.Agent.Run do
         inputs: %{
           "document_type_slug" => inputs.document_type_slug,
           "documents" => inputs.documents,
-          "extraction_schema" => inputs.extraction_schema,
-          "validation_rules" => inputs.validation_rules,
-          "shape_signals" => inputs.shape_signals
+          "document_types" => storable_candidates(inputs.document_types, classified_slug)
         },
         explanation: explanation
       })
@@ -186,7 +201,8 @@ defmodule DocumentComplianceEngine.Agent.Run do
           "document_job_id" => document_job_id,
           "status" => "needs_review",
           "thread_id" => thread_id,
-          "explanation" => truncate(explanation)
+          "explanation" => truncate(explanation),
+          "document_type_slug" => classified_slug
         },
         extracted_payload(extracted, extraction_metadata)
       )
@@ -207,7 +223,39 @@ defmodule DocumentComplianceEngine.Agent.Run do
         _ -> nil
       end
 
-    {extract_result[:fields] || %{}, extract_result[:metadata] || %{}, explanation}
+    # A halted run still knows what it decided the document was — that's
+    # exactly what the reviewer is being asked about when the halt came
+    # from a low-confidence classification.
+    classified_slug =
+      case results[:resolve_type] do
+        %{document_type_slug: slug} -> slug
+        _ -> nil
+      end
+
+    {extract_result[:fields] || %{}, extract_result[:metadata] || %{}, explanation,
+     classified_slug}
+  end
+
+  # The candidate list is the largest thing in a checkpoint (measured: ~1.2KB
+  # per document type, against 141 bytes of document text on a typical
+  # fixture), and most of that bulk is `extraction_schema`/`validation_rules`
+  # for types this run didn't pick. Only the *winning* candidate's config is
+  # ever read again — `TypeResolution` looks up exactly one — while
+  # `Classification` reads nothing but slug/name/description/shape_signals
+  # from any of them. So the losers are stored with just those four fields:
+  # both steps would behave identically if they ever re-ran, and the row
+  # still records which alternatives this run chose among, which is the part
+  # worth keeping for an audit.
+  @classification_fields ~w(slug name description shape_signals)
+
+  defp storable_candidates(candidates, winning_slug) do
+    Enum.map(candidates, fn candidate ->
+      if candidate["slug"] == winning_slug do
+        candidate
+      else
+        Map.take(candidate, @classification_fields)
+      end
+    end)
   end
 
   # Known roles (contract/w9) still populate AgentRun's fixed columns

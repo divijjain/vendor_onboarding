@@ -69,6 +69,54 @@ defmodule DocumentComplianceEngine.Agent.FormatValidatorsTest do
       refute valid?("number", "N/A")
     end
 
+    test "parse_date resolves the forms a document actually writes" do
+      assert {:ok, ~D[2027-03-14]} = FormatValidators.parse_date("2027-03-14")
+      assert {:ok, ~D[2027-03-14]} = FormatValidators.parse_date("2027/03/14")
+      assert {:ok, ~D[2027-03-14]} = FormatValidators.parse_date("March 14, 2027")
+      assert {:ok, ~D[2027-03-14]} = FormatValidators.parse_date("14 Mar 2027")
+      # Unambiguous because 14 cannot be a month, whichever locale wrote it.
+      assert {:ok, ~D[2027-03-14]} = FormatValidators.parse_date("14/03/2027")
+      assert {:ok, ~D[2027-03-14]} = FormatValidators.parse_date("03/14/2027")
+    end
+
+    test "parse_date refuses a date that can be read two ways, rather than picking one" do
+      # Both readings are real dates five weeks apart. Deciding would decide
+      # whether a certificate has expired — see the moduledoc.
+      assert :error = FormatValidators.parse_date("01/02/2027")
+      # Still passes the *format* check: a date does exist here, which is a
+      # different question from which date it is.
+      assert :ok = FormatValidators.validate("date", "01/02/2027")
+    end
+
+    test "parse_date rejects impossible and unparseable dates" do
+      assert :error = FormatValidators.parse_date("2027-02-30")
+      assert :error = FormatValidators.parse_date("sometime next spring")
+      assert :error = FormatValidators.parse_date("")
+    end
+
+    test "monetary_amount accepts money as documents actually write it" do
+      # The plain-text and scanned invoice eval fixtures respectively — a
+      # bare `number` check rejects the second, which is the false
+      # "invalid" this validator exists to avoid.
+      assert valid?("monetary_amount", "1,000.00")
+      assert valid?("monetary_amount", "$1,275.00")
+
+      assert valid?("monetary_amount", "USD 1,200.00")
+      assert valid?("monetary_amount", "1200 EUR")
+      assert valid?("monetary_amount", "€45")
+      # A credit, written the way accounting writes one.
+      assert valid?("monetary_amount", "(1,200.00)")
+      assert valid?("monetary_amount", "-17.50")
+    end
+
+    test "monetary_amount still needs an actual amount, not just a currency" do
+      refute valid?("monetary_amount", "$")
+      refute valid?("monetary_amount", "USD")
+      refute valid?("monetary_amount", "twelve hundred dollars")
+      refute valid?("monetary_amount", "N/A")
+      refute valid?("monetary_amount", "")
+    end
+
     test "email checks shape only" do
       assert valid?("email", "ap@acme-corp.com")
       assert valid?("email", "a.b+tag@sub.example.co.uk")
@@ -133,7 +181,7 @@ defmodule DocumentComplianceEngine.Agent.FormatValidatorsTest do
     end
 
     test "known/0 lists exactly the validators validate/2 dispatches on" do
-      assert length(FormatValidators.known()) == 11
+      assert length(FormatValidators.known()) == 12
 
       for validator <- FormatValidators.known() do
         refute FormatValidators.validate(validator, "some value") == {:error, :unknown_validator}
